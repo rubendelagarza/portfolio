@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ruben de la Garza — Technical Consultant Portfolio</title>
+<meta name="description" content="Interactive portfolio of Ruben de la Garza, Senior Technical Consultant: sixteen hands-on labs covering Microsoft 365, identity, Active Directory, ITSM, Google Cloud and Azure networking, email DNS and Linux web servers." />
+<meta property="og:title" content="Ruben de la Garza — Technical Consultant Portfolio" />
+<meta property="og:description" content="Sixteen hands-on labs: Microsoft 365, SSO/MFA, Active Directory, ITSM, Google Cloud, Azure, email DNS, mailbox migration, local AI, Linux, Cloudflare and OAuth." />
+<link rel="stylesheet" href="assets/style.css" />
+<link rel="stylesheet" href="assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Senior Technical Consultant</span></div>
+    <nav>
+      <a href="index.html" class="active">Portfolio</a>
+      <a href="about.html">About</a>
+      <a href="contact.html">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="container">
+    <div class="eyebrow">Interactive Portfolio</div>
+    <h1>Don't take my CV's word for it. Do the work I do.</h1>
+    <p class="lede">
+      Sixteen hands-on labs drop you into a broken or empty environment (a Microsoft 365 tenant,
+      a domain controller, a ticket queue, cloud networks, a fresh Linux server) and check whether
+      you fixed it properly. Faults are randomized and hints are there when you need them.
+      Short on time? Every lab has a <strong>Watch solution</strong> button that replays the fix
+      with the reasoning narrated.
+    </p>
+    <div class="row mt-16">
+      <a class="btn" href="#labs">Start a lab</a>
+      <a class="btn ghost" href="about.html">Read the CV</a>
+      <a class="btn ghost" href="https://www.linkedin.com/in/rubendelagarza" target="_blank" rel="noopener">LinkedIn</a>
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:18px" id="overall"></p>
+  </div>
+</section>
+
+<section class="track" id="labs">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">Microsoft &amp; Identity</div>
+      <p>Tenant configuration, single sign-on and directory administration.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/m365-hardening-lab/" data-lab="m365-hardening-lab">
+        <div class="num">Lab 01 · Intermediate · ~10 min</div>
+        <h3>Harden a new client's Microsoft 365 tenant</h3>
+        <p>Exchange Online and Teams PowerShell: lock down meetings and guest access, warn on external mail, build a shared mailbox, fix a mailbox about to stop receiving mail.</p>
+        <div><span class="tag">Microsoft 365</span><span class="tag">PowerShell</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/sso-mfa-lab/" data-lab="sso-mfa-lab">
+        <div class="num">Lab 02 · Intermediate · ~10 min</div>
+        <h3>Onboard a SaaS app with SAML SSO and MFA</h3>
+        <p>Read vendor metadata, decode AADSTS errors, map claims, then roll out MFA with Conditional Access in report-only mode without locking anyone out.</p>
+        <div><span class="tag">SSO / MFA</span><span class="tag">Entra ID</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/ad-lab/" data-lab="ad-lab">
+        <div class="num">Lab 03 · Intermediate · ~12 min</div>
+        <h3>Active Directory onboarding, offboarding and cleanup</h3>
+        <p>Create a new hire to standard, copy the right groups, unlock without over-resetting, offboard a leaver properly and find stale accounts, all in PowerShell.</p>
+        <div><span class="tag">Active Directory</span><span class="tag">PowerShell</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+<section class="track" style="background:var(--surface)">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">ITSM &amp; Support</div>
+      <p>How incidents get worked, documented and fixed for good.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/itsm-ticket-lab/" data-lab="itsm-ticket-lab">
+        <div class="num">Lab 04 · Guided · ~12 min</div>
+        <h3>ITSM ticket simulator (modeled on ServiceNow)</h3>
+        <p>Work an incident step by step with coaching on every field: impact and urgency, a useful description, work notes vs customer comments, resolution and linked records.</p>
+        <div><span class="tag">ITSM</span><span class="tag">Best practices</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/vpn-troubleshooter/" data-lab="vpn-troubleshooter">
+        <div class="num">Lab 05 · Intermediate · ~8 min</div>
+        <h3>Fix a remote user's VPN access</h3>
+        <p>"VPN says Connected but nothing works." Use ipconfig, nslookup, route and netsh on the user's laptop to find the real fault and fix it so it stays fixed.</p>
+        <div><span class="tag">Networking</span><span class="tag">Windows</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+<section class="track">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">Cloud: Google Cloud &amp; Azure</div>
+      <p>Managed network services, hybrid connectivity and IaaS basics.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/gcp-diagnostics/" data-lab="gcp-diagnostics">
+        <div class="num">Lab 06 · Intermediate · ~8 min</div>
+        <h3>Repair a broken VPC peering</h3>
+        <p>An app can't reach an API across peered VPCs. Diagnose with gcloud and Connectivity Tests, fix it without weakening security, prove it from the client VM.</p>
+        <div><span class="tag">Google Cloud</span><span class="tag">VPC</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/cloud-dns-lab/" data-lab="cloud-dns-lab">
+        <div class="num">Lab 07 · Advanced · ~12 min</div>
+        <h3>Migrate a zone to Cloud DNS and enable DNSSEC</h3>
+        <p>Fix a broken zone export, add CAA, verify before cutover, switch the delegation and complete the chain of trust without the domain ever going dark.</p>
+        <div><span class="tag">Cloud DNS</span><span class="tag">DNSSEC</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/hybrid-vpn-lab/" data-lab="hybrid-vpn-lab">
+        <div class="num">Lab 08 · Advanced · ~15 min</div>
+        <h3>Connect on-prem with HA VPN and BGP</h3>
+        <p>Match an on-prem router config exactly, bring up BGP over two tunnels, advertise an aggregate, engineer the primary path with MED, then fail a tunnel.</p>
+        <div><span class="tag">Hybrid connectivity</span><span class="tag">BGP</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/gcp-lb-cdn-lab/" data-lab="gcp-lb-cdn-lab">
+        <div class="num">Lab 09 · Intermediate–Advanced · ~12 min</div>
+        <h3>Global load balancer, Cloud CDN and Cloud NAT</h3>
+        <p>Build an HTTPS load balancer from its parts with gcloud, get the backends healthy, pick a safe CDN cache mode and size NAT for a 300-VM fleet.</p>
+        <div><span class="tag">Google Cloud</span><span class="tag">Load Balancing</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/azure-vnet-lab/" data-lab="azure-vnet-lab">
+        <div class="num">Lab 10 · Fundamentals+ · ~10 min</div>
+        <h3>Azure VNet, NSG and a Linux VM</h3>
+        <p>Resource group under Azure Policy, VNet and subnet, an NSG that opens only what's needed, and an SSH-key Ubuntu VM, without the defaults az vm create sneaks in.</p>
+        <div><span class="tag">Azure</span><span class="tag">Azure CLI</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+<section class="track" style="background:var(--surface)">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">Infrastructure &amp; Web</div>
+      <p>An email move to Microsoft 365 (DNS, then mailboxes and Outlook), then one Linux server taken from bare to production in three parts.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/email-dns-lab/" data-lab="email-dns-lab">
+        <div class="num">Lab 11 · Intermediate · ~12 min</div>
+        <h3>Set up DNS for email (MX, SPF, DKIM, DMARC)</h3>
+        <p>Point mail at Exchange Online, merge SPF for a marketing platform, enable DKIM, and step DMARC from monitoring to enforcement without losing legitimate mail.</p>
+        <div><span class="tag">DNS</span><span class="tag">Email security</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/outlook-migration-lab/" data-lab="outlook-migration-lab">
+        <div class="num">Lab 12 · Intermediate · ~15 min</div>
+        <h3>Migrate Outlook accounts to Microsoft 365</h3>
+        <p>Move mailboxes from an old IMAP host with a migration batch, fix the failures, cut over after the MX switch, then get Outlook onto Exchange Online with the user's PST archive and shared mailbox.</p>
+        <div><span class="tag">Exchange Online</span><span class="tag">Outlook</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/linux-web-lab/" data-lab="linux-web-lab">
+        <div class="num">Lab 13 · Intermediate · ~12 min · Part 1 of 3</div>
+        <h3>Deploy a web app on a Linux server</h3>
+        <p>Install nginx, open the firewall without locking yourself out, run the app as a systemd service under its own user and put nginx in front as a reverse proxy.</p>
+        <div><span class="tag">Linux</span><span class="tag">nginx · systemd</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/cloudflare-ssl-lab/" data-lab="cloudflare-ssl-lab">
+        <div class="num">Lab 14 · Intermediate · ~12 min · Part 2 of 3</div>
+        <h3>HTTPS with a Cloudflare origin certificate</h3>
+        <p>Proxy the site through Cloudflare, install an Origin CA certificate on nginx, switch to Full (strict) and dodge redirect loops and 52x errors.</p>
+        <div><span class="tag">Cloudflare</span><span class="tag">TLS</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/sqlite-oauth-lab/" data-lab="sqlite-oauth-lab">
+        <div class="num">Lab 15 · Intermediate–Advanced · ~15 min · Part 3 of 3</div>
+        <h3>SQLite database and Sign in with Google</h3>
+        <p>Create the database with the right ownership, register an OAuth client, keep secrets in a root-only env file, then fix the ops team's Python report.</p>
+        <div><span class="tag">SQLite · OAuth</span><span class="tag">Python</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="track">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">AI &amp; Automation</div>
+      <p>Self-hosted AI wired into everyday tools, with the data kept on premises.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/local-llm-bot-lab/" data-lab="local-llm-bot-lab">
+        <div class="num">Lab 16 · Intermediate–Advanced · ~20 min</div>
+        <h3>Local LLM + Telegram renewal bot</h3>
+        <p>Run Qwen3.5 4B with Ollama on an office Linux server, keep its API private, then deploy a Telegram bot that reminds an insurance agent which policies are due for renewal.</p>
+        <div><span class="tag">Ollama · Qwen3.5</span><span class="tag">Python · Telegram</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="container inner">
+    <div>© Ruben de la Garza · Senior Technical Consultant · Monterrey, México</div>
+    <div><a href="about.html">About</a> · <a href="contact.html">Contact</a></div>
+  </div>
+</footer>
+
+<script>
+  // Show lab completion badges (stored in this browser by the lab engine).
+  let done = 0; const cards = document.querySelectorAll('[data-lab]');
+  cards.forEach(card => {
+    let rec = null;
+    try { rec = JSON.parse(localStorage.getItem('lab:' + card.dataset.lab) || 'null'); } catch (e) { rec = null; }
+    const slot = card.querySelector('.lab-progress');
+    if (!rec || !slot) return;
+    if (rec.completed) { done++; slot.innerHTML = '<span class="badge ok">Completed · best ' + rec.best + '/100</span>'; }
+    else if (rec.watched) slot.innerHTML = '<span class="badge">Solution watched</span>';
+  });
+  if (done) document.getElementById('overall').textContent = 'Your progress in this browser: ' + done + ' of ' + cards.length + ' labs completed.';
+</script>
+</body>
+</html>
