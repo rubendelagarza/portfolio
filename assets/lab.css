@@ -253,3 +253,15 @@ ul.live-check li.fail { color: var(--muted); }
 .tg-input { padding: 8px; border-top: 1px solid var(--border); }
 .tg-input input { flex: 1; }
 @media (max-width: 720px) { .tg { grid-template-columns: 1fr; } .tg-list { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); } }
+
+/* ---------- containers & Kubernetes labs */
+.cs-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #94a3b8; vertical-align: middle; }
+.cs-dot.ok { background: var(--success); } .cs-dot.warn { background: var(--warn); } .cs-dot.bad { background: var(--danger); }
+.k8s-flow { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.k8s-box { border: 1.5px solid var(--border-strong); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); overflow-wrap: anywhere; }
+.k8s-box.ok { border-color: var(--success); background: #f0fdf4; } .k8s-box.bad { border-color: var(--danger); background: #fef2f2; }
+.k8s-arrow { font-family: var(--mono); color: var(--muted); padding-left: 8px; overflow-wrap: anywhere; } .k8s-arrow.bad { color: var(--danger); }
+.k8s-pods { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 6px; }
+.k8s-pod { border: 1px solid var(--border); border-left: 4px solid #94a3b8; border-radius: 4px; padding: 5px 7px; display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+.k8s-pod.ok { border-left-color: var(--success); } .k8s-pod.warn { border-left-color: var(--warn); } .k8s-pod.bad { border-left-color: var(--danger); background: #fef2f2; }
+.k8s-pod span { color: var(--muted); }

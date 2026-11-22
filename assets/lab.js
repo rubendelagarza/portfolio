@@ -471,7 +471,7 @@
           return `<li class="obj locked"><span class="obj-check" aria-hidden="true"></span><div class="obj-body"><div class="obj-text">${ob.text}</div><div class="muted" style="font-size:12px">Locked: finish step ${firstOpen + 1} first.</div></div></li>`;
         }
         const level = this.hints[i] || 0;
-        const hints = (ob.hints || []).slice(0, level).map((h, k) => `<div class="obj-hint"><strong>Hint ${k + 1}.</strong> ${h}</div>`).join('');
+        const hints = (ob.hints || []).slice(0, level).map((h, k) => `<div class="obj-hint"><strong>Hint ${k + 1}.</strong> ${typeof h === 'function' ? h(this.state) : h}</div>`).join('');
         const more = (ob.hints || []).length > level && !r.ok && !this.playing
           ? `<button type="button" class="ghost sm" data-hint="${i}">Hint ${level + 1}/${ob.hints.length} (${this._hintPrice(level) ? '−' + this._hintPrice(level) : 'free'})</button>` : '';
         const fb = !r.ok && this.feedback[i] ? `<div class="obj-fb">${esc(this.feedback[i])}</div>` : '';

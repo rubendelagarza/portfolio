@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Compose stack, networking and startup order — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 19</div>
+    <h1>Lab: Compose stack, networking and startup order</h1>
+    <p>A four-service Docker Compose stack (nginx, API, database, Redis) works on the developer's laptop but returns 502 on the server. Bring it up, read the logs, fix how the services find each other and the order they start in, and verify end to end.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">docker compose · networks · healthchecks</span><span class="pill">3 randomized stacks</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> container-to-container networking (service names, not <code>localhost</code>), Compose networks, published vs internal ports, healthchecks with <code>depends_on: condition: service_healthy</code>, and keeping secrets out of the compose file with <code>.env</code>.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Ticket INC-21177</h3>
+          <p style="font-size:14px" id="wo-text"></p>
+          <p class="muted" style="font-size:12px;margin:0">Server <code>shop01</code>, project in <code>/srv/shop</code>. Edit files with <code>nano</code>; after a change run <code>docker compose up -d</code> again.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Containers on shop01</h3>
+          <div id="dk-panel"></div>
+        </div>
+        <div class="panel">
+          <h3>How the stack is meant to work</h3>
+          <ul style="font-size:13px;padding-left:18px;margin:0">
+            <li><b>web</b> (nginx) is the only service published to the host, on port 80, and proxies <code>/api/</code> to <b>api</b>:3000.</li>
+            <li><b>api</b> needs <b>db</b> and <b>cache</b>, and connects once at startup (no retries).</li>
+            <li>The database must not be reachable from outside the server.</li>
+          </ul>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 19 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script src="../../assets/container-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim, CS = ContainerSim, { CmdError } = Lab;
+  const HOME = '/home/ruben', DIR = '/srv/shop', FILE = DIR + '/docker-compose.yml', PW = 'S3cr3t-shop-2026';
+  const $ = s => document.querySelector(s);
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+
+  const VARIANTS = [
+    { db: 'postgres', dbImage: 'postgres:16-alpine', port: 5432, scheme: 'postgres', userVar: 'POSTGRES_USER', pwVar: 'POSTGRES_PASSWORD', dbVar: 'POSTGRES_DB', hc: '["CMD-SHELL", "pg_isready -U shop -d shop"]', bug: 'redis' },
+    { db: 'mysql', dbImage: 'mysql:8.4', port: 3306, scheme: 'mysql', userVar: 'MYSQL_USER', pwVar: 'MYSQL_PASSWORD', dbVar: 'MYSQL_DATABASE', hc: '["CMD", "mysqladmin", "ping", "-h", "localhost"]', bug: 'ports' },
+    { db: 'postgres', dbImage: 'postgres:16-alpine', port: 5432, scheme: 'postgres', userVar: 'POSTGRES_USER', pwVar: 'POSTGRES_PASSWORD', dbVar: 'POSTGRES_DB', hc: '["CMD-SHELL", "pg_isready -U shop -d shop"]', bug: 'networks' }
+  ];
+  function composeText(V, fixed) {
+    const dbHost = !fixed && V.bug === 'ports' ? '127.0.0.1' : 'db';
+    const cacheHost = !fixed && V.bug !== 'ports' ? (V.bug === 'networks' ? '127.0.0.1' : 'localhost') : 'cache';
+    const pwApi = fixed ? '${DB_PASSWORD}' : PW;
+    const extraDbEnv = V.db === 'mysql' ? `      MYSQL_ROOT_PASSWORD: ${fixed ? '${DB_ROOT_PASSWORD}' : 'r00t-shop-2026'}\n` : '';
+    const nets = (list) => V.bug === 'networks' ? `    networks:\n${list.map(n => `      - ${n}`).join('\n')}\n` : '';
+    return `services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+${nets(['frontend'])}
+  api:
+    image: shop-api:3.2
+    environment:
+      DATABASE_URL: ${V.scheme}://shop:${pwApi}@${dbHost}:${V.port}/shop
+      REDIS_URL: redis://${cacheHost}:6379
+    depends_on:
+${fixed ? `      db:\n        condition: service_healthy\n      cache:\n        condition: service_started` : '      - db\n      - cache'}
+${nets(fixed && V.bug === 'networks' ? ['frontend', 'backend'] : ['frontend'])}
+  db:
+    image: ${V.dbImage}
+    environment:
+      ${V.userVar}: shop
+      ${V.pwVar}: ${fixed ? '${DB_PASSWORD}' : PW}
+      ${V.dbVar}: shop
+${extraDbEnv}${!fixed && V.bug === 'ports' ? '    ports:\n      - "3306:3306"\n' : ''}${fixed ? `    healthcheck:\n      test: ${V.hc}\n      interval: 5s\n      timeout: 3s\n      retries: 10\n` : ''}    volumes:
+      - dbdata:${V.db === 'mysql' ? '/var/lib/mysql' : '/var/lib/postgresql/data'}
+${nets(['backend'])}
+  cache:
+    image: redis:7-alpine
+${nets(['backend'])}
+volumes:
+  dbdata:
+${V.bug === 'networks' ? '\nnetworks:\n  frontend:\n  backend:\n' : ''}`.replace(/\n\n\n+/g, '\n\n');
+  }
+
+  // ------------------------------------------------------------- compose model
+  function load(st) {
+    const n = L.get(st, FILE); if (!n) return { err: `no configuration file provided: not found` };
+    const envN = L.get(st, DIR + '/.env'); const vars = CS.dotenv(envN ? envN.c : '');
+    const ip = CS.interpolate(n.c, vars);
+    let doc; try { doc = CS.yaml(ip.text); } catch (e) { return { err: e.message.replace(/^yaml:/, `yaml:`) }; }
+    if (!doc || typeof doc !== 'object' || !doc.services || typeof doc.services !== 'object') return { err: 'validating docker-compose.yml: services must be a mapping' };
+    const svcs = {}; Object.entries(doc.services).forEach(([k, v]) => { svcs[k] = CS.composeService(v); });
+    const declaredNets = doc.networks ? Object.keys(doc.networks) : [];
+    for (const [k, s] of Object.entries(svcs)) for (const nn of s.networks || []) if (!declaredNets.includes(nn)) return { err: `service "${k}" refers to undefined network ${nn}: invalid compose project` };
+    for (const [k, s] of Object.entries(svcs)) for (const d of Object.keys(s.deps)) if (!svcs[d]) return { err: `service "${k}" depends on undefined service "${d}": invalid compose project` };
+    return { doc, svcs, vars, missing: ip.missing, text: ip.text };
+  }
+  const netsOf = s => s.networks && s.networks.length ? s.networks : ['default'];
+  const share = (a, b) => netsOf(a).some(n => netsOf(b).includes(n));
+  const parseUrl = u => { const m = String(u || '').match(/^(\w+):\/\/(?:([^:@]+)(?::([^@]*))?@)?([^:/]+)(?::(\d+))?/); return m ? { scheme: m[1], user: m[2], pw: m[3], host: m[4], port: m[5] ? +m[5] : null } : null; };
+  const HC_OK = { postgres: /pg_isready/, mysql: /mysqladmin\s+ping|mysql\s.*-e|healthcheck\.sh/ };
+
+  function up(st, quiet) {
+    const V = st.V; const cfgd = load(st);
+    if (cfgd.err) throw CmdError(cfgd.err);
+    const out = []; const warn = cfgd.missing.map(k => `WARN[0000] The "${k}" variable is not set. Defaulting to a blank string.`);
+    const S = cfgd.svcs;
+    for (const need of ['web', 'api', 'db', 'cache']) if (!S[need]) throw CmdError(`(This lab expects the four services web, api, db and cache; "${need}" is missing.)`);
+    // remove previous project containers
+    st.dk.containers = st.dk.containers.filter(c => !c.project);
+    const netNames = [...new Set(Object.values(S).flatMap(netsOf))].map(n => 'shop_' + n);
+    st.dk.networks = st.dk.networks.filter(n => !n.project).concat(netNames.map((n, i) => ({ name: n, driver: 'bridge', project: true, subnet: `172.${20 + i}.0.0/16` })));
+    if (!st.dk.volumes.some(v => v.name === 'shop_dbdata')) st.dk.volumes.push({ name: 'shop_dbdata', driver: 'local' });
+    const mk = (name, s, extra) => { const c = Object.assign({ id: CS.hex('shop' + name + JSON.stringify(s) + (st.dk.seq++), 12), name: `shop-${name}-1`, service: name, project: true, image: s.image, cmd: [], ports: s.ports.filter(p => p.host).map(p => ({ host: p.host, cont: p.cont })), mounts: [], env: s.env, network: 'shop_' + netsOf(s)[0], networks: netsOf(s).map(n => 'shop_' + n), restart: s.restart, status: 'running', logs: [], restarts: 0, ip: '172.20.0.' + (2 + Object.keys(S).indexOf(name)), createdAgo: 'Less than a second ago', upFor: 'Less than a second' }, extra || {}); st.dk.containers.push(c); return c; };
+    const lines = netNames.map(n => ` ✔ Network ${n.padEnd(20)} Created`);
+    if (!st.dk.volumes.find(v => v.name === 'shop_dbdata').shown) { lines.push(' ✔ Volume "shop_dbdata"        Created'); st.dk.volumes.find(v => v.name === 'shop_dbdata').shown = true; }
+    // db
+    const db = S.db; const dbC = mk('db', db, { cmd: [V.db === 'mysql' ? 'mysqld' : 'postgres'] });
+    const hostClash = db.ports.find(p => p.host === 3306 && V.bug === 'ports') || db.ports.find(p => p.host === 3306 || p.host === 5432 ? st.hostPorts.includes(p.host) : false);
+    let dbUp = true;
+    if (hostClash) { dbC.status = 'created'; dbUp = false; lines.push(` ✘ Container shop-db-1           Error`); out.push(`Error response from daemon: driver failed programming external connectivity on endpoint shop-db-1 (${CS.hex('ep', 64)}): Error starting userland proxy: listen tcp4 0.0.0.0:${hostClash.host}: bind: address already in use`); }
+    const dbPw = db.env[V.pwVar];
+    dbC.logs = V.db === 'mysql' ? ['2026-11-22T16:50:01.112Z 0 [System] [MY-015015] [Server] MySQL Server - start.', '2026-11-22T16:50:09.871Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: \'8.4.3\'  socket: \'/var/run/mysqld/mysqld.sock\'  port: 3306  MySQL Community Server - GPL.'] : ['PostgreSQL init process complete; ready for start up.', '2026-11-22 16:50:04.218 UTC [1] LOG:  starting PostgreSQL 16.6 on x86_64-pc-linux-musl', '2026-11-22 16:50:04.221 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432', '2026-11-22 16:50:04.230 UTC [1] LOG:  database system is ready to accept connections'];
+    if (!dbPw) { dbC.status = 'exited'; dbC.exit = 1; dbUp = false; dbC.logs = V.db === 'mysql' ? ['2026-11-22 16:50:01+00:00 [ERROR] [Entrypoint]: Database is uninitialized and password option is not specified', '    You need to specify one of the following as an environment variable:', '    - MYSQL_ROOT_PASSWORD'] : ['Error: Database is uninitialized and superuser password is not specified.', '       You must specify POSTGRES_PASSWORD to a non-empty value for the', '       superuser.']; }
+    const hcGood = db.healthcheck && HC_OK[V.db].test(db.hcTest);
+    if (dbUp && db.healthcheck) dbC.health = hcGood ? 'healthy' : 'unhealthy';
+    // cache
+    const cacheC = mk('cache', S.cache, { cmd: ['redis-server'], logs: ['1:C 22 Nov 2026 16:50:01.003 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo', '1:M 22 Nov 2026 16:50:01.004 * Ready to accept connections tcp'] });
+    // api
+    const api = S.api; const cond = api.deps.db;
+    if (cond === 'service_healthy' && (!db.healthcheck || !dbUp || !hcGood)) {
+      lines.push(dbUp && db.healthcheck ? ' ✘ Container shop-db-1           Error' : ` ${dbUp ? '✔' : '✘'} Container shop-db-1           ${dbUp ? 'Started' : 'Error'}`);
+      const msg = !dbUp ? `dependency failed to start: container shop-db-1 exited (1)` : !db.healthcheck ? 'dependency failed to start: container shop-db-1 has no healthcheck configured' : 'dependency failed to start: container shop-db-1 is unhealthy';
+      if (!out.length) out.push(msg);
+      if (db.healthcheck && !hcGood) dbC.healthLog = [{ ExitCode: 127, Output: `/bin/sh: ${db.hcTest.replace(/^CMD(-SHELL)? /, '').split(' ')[0]}: not found` }];
+      return { lines, out, warn, ok: false };
+    }
+    if (dbUp) lines.push(` ✔ Container shop-db-1           ${cond === 'service_healthy' ? 'Healthy' : 'Started'}`);
+    lines.push(' ✔ Container shop-cache-1        Started');
+    const apiC = mk('api', api, { cmd: ['node', 'server.js'] });
+    const fail = (lines2, code) => { apiC.logs = ['> shop-api@3.2.0 start', '> node server.js', '', 'shop-api: connecting to database...'].concat(lines2); if (/^(always|unless-stopped|on-failure)/.test(api.restart) && code === 'retry') { apiC.restarts = 1; apiC.logs = apiC.logs.concat(['', '> shop-api@3.2.0 start', '> node server.js', '', 'shop-api: connecting to database...', 'shop-api: database OK, cache OK', 'shop-api listening on :3000']); apiC.retried = true; return true; } if (/^(always|unless-stopped)/.test(api.restart)) { apiC.status = 'restarting'; apiC.exit = 1; apiC.restarts = 6; } else { apiC.status = 'exited'; apiC.exit = 1; apiC.exitedAgo = '3 seconds ago'; } return false; };
+    let apiOk = true;
+    const dbu = parseUrl(api.env.DATABASE_URL); const ru = parseUrl(api.env.REDIS_URL);
+    if (!dbu) apiOk = fail([`TypeError [ERR_INVALID_URL]: Invalid URL: ${api.env.DATABASE_URL || '(DATABASE_URL is empty)'}`]);
+    else if (['localhost', '127.0.0.1', '0.0.0.0'].includes(dbu.host)) apiOk = fail([`Error: connect ECONNREFUSED 127.0.0.1:${dbu.port || V.port}`, '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1607:16) {', `  errno: -111, code: 'ECONNREFUSED', syscall: 'connect', address: '127.0.0.1', port: ${dbu.port || V.port}`, '}', '(Inside a container, localhost is the container itself, not the server.)']);
+    else if (dbu.host !== 'db' || !share(api, db)) apiOk = fail([`Error: getaddrinfo ENOTFOUND ${dbu.host}`, `    at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:120:26) {`, `  errno: -3008, code: 'ENOTFOUND', syscall: 'getaddrinfo', hostname: '${dbu.host}'`, '}']);
+    else if (!dbUp) apiOk = fail([`Error: connect ECONNREFUSED 172.20.0.2:${V.port}`, `  code: 'ECONNREFUSED'`, '(db is not running.)']);
+    else if ((dbu.port || V.port) !== V.port) apiOk = fail([`Error: connect ECONNREFUSED 172.20.0.2:${dbu.port}`, `  code: 'ECONNREFUSED'`]);
+    else if (cond !== 'service_healthy') apiOk = fail([`Error: connect ECONNREFUSED 172.20.0.2:${V.port}`, '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1607:16) {', `  errno: -111, code: 'ECONNREFUSED', syscall: 'connect', address: '172.20.0.2', port: ${V.port}`, '}', `(db was started but was still initializing when api tried to connect: "depends_on" alone only waits for the container to start, not for the database to be ready.)`], 'retry');
+    if (apiOk && dbu.pw !== dbPw) apiOk = fail([V.db === 'mysql' ? "Error: Access denied for user 'shop'@'172.20.0.4' (using password: YES)" : 'error: password authentication failed for user "shop"', `  code: '${V.db === 'mysql' ? 'ER_ACCESS_DENIED_ERROR' : '28P01'}'`]);
+    if (apiOk) {
+      if (!ru) apiOk = fail(['shop-api: database OK', `TypeError [ERR_INVALID_URL]: Invalid URL: ${api.env.REDIS_URL || '(REDIS_URL is empty)'}`]);
+      else if (['localhost', '127.0.0.1'].includes(ru.host)) apiOk = fail(['shop-api: database OK', `Error: connect ECONNREFUSED 127.0.0.1:${ru.port || 6379}`, '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1607:16)', `  code: 'ECONNREFUSED', address: '127.0.0.1', port: ${ru.port || 6379}`, '(Inside a container, localhost is the container itself, not the server.)']);
+      else if (ru.host !== 'cache' || !share(api, S.cache)) apiOk = fail(['shop-api: database OK', `Error: getaddrinfo ENOTFOUND ${ru.host}`, `  code: 'ENOTFOUND', hostname: '${ru.host}'`]);
+    }
+    if (apiOk && !apiC.retried) apiC.logs = ['> shop-api@3.2.0 start', '> node server.js', '', 'shop-api: connecting to database...', 'shop-api: database OK, cache OK', 'shop-api listening on :3000'];
+    apiC.ok = apiOk;
+    lines.push(' ✔ Container shop-api-1          Started');
+    const webC = mk('web', S.web, { cmd: ['nginx', '-g', 'daemon off;'], logs: ['/docker-entrypoint.sh: Configuration complete; ready for start up', '2026/11/22 16:50:12 [notice] 1#1: nginx/1.27.3', '2026/11/22 16:50:12 [notice] 1#1: start worker processes'] });
+    webC.reachApi = apiOk && share(S.web, api);
+    lines.push(' ✔ Container shop-web-1          Started');
+    st.flags.lastUp = { apiOk, cond, hc: !!(db.healthcheck && hcGood), dbPublished: db.ports.some(p => p.host) };
+    return { lines, out, warn, ok: !out.length };
+  }
+
+  function composeCmd(st, sub, toks) {
+    const proj = st.dk.containers.filter(c => c.project);
+    const strip = toks.filter(t => !t.startsWith('-'));
+    if (st.cwd !== DIR && !toks.includes('-f')) throw CmdError('no configuration file provided: not found\n(Run docker compose from /srv/shop, where docker-compose.yml is.)');
+    switch (sub) {
+      case 'up': {
+        if (!toks.includes('-d') && !toks.includes('--detach')) return { text: '(Attached mode isn\'t simulated: use docker compose up -d, then docker compose logs.)', cls: 'muted' };
+        const r = up(st); st.flags.composeUp = (st.flags.composeUp || 0) + 1;
+        const head = `[+] Running ${r.lines.length}/${r.lines.length}`;
+        const text = r.warn.concat([head], r.lines).join('\n');
+        if (r.out.length) throw CmdError(text + '\n' + r.out.join('\n'));
+        return text;
+      }
+      case 'ps': {
+        const all = toks.includes('-a') || toks.includes('--all');
+        const list = proj.filter(c => all || c.status === 'running' || c.status === 'restarting');
+        return CS.table(['NAME', 'IMAGE', 'SERVICE', 'STATUS', 'PORTS'], list.map(c => [c.name, c.image, c.service, CS.statusText(c), CS.portsText(c)]));
+      }
+      case 'logs': {
+        st.flags.composeLogs = true;
+        const list = proj.filter(c => !strip.length || strip.includes(c.service));
+        if (strip.length && !list.length) throw CmdError(`no such service: ${strip[0]}`);
+        if (strip.includes('api')) st.flags.apiLogs = true;
+        if (!strip.length) st.flags.apiLogs = true;
+        return list.map(c => (c.logs || []).map(l => `${(c.service + '-1').padEnd(9)}| ${l}`).join('\n')).filter(Boolean).join('\n') || null;
+      }
+      case 'down': { const n = proj.length; st.dk.containers = st.dk.containers.filter(c => !c.project); const nets = st.dk.networks.filter(x => x.project); st.dk.networks = st.dk.networks.filter(x => !x.project); return `[+] Running ${n + nets.length}/${n + nets.length}\n` + proj.map(c => ` ✔ Container ${c.name.padEnd(20)} Removed`).concat(nets.map(x => ` ✔ Network ${x.name.padEnd(22)} Removed`)).join('\n'); }
+      case 'config': { const c = load(st); if (c.err) throw CmdError(c.err); st.flags.configSeen = true; return c.missing.map(k => `WARN[0000] The "${k}" variable is not set. Defaulting to a blank string.`).concat([`name: shop`, c.text.trim()]).join('\n'); }
+      case 'restart': { const r = up(st); return r.out.length ? { text: r.out.join('\n'), cls: 'err' } : proj.map(c => ` ✔ Container ${c.name}  Started`).join('\n'); }
+      case 'stop': proj.forEach(c => { c.status = 'exited'; c.exit = 0; }); return proj.map(c => ` ✔ Container ${c.name}  Stopped`).join('\n');
+      case 'version': return 'Docker Compose version v2.29.7';
+    }
+    throw CmdError(`unknown docker command: "compose ${sub}"\nAvailable here: up -d, ps [-a], logs [SERVICE], down, config, restart, version`);
+  }
+
+  // ------------------------------------------------------------- state
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/etc/hostname'] = L.f('shop01\n');
+    fs[DIR] = L.d('ruben', 'ruben'); fs[DIR + '/nginx'] = L.d('ruben', 'ruben');
+    fs[FILE] = L.f(composeText(V, false), 'ruben', 'ruben');
+    fs[DIR + '/nginx/default.conf'] = L.f('server {\n    listen 80;\n    location /api/ {\n        proxy_pass http://api:3000/;\n    }\n    location / {\n        root /usr/share/nginx/html;\n    }\n}\n', 'ruben', 'ruben');
+    fs[DIR + '/README.md'] = L.f(`# shop stack\n\nStart:  cd /srv/shop && docker compose up -d\nCheck:  curl http://localhost/api/health\n\nOn my laptop it works (I run Postgres/MySQL and Redis directly on the laptop, not in Docker). -- dev team\n`, 'ruben', 'ruben');
+    const users = L.baseUsers('ruben'); users.ruben.groups.push('docker');
+    const st = { v, V, fs, cwd: DIR, users, services: { docker: { installed: true, active: true, enabled: true }, ssh: { installed: true, active: true, enabled: true } }, units: {}, packages: ['docker-ce', 'curl'], ufw: { enabled: false, defaultIn: 'deny', rules: [] }, flags: {}, hostPorts: V.bug === 'ports' ? [3306] : [] };
+    if (V.bug === 'ports') st.services.mysql = { installed: true, active: true, enabled: true };
+    st.dk = CS.dockerState(['nginx:1.27-alpine', 'shop-api:3.2', V.dbImage, 'redis:7-alpine'].map((r, i) => CS.image(r, [48, 212, V.db === 'mysql' ? 603 : 276, 41][i], { created: ['4 weeks ago', '2 days ago', '3 weeks ago', '4 weeks ago'][i] })));
+    try { up(st); } catch (e) { /* the initial broken state */ }
+    st.dk.containers.forEach(c => { c.createdAgo = '47 minutes ago'; if (c.status === 'running') c.upFor = '47 minutes'; c.exitedAgo = '47 minutes ago'; });
+    st.flags = {};
+    return st;
+  }
+
+  const dcfg = {
+    home: HOME,
+    compose: (st, sub, toks) => composeCmd(st, sub, toks || []),
+    hostPorts: st => st.hostPorts,
+    build: () => ({ ok: false, log: ['(Nothing to build in this lab: the images are already pulled.)'] }),
+    run: () => {},
+    onLogs: (st, c) => { if (c.service === 'api') st.flags.apiLogs = true; st.flags.composeLogs = true; },
+    exec: (st, c, cmd) => {
+      if (!c.project) return undefined;
+      const cfgd = load(st); const me = cfgd.svcs ? cfgd.svcs[c.service] : null;
+      const host = cmd[cmd.length - 1];
+      if (['getent', 'nslookup', 'ping', 'nc'].includes(cmd[0])) {
+        const target = cmd[0] === 'nc' ? cmd[cmd.length - 2] : (cmd[0] === 'getent' ? cmd[2] : host);
+        const other = cfgd.svcs && cfgd.svcs[target];
+        if (!other || !share(me, other)) return { text: cmd[0] === 'getent' ? '' : cmd[0] === 'nslookup' ? `** server can't find ${target}: NXDOMAIN` : `${cmd[0]}: bad address '${target}'`, cls: 'err' };
+        const ip = (st.dk.containers.find(x => x.service === target) || {}).ip || '172.20.0.9';
+        return cmd[0] === 'getent' ? `${ip}      ${target}` : cmd[0] === 'nslookup' ? `Server:\t\t127.0.0.11\nAddress:\t127.0.0.11:53\n\nNon-authoritative answer:\nName:\t${target}\nAddress: ${ip}` : cmd[0] === 'nc' ? `${target} (${ip}:${cmd[cmd.length - 1]}) open` : `PING ${target} (${ip}): 56 data bytes\n64 bytes from ${ip}: seq=0 ttl=64 time=0.081 ms`;
+      }
+      if (cmd[0] === 'env' || cmd[0] === 'printenv') return Object.entries(c.env || {}).map(([k, v]) => `${k}=${v}`).join('\n');
+      return undefined;
+    }
+  };
+  function curl(st, toks) {
+    const url = toks.find(x => !x.startsWith('-')) || '';
+    const m = url.match(/^(?:https?:\/\/)?(localhost|127\.0\.0\.1|shop01|10\.20\.0\.40)(?::(\d+))?(\/\S*)?$/);
+    const head = toks.includes('-i') || toks.includes('-I');
+    if (!m) return { text: `curl: (6) Could not resolve host: ${url.replace(/^https?:\/\//, '').split(/[/:]/)[0]}`, cls: 'err' };
+    const port = +(m[2] || 80); const path = m[3] || '/';
+    if (port === 3306 && st.hostPorts.includes(3306)) return { text: 'curl: (1) Received HTTP/0.9 when not allowed\n(That\'s the MySQL server installed directly on shop01, not the container.)', cls: 'err' };
+    const c = st.dk.containers.find(x => (x.status === 'running') && (x.ports || []).some(p => p.host === port));
+    if (!c) return { text: `curl: (7) Failed to connect to localhost port ${port} after 0 ms: Couldn't connect to server`, cls: 'err' };
+    if (c.service !== 'web') return { text: 'curl: (52) Empty reply from server', cls: 'err' };
+    if (!path.startsWith('/api/')) return (head ? 'HTTP/1.1 200 OK\nServer: nginx/1.27.3\n\n' : '') + '<!doctype html><title>Shop</title><h1>Shop</h1>';
+    const api = st.dk.containers.find(x => x.service === 'api');
+    if (!api || api.status !== 'running' || !api.ok || !c.reachApi) { c.logs.push(`2026/11/22 16:51:0${Math.floor(Math.random() * 9)} [error] 29#29: *3 ${api && api.status === 'running' && c.reachApi ? 'upstream prematurely closed connection' : 'host not found in upstream "api" / connect() failed (111: Connection refused)'} while connecting to upstream, client: 172.20.0.1, server: , request: "GET ${path} HTTP/1.1", upstream: "http://api:3000${path.replace('/api', '')}"`); return (head ? 'HTTP/1.1 502 Bad Gateway\nServer: nginx/1.27.3\nContent-Type: text/html\n\n' : '') + '<html>\n<head><title>502 Bad Gateway</title></head>\n<body>\n<center><h1>502 Bad Gateway</h1></center>\n<hr><center>nginx/1.27.3</center>\n</body>\n</html>'; }
+    if (path === '/api/health') { st.flags.healthOk = st.flags.lastUp && st.flags.lastUp.apiOk; return (head ? 'HTTP/1.1 200 OK\nServer: nginx/1.27.3\nContent-Type: application/json\n\n' : '') + `{"status":"ok","db":"up","cache":"up","version":"3.2.0"}`; }
+    return (head ? 'HTTP/1.1 404 Not Found\n\n' : '') + '{"error":"not found"}';
+  }
+  const cfg = {
+    user: 'ruben', home: HOME, host: 'shop01', ip: '10.20.0.40', adminIp: '10.20.0.2',
+    curl: (st, toks) => curl(st, toks),
+    listeners: st => [{ addr: '0.0.0.0', port: 22, proc: 'sshd' }].concat(st.hostPorts.includes(3306) ? [{ addr: '0.0.0.0', port: 3306, proc: 'mysqld' }] : [], st.dk.containers.some(c => c.service === 'web' && c.status === 'running') ? [{ addr: '0.0.0.0', port: 80, proc: 'docker-proxy' }] : []),
+    extra: (lab) => CS.docker(lab, dcfg)
+  };
+
+  function render(st) { $('#dk-panel').innerHTML = CS.dockerPanel(st); }
+  const fileSvcs = st => { const c = load(st); return c.svcs || null; };
+
+  let lab;
+  lab = Lab({
+    id: 'docker-compose-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@shop01 — /srv/shop',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@shop01:${st.cwd === HOME ? '~' : st.cwd.replace(HOME, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nDocker version 27.3.1, build ce12230 · Docker Compose version v2.29.7\n\nLast login: Sun Nov 22 10:40:02 2026 from 10.20.0.2\nType "help" for the commands; edit files with nano.\n',
+    createState, commands: lab => L.commands(lab, cfg), render,
+    onReset: st => { document.getElementById('ed-panel').hidden = true; $('#wo-text').innerHTML = `"The new shop stack (${st.V.db === 'mysql' ? 'MySQL' : 'PostgreSQL'} + Redis) answers <b>502 Bad Gateway</b> on <code>/api/health</code>. Works on my laptop!" (dev team)`; },
+    objectives: [
+      { text: 'Bring the stack up and read the logs to find why the API isn\'t serving.',
+        check: st => (st.flags.composeUp && st.flags.apiLogs) || (!st.flags.composeUp ? 'Start (or re-apply) the stack with docker compose up -d.' : 'Read the api service logs.'),
+        hints: ['Compose has its own <code>ps</code> and <code>logs</code> subcommands, run from the project folder.', 'A 502 from nginx means it can\'t reach the api container: look at api\'s status and logs first.', '<code>cd /srv/shop</code>, <code>docker compose up -d</code>, <code>docker compose ps -a</code>, <code>docker compose logs api</code>'] },
+      { text: 'Make the services find each other the container way: by service name, on a shared network, with the database not published to the host.',
+        check: st => {
+          const S = fileSvcs(st); if (!S || !S.api) return 'docker-compose.yml doesn\'t parse (try docker compose config).';
+          const d = parseUrl(S.api.env.DATABASE_URL), r = parseUrl(S.api.env.REDIS_URL);
+          if (!d || d.host !== 'db') return 'DATABASE_URL should point at the db service by name.';
+          if (!r || r.host !== 'cache') return 'REDIS_URL should point at the cache service by name.';
+          if (!share(S.api, S.db) || !share(S.api, S.cache)) return 'api isn\'t on the same network as db and cache.';
+          if (!share(S.web, S.api)) return 'web can\'t reach api (no shared network).';
+          if (S.db.ports.some(p => p.host)) return 'db is still published on a host port (ports:): the database must stay internal.';
+          return true;
+        },
+        hints: ['Inside a container, <code>localhost</code> is that container. Compose gives every service a DNS name on its networks.', st => ({ redis: 'Look at REDIS_URL: on the laptop Redis ran on the laptop itself.', ports: 'Two things: the db service publishes 3306 on the host (and something on shop01 already uses it: <code>sudo ss -tlnp</code>), and DATABASE_URL points at 127.0.0.1.', networks: 'api sits only on the frontend network, db and cache only on backend: <code>docker exec shop-web-1 getent hosts db</code> style checks show who can resolve whom. Also check REDIS_URL.' })[st.V.bug], st => ({ redis: 'In docker-compose.yml set <code>REDIS_URL: redis://cache:6379</code>.', ports: 'Remove the <code>ports:</code> block from db (services on the same network reach it on 3306 anyway) and set the host in DATABASE_URL to <code>db</code>.', networks: 'Give api both networks (<code>- frontend</code> and <code>- backend</code>) and set <code>REDIS_URL: redis://cache:6379</code>.' })[st.V.bug]] },
+      { text: 'Make the API wait for a database that is actually ready: a healthcheck on <code>db</code> and <code>depends_on</code> with <code>condition: service_healthy</code>.',
+        check: st => { const S = fileSvcs(st); if (!S || !S.db) return 'docker-compose.yml doesn\'t parse.'; if (!S.db.healthcheck) return 'db has no healthcheck.'; if (!HC_OK[st.V.db].test(S.db.hcTest)) return `db's healthcheck doesn't test the database (use ${st.V.db === 'mysql' ? 'mysqladmin ping' : 'pg_isready'}).`; if (S.api.deps.db !== 'service_healthy') return 'api\'s depends_on doesn\'t wait for db to be healthy.'; return true; },
+        hints: ['A plain <code>depends_on: [db]</code> only waits until the db container has <i>started</i>, not until the database accepts connections.', st => `Add a <code>healthcheck:</code> to db that runs <code>${st.V.db === 'mysql' ? 'mysqladmin ping -h localhost' : 'pg_isready -U shop -d shop'}</code>, and change api's depends_on to the long form with conditions.`, st => `db: <code>healthcheck: { test: ${Lab.util.esc(st.V.hc)}, interval: 5s, timeout: 3s, retries: 10 }</code>; api: <code>depends_on: { db: { condition: service_healthy }, cache: { condition: service_started } }</code> (block style works too).`] },
+      { text: 'Apply it and verify end to end: <code>curl http://localhost/api/health</code> returns 200 through nginx.',
+        check: st => { const a = st.dk.containers.find(c => c.service === 'api'); if (!a || a.status !== 'running' || !a.ok) return 'api isn\'t running and connected (apply with docker compose up -d, then check logs).'; return st.flags.healthOk || 'Test through nginx: curl -i http://localhost/api/health'; },
+        hints: ['Compose recreates the containers whose configuration changed.', '<code>docker compose up -d</code>, <code>docker compose ps</code>; if api is still not up, its logs say what\'s left.', '<code>docker compose up -d</code>, then <code>curl -i http://localhost/api/health</code>'] },
+      { text: 'Move the database password out of docker-compose.yml into a <code>.env</code> file.', optional: true,
+        check: st => { const n = L.get(st, FILE); const e = L.get(st, DIR + '/.env'); if (!e) return 'There\'s no /srv/shop/.env.'; if (n && n.c.includes(PW)) return 'The password is still written in docker-compose.yml.'; const a = st.dk.containers.find(c => c.service === 'api'); return (a && a.ok && st.flags.healthOk) || 'Re-apply and check that the stack still works with the variables.'; },
+        hints: ['Compose reads <code>.env</code> in the project folder and replaces <code>${VAR}</code> in the file.', 'Put <code>DB_PASSWORD=…</code> in .env and use <code>${DB_PASSWORD}</code> in both places (db and the api URL). <code>docker compose config</code> shows the result.', `<code>nano /srv/shop/.env</code> with <code>DB_PASSWORD=${PW}</code>, replace it in the compose file with <code>\${DB_PASSWORD}</code>, then <code>docker compose up -d</code>. (Add .env to .gitignore.)`] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      s.push({ cmd: 'docker compose up -d' }, { cmd: 'docker compose ps -a', note: 'web is up but api exited: that\'s the 502.' }, { cmd: 'docker compose logs api', note: { redis: 'It reached the database too early (db was still starting) and, once that\'s fixed, Redis on localhost.', ports: 'db never started: port 3306 on the host is taken. And the API looks for the database on 127.0.0.1.', networks: 'api can\'t resolve "db": it\'s on another network.' }[V.bug] });
+      if (V.bug === 'ports') s.push({ cmd: 'sudo ss -tlnp', note: 'A MySQL installed directly on shop01 already listens on 3306. The container doesn\'t need a host port at all.' });
+      if (V.bug === 'networks') s.push({ cmd: 'docker network ls', note: 'Two networks: frontend and backend.' });
+      s.push({ cmd: 'nano docker-compose.yml', note: 'Service names instead of localhost' + (V.bug === 'ports' ? ', no host port for db' : V.bug === 'networks' ? ', api on both networks' : '') + ', a real healthcheck on db and depends_on with condition: service_healthy. The password moves to ${DB_PASSWORD}.' }, { run: api => api.fill('#ed-text', composeText(V, true), { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'nano .env', note: 'The secrets live in .env (keep it out of git).' }, { run: api => api.fill('#ed-text', `DB_PASSWORD=${PW}\n${V.db === 'mysql' ? 'DB_ROOT_PASSWORD=r00t-shop-2026\n' : ''}`, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'docker compose config', note: 'Check that the variables resolve.' });
+      s.push({ cmd: 'docker compose up -d', note: 'Compose now waits for db to report healthy before starting api.' }, { cmd: 'docker compose ps' }, { cmd: 'curl -i http://localhost/api/health' });
+      return s;
+    },
+    debrief: [
+      { title: 'localhost means "this container"', text: 'On the laptop the database ran next to the app; in Compose each service is its own host. Use the service name (<code>db</code>, <code>cache</code>): Compose runs a DNS server for every network.' },
+      { title: 'Networks decide who can talk', text: 'Services on different Compose networks can\'t resolve each other. Splitting frontend and backend is good practice; the service that bridges them has to be on both.' },
+      { title: 'ports vs internal traffic', text: '<code>ports:</code> publishes on the host, and is only for what users reach (nginx). Containers talk on the internal network without it, and a published database is both a security hole and a port clash waiting to happen.' },
+      { title: 'Started is not ready', text: 'Plain <code>depends_on</code> only orders container starts. A healthcheck plus <code>condition: service_healthy</code> waits until the database accepts connections. Retries in the app are still a good idea.' },
+      { title: 'Read the stack from the edge in', text: 'A 502 from nginx says "upstream down". <code>docker compose ps -a</code> and <code>logs</code> point at the failing service; <code>docker exec … getent hosts</code> tests DNS between services.' },
+      { title: 'Secrets in .env', text: 'Compose substitutes <code>${VAR}</code> from .env; <code>docker compose config</code> shows the result. Keep .env out of git, or use Compose secrets.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>

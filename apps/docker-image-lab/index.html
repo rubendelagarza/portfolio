@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Slim down a 1.2 GB Docker image — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 17</div>
+    <h1>Lab: Slim down a 1.2 GB Docker image</h1>
+    <p>The team's API image is over a gigabyte: CI is slow and the registry bill keeps growing. Measure where the size comes from, add a <code>.dockerignore</code>, rewrite the Dockerfile as a multi-stage build and ship an image under 200 MB that still works.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~15 min</span><span class="pill">docker · Dockerfile · multi-stage</span><span class="pill">3 randomized apps (Python, Node, Go)</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> reading <code>docker history</code> to find what makes an image big, build context hygiene, multi-stage builds, choosing a runtime base image (slim, alpine, distroless, scratch) and the runtime surprises each one brings: native libraries, static binaries and CA certificates.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <p style="font-size:14px" id="wo-text"></p>
+          <p class="muted" style="font-size:12px;margin:0">You're on the build server <code>build01</code> as <code>ruben</code>. The project is in <code>~/shopapi</code>; files open in the editor with <code>nano</code>.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Docker on build01</h3>
+          <div id="dk-panel"></div>
+        </div>
+        <div class="panel">
+          <h3>Requirements</h3>
+          <ul style="font-size:13px;padding-left:18px;margin:0">
+            <li>Tag the new image <code>shopapi:2.0</code>.</li>
+            <li>Final image under <b>200 MB</b>.</li>
+            <li>The app listens on port 8080 and must answer <code>GET /health</code> with 200.</li>
+            <li>Keep the Dockerfile multi-stage: build tools never ship in the final image.</li>
+          </ul>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 17 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script src="../../assets/container-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim, CS = ContainerSim, { CmdError } = Lab;
+  const HOME = '/home/ruben', DIR = HOME + '/shopapi';
+  const $ = s => document.querySelector(s);
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+
+  // Base images known to the simulated registry (uncompressed MB)
+  const BASES = {
+    'python:3.12': { size: 1020, os: 'debian', full: true }, 'python:3.12-slim': { size: 125, os: 'debian' }, 'python:3.12-slim-bookworm': { size: 125, os: 'debian' }, 'python:3.12-alpine': { size: 52, os: 'alpine' },
+    'node:22': { size: 1000, os: 'debian', full: true }, 'node:22-slim': { size: 230, os: 'debian' }, 'node:22-alpine': { size: 140, os: 'alpine' },
+    'golang:1.23': { size: 830, os: 'debian', full: true, go: true }, 'golang:1.23-alpine': { size: 260, os: 'alpine', go: true },
+    'alpine:3.20': { size: 8, os: 'alpine', certs: true }, 'debian:12-slim': { size: 75, os: 'debian' }, 'ubuntu:24.04': { size: 78, os: 'debian' }, 'scratch': { size: 0, os: 'scratch' },
+    'gcr.io/distroless/static-debian12': { size: 2, os: 'distroless-static', certs: true }, 'gcr.io/distroless/static-debian12:nonroot': { size: 2, os: 'distroless-static', certs: true, nonroot: true },
+    'gcr.io/distroless/base-debian12': { size: 21, os: 'distroless-base', certs: true }, 'gcr.io/distroless/base-debian12:nonroot': { size: 21, os: 'distroless-base', certs: true, nonroot: true },
+    'gcr.io/distroless/nodejs22-debian12': { size: 130, os: 'distroless-node', certs: true }, 'gcr.io/distroless/nodejs22-debian12:nonroot': { size: 130, os: 'distroless-node', certs: true, nonroot: true },
+    'gcr.io/distroless/python3-debian12': { size: 52, os: 'distroless-py', certs: true }
+  };
+  const normBase = b => b.replace(/^docker\.io\/(library\/)?/, '').replace(/:latest$/, '');
+
+  const VARIANTS = [
+    { lang: 'python', title: 'Python (Flask + PostgreSQL)', bloat: [['.git', 48], ['tests/fixtures', 92], ['__pycache__', 2]],
+      files: { 'app.py': 'import os\nfrom flask import Flask, jsonify\nimport psycopg2  # PostgreSQL driver\n\napp = Flask(__name__)\n\n@app.get("/health")\ndef health():\n    return jsonify(status="ok")\n\nif __name__ == "__main__":\n    app.run(host="0.0.0.0", port=8080)\n', 'requirements.txt': 'flask==3.1.0\ngunicorn==23.0.0\npsycopg2==2.9.10\n', 'README.md': '# shopapi\n\nRun: gunicorn -b 0.0.0.0:8080 app:app\nHealth check: GET /health\n' },
+      dockerfile: 'FROM python:3.12\nWORKDIR /app\nCOPY . .\nRUN apt-get update && apt-get install -y build-essential libpq-dev\nRUN pip install -r requirements.txt\nEXPOSE 8080\nCMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]\n' },
+    { lang: 'node', title: 'Node.js (TypeScript + Express)', bloat: [['.git', 38], ['node_modules', 40], ['coverage', 22]],
+      files: { 'package.json': '{\n  "name": "shopapi",\n  "version": "2.0.0",\n  "scripts": { "build": "tsc -p .", "start": "node dist/server.js" },\n  "dependencies": { "express": "^4.21.1", "pg": "^8.13.1" },\n  "devDependencies": { "typescript": "^5.6.3", "@types/express": "^5.0.0", "jest": "^29.7.0", "ts-jest": "^29.2.5" }\n}\n', 'package-lock.json': '{ "lockfileVersion": 3 }\n', 'tsconfig.json': '{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "target": "ES2022", "module": "commonjs" } }\n', 'src/server.ts': 'import express from "express";\nconst app = express();\napp.get("/health", (_req, res) => res.json({ status: "ok" }));\napp.listen(8080);\n', 'README.md': '# shopapi\n\nBuild: npm run build (TypeScript -> dist/)\nRun:   node dist/server.js  (port 8080)\nHealth check: GET /health\n' },
+      dockerfile: 'FROM node:22\nWORKDIR /app\nCOPY . .\nRUN npm install\nRUN npm run build\nEXPOSE 8080\nCMD ["node", "dist/server.js"]\n' },
+    { lang: 'go', title: 'Go (net/http, calls a payments API over HTTPS)', bloat: [['.git', 70], ['testdata', 150]],
+      files: { 'go.mod': 'module example.com/shopapi\n\ngo 1.23\n', 'go.sum': '', 'cmd/server/main.go': 'package main\n\n// Listens on :8080. /health checks the payments API over HTTPS.\nfunc main() { /* ... */ }\n', 'README.md': '# shopapi\n\nBuild: go build -o server ./cmd/server\nRun:   ./server  (port 8080)\nHealth check: GET /health (calls https://api.payments.example over TLS)\n' },
+      dockerfile: 'FROM golang:1.23\nWORKDIR /src\nCOPY . .\nRUN go build -o /app/server ./cmd/server\nEXPOSE 8080\nCMD ["/app/server"]\n' }
+  ];
+  const DEP = { python: { prod: 45, dev: 0 }, node: { prod: 38, dev: 140 }, go: { prod: 0, dev: 150 } };
+
+  // ------------------------------------------------------------- build evaluator
+  function evalBuild(st, ctx) {
+    const V = st.V; const df = ctx.df; const steps = []; const total = df.stages.reduce((n, s) => n + s.ins.length + 1, 0) + 2;
+    const req = (L.get(st, DIR + '/requirements.txt') || {}).c || '';
+    const bloat = V.bloat.filter(([p]) => !ctx.excluded(p));
+    const ctxMB = bloat.reduce((n, [, s]) => n + s, 0) + 0.2;
+    const ctxSize = ctxMB >= 1 ? ctxMB.toFixed(1) + 'MB' : '41.3kB';
+    let n = 0;
+    const label = (s, i) => `[${s.name || 'stage-' + s.index} ${i}/${s.ins.length + 1}]`;
+    const fail = (s, i, ins, lines, exitMsg) => ({ ok: false, steps, total, failAt: n, ctxSize, ctxSecs: (ctxMB / 200).toFixed(1), log: [`------`, ` > ${label(s, i)} ${ins.ins} ${ins.args}:`].concat(lines.map(l => `${(10 + n * 1.7).toFixed(2)} ${l}`), ['------', exitMsg || `ERROR: failed to solve: process "/bin/sh -c ${ins.args}" did not complete successfully: exit code: 1`]) });
+    const state = [];
+    for (const s of df.stages) {
+      n++;
+      const baseName = normBase(s.base);
+      const fromStage = df.stages.slice(0, s.index).find(x => x.name === baseName);
+      let B = BASES[baseName];
+      const sv = { name: s.name, adds: 0, tags: new Set(), user: '', env: {}, workdir: '/', layers: [], cmd: null, entry: null, base: baseName, os: B ? B.os : fromStage ? state[fromStage.index].os : null, certs: B ? !!B.certs : false };
+      if (fromStage) { const p = state[fromStage.index]; Object.assign(sv, { adds: p.adds, tags: new Set(p.tags), user: p.user, env: Object.assign({}, p.env), workdir: p.workdir, os: p.os, certs: p.certs, baseSize: p.baseSize, depsAt: p.depsAt, artifact: p.artifact, layers: p.layers.slice() }); }
+      else if (!B) return { ok: false, steps, total, failAt: n, ctxSize, log: [`ERROR: failed to solve: ${s.base}: failed to resolve source metadata for docker.io/library/${s.base}: docker.io/library/${s.base}: not found`, `(This simulated registry has: ${Object.keys(BASES).join(', ')})`] };
+      if (B) { sv.baseSize = B.size; sv.full = !!B.full; sv.go = !!B.go; sv.nonroot = !!B.nonroot; if (B.full && V.lang === 'go') sv.go = true; sv.layers.push({ by: `/bin/sh -c #(nop) FROM ${baseName}`, size: B.size, base: true, comment: 'base image' }); }
+      steps.push(` => ${label(s, 1)} FROM docker.io/${baseName.includes('/') ? baseName : 'library/' + baseName}${' '.repeat(6)}${(B ? Math.max(0.4, B.size / 260) : 0).toFixed(1)}s`);
+      for (let i = 0; i < s.ins.length; i++) {
+        const ins = s.ins[i]; n++; const a = ins.args; let add = 0; const before = sv.adds;
+        const stepLine = (secs) => steps.push(` => ${label(s, i + 2)} ${ins.ins} ${a.length > 52 ? a.slice(0, 51) + '…' : a}${' '.repeat(4)}${secs}s`);
+        if (ins.ins === 'WORKDIR') { sv.workdir = a.trim().startsWith('/') ? a.trim() : (sv.workdir.replace(/\/$/, '') + '/' + a.trim()); stepLine('0.0'); continue; }
+        if (ins.ins === 'ENV') { Object.assign(sv.env, ins.env); continue; }
+        if (ins.ins === 'USER') { sv.user = ins.user; continue; }
+        if (ins.ins === 'CMD') { sv.cmd = ins.exec || ['/bin/sh', '-c', ins.shell]; continue; }
+        if (ins.ins === 'ENTRYPOINT') { sv.entry = ins.exec || ['/bin/sh', '-c', ins.shell]; continue; }
+        if (['EXPOSE', 'LABEL', 'ARG', 'HEALTHCHECK', 'VOLUME', 'STOPSIGNAL', 'SHELL'].includes(ins.ins)) continue;
+        if (ins.ins === 'COPY' || ins.ins === 'ADD') {
+          if (ins.from) {
+            const src = df.stageByRef(ins.from);
+            if (!src || src.index >= s.index) { if (BASES[normBase(ins.from)]) { if (ins.src.some(p => /ca-certificates|ssl\/certs/.test(p))) { sv.tags.add('certs'); sv.certs = true; add = 0.2; } stepLine('0.3'); sv.adds += add; sv.layers.push({ by: `COPY ${a}`, size: add }); continue; } return fail(s, i + 2, ins, [`invalid from flag value ${ins.from}: pull access denied, repository does not exist`], `ERROR: failed to solve: invalid from flag value ${ins.from}: stage not found`); }
+            const sp = state[src.index];
+            for (const pth of ins.src) {
+              const p0 = pth.replace(/\/$/, '');
+              if (/ca-certificates|ssl\/certs/.test(p0)) { if (!sp.certs) return fail(s, i + 2, ins, [], `ERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref: "${p0}": not found`); sv.tags.add('certs'); sv.certs = true; add += 0.2; continue; }
+              if (sp.artifact && (p0 === sp.artifact.path || sp.artifact.path.startsWith(p0 + '/') || (p0 === sp.workdir && sp.artifact.path.startsWith(p0)))) { sv.artifact = Object.assign({}, sp.artifact, { path: destPath(sv, ins.dest, sp.artifact.path, p0) }); add += sp.artifact.size; sv.tags.add('artifact'); }
+              if (sp.depsAt && (p0 === sp.depsAt || sp.depsAt.startsWith(p0 + '/') || p0.startsWith(sp.depsAt))) { sv.depsAt = destPath(sv, ins.dest, sp.depsAt, p0); sv.depsFrom = sp.depsAt; sv.tags.add('deps'); if (sp.tags.has('devdeps')) sv.tags.add('devdeps'); if (sp.tags.has('pgCompiled')) sv.tags.add('pgCompiled'); add += DEP[V.lang].prod + (sp.tags.has('devdeps') ? DEP[V.lang].dev : 0); }
+              if (p0 === sp.workdir || p0 === '/app' || p0 === '.') { ['src', 'req'].forEach(t => sp.tags.has(t) && sv.tags.add(t)); add += 0.5; }
+              if (sp.tags.has('src') && sp.workdir !== '/' && p0.startsWith(sp.workdir + '/') && /\.(py|json)$|package/.test(p0)) { sv.tags.add(/package/.test(p0) ? 'req' : 'src'); add += 0.01; }
+              if (add === 0 && before === sv.adds) return fail(s, i + 2, ins, [], `ERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref ${CS.hex(p0, 8)}::${CS.hex(p0 + 'x', 20)}: "${p0}": not found`);
+            }
+          } else {
+            for (const pth of ins.src) {
+              const p0 = pth.replace(/^\.\//, '').replace(/\/$/, '');
+              if (p0 === '.' || p0 === '') { sv.tags.add('src'); sv.tags.add('req'); add += ctxMB; continue; }
+              if (/^(requirements\.txt|package\*?\.json|package-lock\.json|go\.(mod|sum)|go\.\*)$/.test(p0)) { sv.tags.add('req'); add += 0.01; continue; }
+              if (/^(app\.py|src|cmd|internal|tsconfig\.json|.*\.(py|go|ts))$/.test(p0) || /^\*/.test(p0)) { sv.tags.add('src'); add += 0.05; continue; }
+              if (!L.get(st, DIR + '/' + p0)) return fail(s, i + 2, ins, [], `ERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref: "/${p0}": not found`);
+              add += 0.01;
+            }
+          }
+          if (ins.chown) sv.tags.add('chown');
+          stepLine((add / 80 + 0.1).toFixed(1)); sv.adds += add; sv.layers.push({ by: `${ins.ins} ${a}`, size: add }); continue;
+        }
+        if (ins.ins === 'RUN') {
+          const os = sv.os;
+          if (os === 'scratch' || /^distroless/.test(os || '')) return fail(s, i + 2, ins, [], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: runc run failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory`);
+          const cmds = a.split(/&&|;/).map(x => x.trim());
+          for (const c of cmds) {
+            if (/^apt-get (-\S+ )*update/.test(c) || /^apt-get update/.test(c)) { if (os !== 'debian') return fail(s, i + 2, ins, ['/bin/sh: 1: apt-get: not found'], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: exit code: 127`); if (!/rm -rf \/var\/lib\/apt\/lists/.test(a)) add += 38; continue; }
+            if (/^apt-get .*install/.test(c)) { if (os !== 'debian') return fail(s, i + 2, ins, ['/bin/sh: 1: apt-get: not found'], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: exit code: 127`); if (/build-essential|gcc|libpq-dev/.test(c)) { sv.tags.add('buildtools'); add += sv.full ? 6 : 240; } if (/libpq5/.test(c)) { sv.tags.add('libpq'); add += 9; } if (/ca-certificates/.test(c)) { sv.certs = true; add += 1; } continue; }
+            if (/^apk add/.test(c)) { if (os !== 'alpine') return fail(s, i + 2, ins, ['/bin/sh: 1: apk: not found'], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: exit code: 127`); if (/build-base|gcc/.test(c)) { sv.tags.add('buildtools'); add += 190; } if (/postgresql-dev|libpq-dev/.test(c)) sv.tags.add('pgdev'); if (/libpq\b|postgresql-libs/.test(c)) { sv.tags.add('libpq'); add += 4; } if (/ca-certificates/.test(c)) { sv.certs = true; add += 1; } continue; }
+            if (/python3? -m venv/.test(c)) { sv.venv = c.match(/venv\s+(\S+)/)[1]; add += 12; continue; }
+            if (/(^|\/)pip3? install/.test(c)) {
+              const pipVenv = (c.match(/^(\S+)\/bin\/pip3?/) || [])[1];
+              if (/-r\s+\S*requirements\.txt/.test(c) && !sv.tags.has('req')) return fail(s, i + 2, ins, ['ERROR: Could not open requirements file: [Errno 2] No such file or directory: \'requirements.txt\''], null);
+              const needsBuild = /^psycopg2==/m.test(req) && !/psycopg2-binary/.test(req);
+              if (needsBuild) {
+                if (os === 'alpine' && !(sv.tags.has('buildtools') && sv.tags.has('pgdev'))) return fail(s, i + 2, ins, ['Collecting psycopg2==2.9.10', '  Downloading psycopg2-2.9.10.tar.gz (385 kB)', '  error: subprocess-exited-with-error', '  × python setup.py egg_info did not run successfully.', '  │ exit code: 1', '  ╰─> Error: pg_config executable not found.', '      pg_config is required to build psycopg2 from source. On Alpine (musl) there is no prebuilt wheel:', '      install postgresql-dev, gcc and musl-dev, or use psycopg2-binary / a Debian-based image.'], null);
+                if (os === 'debian' && !sv.full && !sv.tags.has('buildtools')) return fail(s, i + 2, ins, ['Collecting psycopg2==2.9.10', '  Downloading psycopg2-2.9.10.tar.gz (385 kB)', '  error: subprocess-exited-with-error', '  ╰─> Error: pg_config executable not found.', '      pg_config is required to build psycopg2 from source. Please add the directory containing pg_config to the $PATH', '      or install libpq-dev and gcc (build-essential) in this stage, or use psycopg2-binary.'], null);
+                sv.tags.add('pgCompiled');
+              }
+              const pre = (c.match(/--prefix[= ](\S+)/) || [])[1];
+              sv.depsAt = pre || pipVenv || (/--user/.test(c) ? '/root/.local' : (sv.venv && /bin\/pip/.test(c) ? sv.venv : 'system'));
+              sv.tags.add('deps'); add += DEP.python.prod + (sv.full ? 0 : 0); continue;
+            }
+            if (/^npm (ci|install|i)\b/.test(c)) {
+              if (!sv.tags.has('req')) return fail(s, i + 2, ins, ['npm error code ENOENT', 'npm error syscall open', `npm error path ${sv.workdir}/package.json`, 'npm error errno -2', 'npm error enoent Could not read package.json'], null);
+              const prodOnly = /--omit[= ]dev|--production|--only[= ]prod/.test(c);
+              sv.tags.add('deps'); sv.depsAt = sv.workdir.replace(/\/$/, '') + '/node_modules'; add += DEP.node.prod; if (!prodOnly) { sv.tags.add('devdeps'); add += DEP.node.dev; } else sv.tags.delete('devdeps');
+              continue;
+            }
+            if (/^npm prune/.test(c) && /--omit[= ]dev|--production/.test(c)) { if (sv.tags.has('devdeps')) { sv.tags.delete('devdeps'); add -= DEP.node.dev; } continue; }
+            if (/^npm run build|^npx tsc|^tsc/.test(c)) {
+              if (!sv.tags.has('src')) return fail(s, i + 2, ins, ['error TS18003: No inputs were found in config file \'tsconfig.json\'.'], null);
+              if (!sv.tags.has('devdeps')) return fail(s, i + 2, ins, ['> shopapi@2.0.0 build', '> tsc -p .', '', 'sh: 1: tsc: not found'], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: exit code: 127`);
+              sv.artifact = { path: sv.workdir.replace(/\/$/, '') + '/dist', size: 1.6, kind: 'dist' }; sv.tags.add('artifact'); add += 1.6; continue;
+            }
+            if (/^go mod download/.test(c)) { if (!sv.go) return fail(s, i + 2, ins, ['/bin/sh: 1: go: not found'], null); if (!sv.tags.has('req')) return fail(s, i + 2, ins, ['go: go.mod file not found in current directory or any parent directory; see \'go help modules\''], null); sv.tags.add('modcache'); add += DEP.go.dev; continue; }
+            if (/(^|\s)go build/.test(c)) {
+              if (!sv.go) return fail(s, i + 2, ins, ['/bin/sh: 1: go: not found'], `ERROR: failed to solve: process "/bin/sh -c ${a}" did not complete successfully: exit code: 127`);
+              if (!sv.tags.has('src') || !sv.tags.has('req')) return fail(s, i + 2, ins, [sv.tags.has('req') ? 'stat /src/cmd/server: directory not found' : 'go: go.mod file not found in current directory or any parent directory; see \'go help modules\''], null);
+              const outP = (c.match(/-o\s+(\S+)/) || [])[1] || 'shopapi';
+              const cgo = !(/CGO_ENABLED=0/.test(c) || sv.env.CGO_ENABLED === '0') && sv.os !== 'alpine';
+              if (!sv.tags.has('modcache')) { sv.tags.add('modcache'); add += DEP.go.dev; }
+              sv.artifact = { path: outP.startsWith('/') ? outP : sv.workdir.replace(/\/$/, '') + '/' + outP, size: /-ldflags[= ]["']?-s -w/.test(c) ? 13 : 18, kind: 'bin', cgo }; sv.tags.add('artifact'); add += sv.artifact.size; continue;
+            }
+            if (/^(useradd|adduser|addgroup|groupadd)/.test(c)) { const um = c.match(/(?:-u|--uid)\s+(\d+)/); sv.createdUser = { name: c.split(/\s+/).pop(), uid: um ? um[1] : '999' }; add += 0.01; continue; }
+            if (/^(mkdir|chown|chmod|rm|echo|ls|true|cp|mv)\b/.test(c)) { if (/^rm -rf/.test(c) && /node_modules|\/root\/\.cache|\/tmp/.test(c)) { /* cleanup in same layer */ } add += 0.01; continue; }
+            if (/^(pip|python|node|npm|go|apt|apk|curl|wget)/.test(c) || c) { add += 0.5; continue; }
+          }
+          stepLine((Math.max(0.3, add / 9)).toFixed(1)); sv.adds += add; sv.layers.push({ by: `RUN /bin/sh -c ${a} # buildkit`, size: Math.max(0, add) }); continue;
+        }
+      }
+      state.push(sv);
+    }
+    const fin = state[state.length - 1];
+    const size = Math.round((fin.baseSize + fin.adds) * 10) / 10;
+    const meta = runtime(st, fin, df);
+    const userRaw = fin.user || (fin.nonroot ? 'nonroot' : '');
+    const image = { size, user: userRaw, layers: fin.layers, cmd: fin.cmd, entrypoint: fin.entry, workdir: fin.workdir, expose: [8080], meta: Object.assign(meta, { stages: df.stages.length, multi: df.stages.length > 1 && df.final.ins.some(x => x.from), nonroot: !!userRaw && !/^(root|0)(:|$)/.test(userRaw), buildtools: fin.tags.has('buildtools') }) };
+    return { ok: true, steps, total, ctxSize, ctxSecs: (ctxMB / 200 + 0.1).toFixed(1), secs: (8 + size / 25).toFixed(1), image };
+  }
+  function destPath(sv, dest, srcPath, p0) {
+    let d = dest.startsWith('/') ? dest : sv.workdir.replace(/\/$/, '') + '/' + dest.replace(/^\.\/?/, '');
+    d = d.replace(/\/\.?$/, '') || '/';
+    const tail = srcPath.slice(p0.length);
+    if (dest.endsWith('/') && !tail) return (d === '/' ? '' : d) + '/' + srcPath.split('/').pop();
+    return (d === '/' ? '' : d) + tail;
+  }
+  function runtime(st, fin, df) {
+    const V = st.V; const cmd = (fin.entry || []).concat(fin.cmd || []);
+    const tags = fin.tags; const os = fin.os;
+    if (!cmd.length) return { startErr: ['(the image has no CMD or ENTRYPOINT: nothing to run)'], exit: 0 };
+    if (V.lang === 'python') {
+      if (os === 'distroless-py') return { startErr: ['Traceback (most recent call last):', '  File "/usr/local/bin/gunicorn", line 5, in <module>', "ModuleNotFoundError: No module named 'gunicorn'", '(The packages were installed for Python 3.12; this distroless image runs Python 3.11 and doesn\'t see them.)'], exit: 1 };
+      if (!tags.has('deps')) return { startErr: [cmd[0] === 'gunicorn' ? `exec: "gunicorn": executable file not found in $PATH` : "ModuleNotFoundError: No module named 'flask'"], exit: cmd[0] === 'gunicorn' ? 127 : 1, runErr: cmd[0] === 'gunicorn' };
+      const at = fin.depsAt || 'system';
+      const onPath = at === 'system' || at === '/usr/local' || /^\/usr\/local\/lib/.test(at) || (fin.env.PATH && fin.env.PATH.includes(at + '/bin')) || (cmd[0] || '').startsWith(at + '/bin') || (fin.env.PYTHONPATH && fin.env.PYTHONPATH.includes(at));
+      if (at === '/root/.local' && fin.user && !/^(root|0)/.test(fin.user)) return { startErr: [`exec: "gunicorn": executable file not found in $PATH`, `(The packages are in /root/.local, which user ${fin.user} can't read.)`], exit: 127, runErr: true };
+      if (!onPath) return { startErr: [cmd[0] === 'gunicorn' ? `exec: "gunicorn": executable file not found in $PATH` : "ModuleNotFoundError: No module named 'flask'", `(The packages are in ${at}, which isn't on PATH: add ENV PATH="${at}/bin:$PATH".)`], exit: 127, runErr: cmd[0] === 'gunicorn' };
+      if (tags.has('pgCompiled') && !fin.full && !tags.has('libpq') && !tags.has('buildtools')) return { startErr: ['[2026-11-22 16:44:02 +0000] [1] [INFO] Starting gunicorn 23.0.0', '[2026-11-22 16:44:02 +0000] [7] [ERROR] Exception in worker process', 'Traceback (most recent call last):', '  File "/app/app.py", line 3, in <module>', '    import psycopg2  # PostgreSQL driver', '  File "/usr/local/lib/python3.12/site-packages/psycopg2/__init__.py", line 51, in <module>', '    from psycopg2._psycopg import BINARY, NUMBER, STRING, DATETIME, ROWID', 'ImportError: libpq.so.5: cannot open shared object file: No such file or directory', '[2026-11-22 16:44:03 +0000] [1] [ERROR] Shutting down: Master', '[2026-11-22 16:44:03 +0000] [1] [ERROR] Reason: Worker failed to boot.'], exit: 3 };
+      if (!tags.has('src')) return { startErr: ['[2026-11-22 16:44:02 +0000] [7] [ERROR] Exception in worker process', "ModuleNotFoundError: No module named 'app'", '[2026-11-22 16:44:03 +0000] [1] [ERROR] Reason: Worker failed to boot.'], exit: 3 };
+      return { ok: true, logs: ['[2026-11-22 16:44:02 +0000] [1] [INFO] Starting gunicorn 23.0.0', '[2026-11-22 16:44:02 +0000] [1] [INFO] Listening at: http://0.0.0.0:8080 (1)', '[2026-11-22 16:44:02 +0000] [7] [INFO] Booting worker with pid: 7'] };
+    }
+    if (V.lang === 'node') {
+      if (os === 'distroless-node' && cmd[0] === 'node') return { startErr: ['node:internal/modules/cjs/loader:1228', '  throw err;', '  ^', '', `Error: Cannot find module '${fin.workdir.replace(/\/$/, '')}/node'`, '    at Module._resolveFilename (node:internal/modules/cjs/loader:1225:15)', '(distroless/nodejs already runs "node" as its ENTRYPOINT: CMD should be just ["dist/server.js"].)'], exit: 1 };
+      if (!tags.has('artifact')) return { startErr: ['node:internal/modules/cjs/loader:1228', '  throw err;', '  ^', '', `Error: Cannot find module '${fin.workdir.replace(/\/$/, '')}/dist/server.js'`, "  code: 'MODULE_NOT_FOUND'"], exit: 1 };
+      if (fin.artifact && fin.artifact.path !== fin.workdir.replace(/\/$/, '') + '/dist') return { startErr: [`Error: Cannot find module '${fin.workdir.replace(/\/$/, '')}/dist/server.js'`, `(dist was copied to ${fin.artifact.path})`], exit: 1 };
+      if (!tags.has('deps') || (fin.depsAt && fin.depsAt !== fin.workdir.replace(/\/$/, '') + '/node_modules')) return { startErr: ['node:internal/modules/cjs/loader:1228', '  throw err;', '  ^', '', "Error: Cannot find module 'express'", `Require stack:`, `- ${fin.workdir.replace(/\/$/, '')}/dist/server.js`, "  code: 'MODULE_NOT_FOUND'"], exit: 1 };
+      return { ok: true, logs: ['shopapi listening on :8080'] };
+    }
+    // go
+    const exe = cmd.find(x => x.startsWith('/') || x.startsWith('./')) || cmd[0];
+    if (!tags.has('artifact')) return { startErr: [`exec: "${exe}": stat ${exe}: no such file or directory`], exit: 127, runErr: true };
+    const exePath = exe.startsWith('./') ? fin.workdir.replace(/\/$/, '') + exe.slice(1) : exe;
+    if (fin.artifact.path !== exePath) return { startErr: [`exec: "${exe}": stat ${exe}: no such file or directory`, `(The binary was copied to ${fin.artifact.path}.)`], exit: 127, runErr: true };
+    if (fin.artifact.cgo && /^(scratch|distroless-static|alpine)$/.test(os)) return { startErr: [`exec ${exe}: no such file or directory`], exit: 255, cgo: true };
+    if (!fin.certs && !tags.has('certs')) return { ok: true, logs: ['2026/11/22 16:44:02 shopapi listening on :8080', '2026/11/22 16:44:09 health: payments API check failed: Get "https://api.payments.example/v1/ping": tls: failed to verify certificate: x509: certificate signed by unknown authority'], health: 503 };
+    return { ok: true, logs: ['2026/11/22 16:44:02 shopapi listening on :8080', '2026/11/22 16:44:09 health: payments API reachable (212ms)'] };
+  }
+
+  // ------------------------------------------------------------- state
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/etc/hostname'] = L.f('build01\n');
+    fs[DIR] = L.d('ruben', 'ruben');
+    Object.entries(V.files).forEach(([p, c]) => { const parts = p.split('/'); for (let i = 1; i < parts.length; i++) fs[DIR + '/' + parts.slice(0, i).join('/')] = L.d('ruben', 'ruben'); fs[DIR + '/' + p] = L.f(c, 'ruben', 'ruben'); });
+    V.bloat.forEach(([p]) => { const parts = p.split('/'); for (let i = 1; i <= parts.length; i++) fs[DIR + '/' + parts.slice(0, i).join('/')] = L.d('ruben', 'ruben'); });
+    fs[DIR + '/Dockerfile'] = L.f(V.dockerfile, 'ruben', 'ruben');
+    const users = L.baseUsers('ruben'); users.ruben.groups.push('docker');
+    const st = { v, V, fs, cwd: HOME, users, services: { docker: { installed: true, active: true, enabled: true }, ssh: { installed: true, active: true, enabled: true } }, units: {}, packages: ['docker-ce', 'curl'], ufw: { enabled: false, defaultIn: 'deny', rules: [] }, flags: {} };
+    st.dk = CS.dockerState([]);
+    const r = evalBuild(st, { df: CS.dockerfile(V.dockerfile), excluded: () => false });
+    const old = Object.assign(r.image, { repo: 'shopapi', tag: '1.0', id: CS.hex('shopapi1.0' + v, 12), created: '2 weeks ago' });
+    st.dk.images.push(old);
+    Object.keys(BASES).filter(b => VARIANTS[v].dockerfile.includes('FROM ' + b + '\n')).forEach(b => st.dk.images.push(CS.image(b, BASES[b].size, { created: '5 weeks ago' })));
+    const c = { id: CS.hex('prod' + v, 12), name: 'shopapi', image: 'shopapi:1.0', cmd: old.cmd, ports: [{ host: 8080, cont: 8080 }], mounts: [], env: {}, network: 'bridge', restart: 'unless-stopped', status: 'running', logs: old.meta.logs.slice(), restarts: 0, upFor: '13 days', createdAgo: '2 weeks ago', ip: '172.17.0.2' };
+    st.dk.containers.push(c);
+    return st;
+  }
+
+  // ------------------------------------------------------------- docker hooks
+  const dcfg = {
+    home: HOME,
+    build: (st, ctx) => { st.flags.built = (st.flags.built || 0) + 1; return evalBuild(st, ctx); },
+    run: (st, c, img) => {
+      const m = img.meta || {};
+      if (m.runErr) { st.dk.containers = st.dk.containers.filter(x => x !== c); throw CmdError(`docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: ${m.startErr[0]}: unknown.${m.startErr[1] ? '\n' + m.startErr[1] : ''}`); }
+      if (m.startErr) { c.status = 'exited'; c.exit = m.exit; c.logs = m.startErr.slice(); c.exitedAgo = '2 seconds ago'; return; }
+      c.status = 'running'; c.logs = (m.logs || []).slice(); c.upFor = '2 seconds';
+    },
+    onHistory: (st, img) => { if (img.tag === '1.0') st.flags.history = true; },
+    exec: (st, c, cmd) => {
+      const img = CS.findImage(st, c.image) || {}; const os = ((img.layers || [])[0] || {}).by || '';
+      if (/distroless|scratch|FROM scratch/.test(os) && ['sh', 'bash', 'ls', 'cat', 'id'].includes(cmd[0])) throw CmdError(`OCI runtime exec failed: exec failed: unable to start container process: exec: "${cmd[0]}": executable file not found in $PATH: unknown\n(Distroless and scratch images have no shell: that's part of why they're small and safe.)`);
+      if (cmd[0] === 'id' || cmd[0] === 'whoami') { const u = img.user || 'root'; const isRoot = /^(root|0)?$/.test(u.split(':')[0]); return cmd[0] === 'whoami' ? (isRoot ? 'root' : u) : (isRoot ? 'uid=0(root) gid=0(root) groups=0(root)' : `uid=${/^\d+$/.test(u) ? u : 10001}(${u}) gid=${/^\d+$/.test(u) ? u : 10001}`); }
+      if (cmd[0] === 'du' || cmd[0] === 'ls') return { text: '(Use docker history IMAGE to see which layer adds what.)', cls: 'muted' };
+      return undefined;
+    }
+  };
+  function curl(st, toks) {
+    const url = toks.find(x => /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?/.test(x));
+    if (!url) { const u2 = toks.find(x => !x.startsWith('-')); return { text: `curl: (6) Could not resolve host: ${u2 || ''}\n(Test the container on this server: curl -i http://localhost:8080/health)`, cls: 'err' }; }
+    const m = url.match(/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::(\d+))?(\/\S*)?/); const port = +(m[1] || 80); const path = m[2] || '/';
+    const c = st.dk.containers.find(x => x.status === 'running' && (x.ports || []).some(p => p.host === port));
+    if (!c) return { text: `curl: (7) Failed to connect to localhost port ${port} after 0 ms: Couldn't connect to server`, cls: 'err' };
+    const img = CS.findImage(st, c.image) || { meta: {} }; const p = c.ports.find(x => x.host === port);
+    if (p.cont !== 8080) return { text: 'curl: (56) Recv failure: Connection reset by peer', cls: 'err' };
+    const head = toks.includes('-i') || toks.includes('-I') || toks.includes('-v');
+    if (path !== '/health') return (head ? 'HTTP/1.1 404 NOT FOUND\nContent-Type: application/json\n\n' : '') + '{"error":"not found"}';
+    if (img.meta.health === 503) { c.logs.push('2026/11/22 16:45:11 health: payments API check failed: x509: certificate signed by unknown authority'); return (head ? 'HTTP/1.1 503 Service Unavailable\nContent-Type: application/json\n\n' : '') + '{"status":"degraded","payments":"x509: certificate signed by unknown authority"}'; }
+    if (img.repo === 'shopapi' && img.tag === '2.0') st.flags.healthOk = true;
+    return (head ? 'HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: 16\n\n' : '') + '{"status":"ok"}';
+  }
+  const cfg = {
+    user: 'ruben', home: HOME, host: 'build01', ip: '10.20.0.15', adminIp: '10.20.0.2',
+    curl: (st, toks) => curl(st, toks),
+    extra: (lab) => Object.assign(CS.docker(lab, dcfg), {
+      du: { raw: true, desc: 'Disk usage of files (du -sh PATH)', run: a => { const st = lab.state; const p = a._pos.filter(x => !x.startsWith('-')); const items = p.length ? p : ['.']; return items.map(x => { const full = L.norm(x, st.cwd, HOME); const rel = full.replace(DIR + '/', '').replace(DIR, '.'); if (rel === '.' || full === DIR) { const tot = st.V.bloat.reduce((n, [, s]) => n + s, 0) + 0.2; return `${Math.round(tot)}M\t${x}`; } const b = st.V.bloat.find(([bp]) => bp === rel || bp.startsWith(rel + '/')); if (!L.get(st, full)) return `du: cannot access '${x}': No such file or directory`; return `${b ? b[1] + 'M' : '8.0K'}\t${x}`; }).join('\n'); } }
+    })
+  };
+
+  // ------------------------------------------------------------- render
+  function render(st) { $('#dk-panel').innerHTML = CS.dockerPanel(st); }
+  const newImg = st => CS.findImage(st, 'shopapi:2.0');
+
+  const IGNORE = { python: '.git\n.gitignore\n__pycache__/\n*.pyc\ntests/\n.venv/\nDockerfile\n.dockerignore\n', node: '.git\nnode_modules/\ncoverage/\ndist/\nnpm-debug.log\nDockerfile\n.dockerignore\n', go: '.git\ntestdata/\n*.test\nDockerfile\n.dockerignore\n' };
+  const SOLUTION_DF = {
+    python: '# ---- build stage: compilers and headers live here only\nFROM python:3.12-slim AS build\nRUN apt-get update && apt-get install -y --no-install-recommends build-essential libpq-dev && rm -rf /var/lib/apt/lists/*\nRUN python -m venv /opt/venv\nWORKDIR /app\nCOPY requirements.txt .\nRUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt\n\n# ---- runtime stage\nFROM python:3.12-slim\nRUN apt-get update && apt-get install -y --no-install-recommends libpq5 && rm -rf /var/lib/apt/lists/*\nRUN useradd --uid 10001 --no-create-home app\nCOPY --from=build /opt/venv /opt/venv\nENV PATH="/opt/venv/bin:$PATH"\nWORKDIR /app\nCOPY app.py .\nUSER 10001\nEXPOSE 8080\nCMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]\n',
+    node: '# ---- build stage: dev dependencies + TypeScript compiler\nFROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\nCOPY tsconfig.json ./\nCOPY src ./src\nRUN npm run build\n\n# ---- runtime stage: production dependencies only\nFROM node:22-alpine\nWORKDIR /app\nENV NODE_ENV=production\nCOPY package*.json ./\nRUN npm ci --omit=dev && npm cache clean --force\nCOPY --from=build /app/dist ./dist\nUSER node\nEXPOSE 8080\nCMD ["node", "dist/server.js"]\n',
+    go: '# ---- build stage\nFROM golang:1.23 AS build\nWORKDIR /src\nCOPY go.mod go.sum ./\nRUN go mod download\nCOPY . .\n# static binary: no libc needed at runtime\nRUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server ./cmd/server\n\n# ---- runtime stage: distroless includes CA certificates and a nonroot user\nFROM gcr.io/distroless/static-debian12:nonroot\nCOPY --from=build /out/server /server\nEXPOSE 8080\nENTRYPOINT ["/server"]\n'
+  };
+
+  let lab;
+  lab = Lab({
+    id: 'docker-image-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@build01 — ~/shopapi',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@build01:${st.cwd === HOME ? '~' : st.cwd.replace(HOME, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: st => `Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nDocker version 27.3.1, build ce12230\n\nLast login: Sun Nov 22 10:31:44 2026 from 10.20.0.2\nApp in this build: ${st.V.title}. Type "help" for the commands; edit files with nano.\n`,
+    createState, commands: lab => L.commands(lab, cfg), render,
+    onReset: st => { document.getElementById('ed-panel').hidden = true; $('#wo-text').innerHTML = `<b>shopapi</b> (${st.V.title}) ships as <code>shopapi:1.0</code>, which is ${CS.mb(st.dk.images[0].size)}. Every deploy pulls it to 14 nodes. Make it small without breaking it: the current version keeps running on port 8080 until yours is verified.`; },
+    objectives: [
+      { text: 'Measure the current image: list images and read the layer history of <code>shopapi:1.0</code>.',
+        check: st => (st.flags.dk_images || st.flags.dk_image_ls) && st.flags.history ? true : !st.flags.history ? 'Look at the layers of shopapi:1.0 (docker history).' : 'List the images and their sizes (docker images).',
+        hints: ['Two docker commands: one lists images, the other shows each layer and its size.', '<code>docker history</code> shows which instruction added each layer: the base image, the COPY of the whole folder, the packages.', '<code>docker images</code>, then <code>docker history shopapi:1.0</code> (and <code>du -sh ~/shopapi/*</code> to see what COPY . . sends).'] },
+      { text: 'Add a <code>.dockerignore</code> that keeps the bulky folders out of the build context.',
+        check: st => { const n = L.get(st, DIR + '/.dockerignore'); if (!n) return 'There\'s no ~/shopapi/.dockerignore yet.'; const ex = CS.ignore(n.c); const miss = st.V.bloat.filter(([p, s]) => s > 5 && !ex(p)).map(([p]) => p); return miss.length ? `These still go into the build context: ${miss.join(', ')}.` : true; },
+        hints: ['Look at what <code>COPY . .</code> copies: everything in the folder that isn\'t ignored.', '<code>du -sh ~/shopapi/* ~/shopapi/.git</code> shows which folders are heavy. One pattern per line.', st => `<code>nano ~/shopapi/.dockerignore</code> with one line per folder: ${st.V.bloat.filter(b => b[1] > 5).map(b => '<code>' + b[0] + '</code>').join(', ')}.`] },
+      { text: 'Rewrite the Dockerfile as a multi-stage build and build it as <code>shopapi:2.0</code>.',
+        check: st => { const i = newImg(st); if (!i) return st.flags.built ? 'No image tagged shopapi:2.0 yet (did the build fail?).' : 'Build the new image with docker build -t shopapi:2.0 .'; if (!i.meta.multi) return 'shopapi:2.0 isn\'t multi-stage: the final stage should COPY --from= a build stage.'; if (i.meta.buildtools) return 'The final stage still installs compilers (build-essential/gcc): keep them in the build stage.'; return true; },
+        hints: ['Two FROM lines: the first stage installs the build tools and builds; the second starts from a small base and only copies the result.', st => ({ python: 'Build the dependencies into a venv in the first stage (python -m venv /opt/venv), copy /opt/venv to the final stage and put it on PATH. psycopg2 compiled from source needs <code>libpq5</code> at runtime.', node: 'Build with all dependencies in the first stage, then in the final stage install production dependencies only (<code>npm ci --omit=dev</code>) and copy dist/. node:22-slim alone is 230 MB: look at alpine or distroless.', go: 'Build a static binary (<code>CGO_ENABLED=0</code>) in the first stage and copy only the binary. The /health check calls an HTTPS API, so the final image needs CA certificates.' })[st.V.lang], '<code>nano Dockerfile</code>, then <code>docker build -t shopapi:2.0 .</code> from ~/shopapi. If the build fails, read the step that failed; if the container exits, read <code>docker logs</code>.'] },
+      { text: '<code>shopapi:2.0</code> is under 200 MB, runs, and answers <code>GET /health</code> with 200.',
+        check: st => { const i = newImg(st); if (!i) return 'Build shopapi:2.0 first.'; if (i.size >= 200) return `shopapi:2.0 is ${CS.mb(i.size)}: still over 200 MB (check the base image of the final stage and what it copies).`; const c = st.dk.containers.find(x => x.image === 'shopapi:2.0'); if (!c) return 'Run a container from shopapi:2.0 (publish its port 8080).'; if (c.status !== 'running') return 'The shopapi:2.0 container exited. Read docker logs.'; return st.flags.healthOk || 'Test it: curl -i http://localhost:PORT/health must return 200.'; },
+        hints: ['Small enough isn\'t enough: start it and test it like production would.', 'The old container already uses host port 8080. Remove it, or publish yours on another port (-p 8081:8080). If it exits, <code>docker logs</code> says why.', '<code>docker run -d --name shopapi-v2 -p 8081:8080 shopapi:2.0</code>, <code>docker ps</code>, <code>curl -i http://localhost:8081/health</code>'] },
+      { text: 'The new image runs as a non-root user.', optional: true,
+        check: st => { const i = newImg(st); return (i && i.meta.nonroot) || 'shopapi:2.0 runs as root (docker inspect --format \'{{.Config.User}}\' shopapi:2.0 is empty).'; },
+        hints: ['A USER instruction in the final stage.', 'Node images have a <code>node</code> user; distroless has a <code>:nonroot</code> tag; on Debian create one with useradd.', 'Add <code>USER 10001</code> (after creating it), <code>USER node</code> or use <code>gcr.io/distroless/static-debian12:nonroot</code>, rebuild, re-run.'] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      s.push({ cmd: 'cd ~/shopapi' }, { cmd: 'docker images', note: `shopapi:1.0 weighs ${CS.mb(st.dk.images[0].size)}.` });
+      s.push({ cmd: 'docker history shopapi:1.0', note: 'The layers tell the story: a full base image with compilers, then COPY . . bringing in everything in the folder.' });
+      s.push({ cmd: 'du -sh ' + V.bloat.map(b => b[0]).join(' '), note: 'These folders went into the image with COPY . . and are never needed at runtime.' });
+      s.push({ cmd: 'nano .dockerignore', note: 'Keep them out of the build context.' }, { run: api => api.fill('#ed-text', IGNORE[V.lang], { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'nano Dockerfile', note: { python: 'Multi-stage: compile psycopg2 in a build stage with build-essential and libpq-dev, ship only the venv plus libpq5 on a slim base, as a non-root user.', node: 'Multi-stage: compile TypeScript with all dependencies, then ship dist/ plus production-only dependencies on node:22-alpine (node:22-slim alone is 230 MB).', go: 'Multi-stage: a static binary (CGO_ENABLED=0, otherwise it needs glibc) on distroless/static, which includes the CA certificates the HTTPS call needs and a nonroot user.' }[V.lang] }, { run: api => api.fill('#ed-text', SOLUTION_DF[V.lang], { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'docker build -t shopapi:2.0 .' }, { cmd: 'docker images', note: 'Compare the sizes.' });
+      s.push({ cmd: 'docker run -d --name shopapi-v2 -p 8081:8080 shopapi:2.0', note: 'Port 8080 on the host is still the production container, so test on 8081.' }, { cmd: 'docker ps' }, { cmd: 'curl -i http://localhost:8081/health' });
+      s.push({ cmd: "docker inspect --format '{{.Config.User}}' shopapi:2.0", note: 'Not root.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Measure before you optimize', text: '<code>docker history</code> shows exactly which instruction added which layer. Usually it\'s the base image and a <code>COPY . .</code> that drags in .git, test data or a local node_modules.' },
+      { title: '.dockerignore is a speed fix too', text: 'Everything not ignored is sent to the builder on every build and lands in the image with COPY . . A short ignore file also stops secrets like .env from shipping by accident.' },
+      { title: 'Multi-stage: build tools stay behind', text: 'Compilers, headers, dev dependencies and module caches live in the build stage. The final stage copies only the artifact: a venv, dist/ plus production modules, or one binary.' },
+      { title: 'Each base image has a catch', text: 'Alpine uses musl, so packages without musl wheels compile from source. Slim lacks runtime libraries such as libpq5. Scratch has no CA certificates or libc, so binaries must be static. Distroless has no shell and its own ENTRYPOINT.' },
+      { title: 'Small and verified', text: 'Size is only half the goal: run the new image next to production on another port and hit its health endpoint before you replace anything.' },
+      { title: 'Non-root by default', text: 'A USER line in the final stage costs nothing and limits what a compromised app can do. Distroless :nonroot and the node user make it a one-liner.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>

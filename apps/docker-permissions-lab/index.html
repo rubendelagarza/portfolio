@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Container won't start (permissions and volumes) — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 18</div>
+    <h1>Lab: Container won't start (permissions and volumes)</h1>
+    <p>Security hardened the notes service so it no longer runs as root. Since the deploy, the container restarts in a loop. Find out which user the container runs as and what it can't write to, then fix it the right way: no <code>chmod 777</code>, no running as root.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~10 min</span><span class="pill">docker · volumes · UIDs</span><span class="pill">3 randomized causes</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> troubleshooting a crash-looping container with <code>docker logs</code> and <code>docker inspect</code>, how UIDs map between a container and the host, the difference between bind mounts and named volumes, fixing ownership in a Dockerfile, and resisting the quick fixes that undo the hardening.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Ticket INC-20931</h3>
+          <p style="font-size:14px">"Notes is down since this morning's deploy. The deploy only changed the image so it runs as a dedicated user (<b>app</b>, UID 10001) instead of root, as the security audit asked."</p>
+          <p class="muted" style="font-size:12px;margin:0">Server <code>app02</code>. Deploy files are in <code>/srv/notes</code> (<code>run.sh</code>, <code>README.md</code>, <code>src/</code>).</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Docker on app02</h3>
+          <div id="dk-panel"></div>
+        </div>
+        <div class="panel">
+          <h3>Rules</h3>
+          <ul style="font-size:13px;padding-left:18px;margin:0">
+            <li>The container must keep running as UID 10001.</li>
+            <li>No world-writable directories (<code>chmod 777</code>, <code>o+w</code>).</li>
+            <li>No <code>--user root</code> and no <code>--privileged</code>.</li>
+            <li>Data must live outside the container so it survives re-creating it.</li>
+          </ul>
+          <p class="muted" style="font-size:12px;margin:8px 0 0">Breaking a rule still lets the service start, but costs 25 points each.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 18 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script src="../../assets/container-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim, CS = ContainerSim, { CmdError } = Lab;
+  const HOME = '/home/ruben', SRV = '/srv/notes', DATA = '/srv/notes/data';
+  const $ = s => document.querySelector(s);
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+
+  const VARIANTS = [
+    { cause: 'bind', mount: `${DATA}:/data`, nfs: false },
+    { cause: 'image', mount: 'notes-data:/data', nfs: false },
+    { cause: 'nfs', mount: `${DATA}:/data`, nfs: true }
+  ];
+  const DF_GOOD = 'FROM python:3.12-slim\nRUN useradd --uid 10001 --no-create-home app\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\n# runtime dirs the app writes to must belong to the app user\nRUN mkdir -p /app/cache /data && chown app:app /app/cache /data\nUSER app\nEXPOSE 8000\nHEALTHCHECK CMD python -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:8000/health\')"\nCMD ["gunicorn", "-b", "0.0.0.0:8000", "notes:app"]\n';
+  const DF_BAD = 'FROM python:3.12-slim\nRUN useradd --uid 10001 --no-create-home app\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nRUN mkdir -p /app/cache /data\nUSER app\nEXPOSE 8000\nHEALTHCHECK CMD python -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:8000/health\')"\nCMD ["gunicorn", "-b", "0.0.0.0:8000", "notes:app"]\n';
+  const runSh = V => `#!/bin/bash\n# Deploy script for the notes service (run as ruben, who is in the docker group)\nset -e\nIMAGE=notes-api:1.4\ndocker rm -f notes 2>/dev/null || true\ndocker run -d --name notes --restart unless-stopped \\\n  -p 8081:8000 \\\n  -v ${V.mount} \\\n  $IMAGE\n`;
+
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/etc/hostname'] = L.f('app02\n');
+    fs[SRV] = L.d('ruben', 'ruben'); fs[SRV + '/src'] = L.d('ruben', 'ruben');
+    fs[SRV + '/run.sh'] = L.f(runSh(V), 'ruben', 'ruben', 0o755);
+    fs[SRV + '/README.md'] = L.f(`# notes\n\nSmall notes API (Flask + SQLite).\n\n- Listens on 8000 inside the container, published on 8081.\n- Database: /data/notes.db  (mount persistent storage on /data)\n- Session cache: /app/cache  (inside the image, throwaway)\n- Image built from src/  ->  docker build -t notes-api:<version> /srv/notes/src\n- Since 1.4 the image runs as user app (UID 10001), not root.\n${V.nfs ? '\nStorage: /srv/notes/data is on the shared NAS (NFS) so backups pick it up.\n' : ''}`, 'ruben', 'ruben');
+    fs[SRV + '/src/Dockerfile'] = L.f(V.cause === 'image' ? DF_BAD : DF_GOOD, 'ruben', 'ruben');
+    fs[SRV + '/src/requirements.txt'] = L.f('flask==3.1.0\ngunicorn==23.0.0\n', 'ruben', 'ruben');
+    fs[SRV + '/src/notes.py'] = L.f('import os, sqlite3\nfrom flask import Flask, jsonify\n\nDB = "/data/notes.db"\nCACHE = "/app/cache/sessions"\napp = Flask(__name__)\n\nos.makedirs(CACHE, exist_ok=True)\nsqlite3.connect(DB).execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT)")\n\n@app.get("/health")\ndef health():\n    return jsonify(status="ok")\n', 'ruben', 'ruben');
+    if (V.cause !== 'image') { fs[DATA] = L.d('root', 'root', 0o755); fs[DATA + '/.keep'] = L.f('', 'root', 'root'); }
+    const users = L.baseUsers('ruben'); users.ruben.groups.push('docker');
+    const st = { v, V, fs, cwd: HOME, users, services: { docker: { installed: true, active: true, enabled: true }, ssh: { installed: true, active: true, enabled: true } }, units: {}, packages: ['docker-ce', 'curl'], ufw: { enabled: false, defaultIn: 'deny', rules: [] }, flags: {} };
+    st.dk = CS.dockerState([
+      CS.image('notes-api:1.4', 168, { user: 'app', id: CS.hex('notes14' + v, 12), created: '3 hours ago', cmd: ['gunicorn', '-b', '0.0.0.0:8000', 'notes:app'], workdir: '/app', expose: [8000], meta: { cacheOk: V.cause !== 'image', dataOwner: 10001, healthcheck: true } }),
+      CS.image('notes-api:1.3', 168, { user: '', id: CS.hex('notes13' + v, 12), created: '5 weeks ago', cmd: ['gunicorn', '-b', '0.0.0.0:8000', 'notes:app'], workdir: '/app', expose: [8000], meta: { cacheOk: true, dataOwner: 0, healthcheck: true, root: true } }),
+      CS.image('python:3.12-slim', 125, { created: '5 weeks ago' })
+    ]);
+    if (V.cause === 'image') st.dk.volumes.push({ name: 'notes-data', driver: 'local', owner: 10001 });
+    const [src, dst] = V.mount.split(':');
+    const c = { id: CS.hex('notes' + v, 12), name: 'notes', image: 'notes-api:1.4', cmd: ['gunicorn', '-b', '0.0.0.0:8000', 'notes:app'], ports: [{ host: 8081, cont: 8000 }], mounts: [{ type: src.startsWith('/') ? 'bind' : 'volume', src, dst }], env: {}, network: 'bridge', restart: 'unless-stopped', status: 'running', logs: [], restarts: 0, ip: '172.17.0.2', createdBy: 'deploy', createdAgo: '3 hours ago' };
+    st.dk.containers.push(c); evalContainer(st, c); c.restarts = 41; c.restartAgo = '6 seconds ago';
+    return st;
+  }
+
+  // ------------------------------------------------------------- the model: can the container write where it needs to?
+  function uidOf(st, c, img) {
+    const u = (c.user !== null && c.user !== undefined && c.user !== '') ? c.user : (img.user || 'root');
+    const name = String(u).split(':')[0];
+    if (name === 'root' || name === '0') return 0;
+    if (name === 'app') return 10001;
+    if (/^\d+$/.test(name)) return +name;
+    return -1;
+  }
+  function canWriteHost(st, node, uid) {
+    if (!node) return uid === 0;
+    const own = node.o === '10001' ? 10001 : (st.users[node.o] ? st.users[node.o].uid : (/^\d+$/.test(node.o) ? +node.o : -2));
+    const grp = /^\d+$/.test(node.g) ? +node.g : (st.users[node.g] ? st.users[node.g].uid : -2);
+    if (uid === 0) return true;
+    if (own === uid) return !!(node.m & 0o200);
+    if (grp === uid) return !!(node.m & 0o020);
+    return !!(node.m & 0o002);
+  }
+  function evalContainer(st, c) {
+    const img = CS.findImage(st, c.image) || { meta: {} };
+    const uid = uidOf(st, c, img); c.uid = uid; c.uname = uid === 0 ? 'root' : uid === 10001 ? 'app' : String(uid);
+    const fail = (path, extra) => {
+      c.logs = ['[2026-11-22 16:41:07 +0000] [1] [INFO] Starting gunicorn 23.0.0', '[2026-11-22 16:41:07 +0000] [1] [INFO] Listening at: http://0.0.0.0:8000 (1)', '[2026-11-22 16:41:07 +0000] [7] [INFO] Booting worker with pid: 7', '[2026-11-22 16:41:08 +0000] [7] [ERROR] Exception in worker process', 'Traceback (most recent call last):', path.startsWith('/app') ? '  File "/app/notes.py", line 8, in <module>' : '  File "/app/notes.py", line 9, in <module>', path.startsWith('/app') ? '    os.makedirs(CACHE, exist_ok=True)' : '    sqlite3.connect(DB).execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT)")', path.startsWith('/app') ? `PermissionError: [Errno 13] Permission denied: '${path}'` : 'sqlite3.OperationalError: unable to open database file'].concat(extra || [], ['[2026-11-22 16:41:08 +0000] [1] [ERROR] Reason: Worker failed to boot.']);
+      c.health = null; c.exit = 3;
+      c.status = c.restart && c.restart !== 'no' ? 'restarting' : 'exited'; c.restartAgo = '2 seconds ago'; c.exitedAgo = '2 seconds ago';
+      return false;
+    };
+    if (!img.meta.cacheOk && uid !== 0) return fail('/app/cache/sessions');
+    const m = (c.mounts || []).find(x => x.dst === '/data' || x.dst === '/data/');
+    if (m && m.type === 'bind') {
+      const p = L.norm(m.src, '/', HOME); let node = L.get(st, p);
+      if (!node) { st.fs[p] = L.d('root', 'root', 0o755); node = st.fs[p]; }
+      if (st.V.nfs && (p === DATA || p.startsWith(DATA + '/'))) return fail('/data/notes.db', uid === 0 ? ['(NFS root_squash: root in the container is mapped to "nobody" on the NAS, so even root can\'t write here.)'] : []);
+      if (!canWriteHost(st, node, uid)) return fail('/data/notes.db');
+    } else if (m && m.type === 'volume') {
+      const vol = st.dk.volumes.find(x => x.name === m.src);
+      const owner = vol && vol.owner !== undefined ? vol.owner : (img.meta.dataOwner || 0);
+      if (vol && vol.owner === undefined) vol.owner = owner;
+      if (uid !== 0 && owner !== uid) return fail('/data/notes.db');
+    }
+    c.status = 'running'; c.health = 'healthy'; c.upFor = '5 seconds'; c.persistent = !!m;
+    c.logs = ['[2026-11-22 16:42:15 +0000] [1] [INFO] Starting gunicorn 23.0.0', '[2026-11-22 16:42:15 +0000] [1] [INFO] Listening at: http://0.0.0.0:8000 (1)', '[2026-11-22 16:42:15 +0000] [7] [INFO] Booting worker with pid: 7', '[2026-11-22 16:42:15 +0000] [7] [INFO] notes: database ready at /data/notes.db'].concat(m ? [] : ['[2026-11-22 16:42:15 +0000] [7] [WARNING] /data is not a mount: notes are stored inside the container and will be lost when it is removed']);
+    return true;
+  }
+
+  // ------------------------------------------------------------- build (variant B)
+  function evalImage(st, ctx) {
+    const df = ctx.df; const fin = df.final; const ins = fin.ins;
+    const userIdx = ins.findIndex(x => x.ins === 'USER'); const user = userIdx >= 0 ? ins[userIdx].user : '';
+    const before = userIdx >= 0 ? ins.slice(0, userIdx) : ins; const after = userIdx >= 0 ? ins.slice(userIdx + 1) : [];
+    const runText = list => list.filter(x => x.ins === 'RUN').map(x => x.args).join(' && ');
+    if (/(^|\s)(mkdir|chown)[^&]*\/app\/cache/.test(runText(after)) && user) return { ok: false, steps: [], log: ['------', ` > [7/9] RUN ${after.find(x => x.ins === 'RUN').args}:`, `0.214 mkdir: cannot create directory '/app/cache': Permission denied`, '------', `ERROR: failed to solve: process "/bin/sh -c ${after.find(x => x.ins === 'RUN').args}" did not complete successfully: exit code: 1`, '(After USER app, the build runs as app, which can\'t create folders in /app owned by root.)'] };
+    const chownOk = /chown\s+(-R\s+)?(app|10001)(:(app|10001))?\s+[^&;]*\/app(\/cache)?(\s|$|&|;)/.test(runText(before)) || ins.some(x => x.ins === 'COPY' && x.chown && /^(app|10001)/.test(x.chown));
+    const world = /chmod\s+(-R\s+)?(777|o\+w|a\+w|\d?\d\d7)\b/.test(runText(ins));
+    const root = !user || /^(root|0)(:|$)/.test(user);
+    const cacheOk = chownOk || world || root;
+    const steps = ins.map((x, i) => ` => [${i + 2}/${ins.length + 1}] ${x.ins} ${x.args.length > 50 ? x.args.slice(0, 49) + '…' : x.args}    ${x.ins === 'RUN' && /pip/.test(x.args) ? '6.2' : '0.3'}s`);
+    steps.unshift(` => [1/${ins.length + 1}] FROM docker.io/library/${fin.base}    0.0s`);
+    if (world) st.flags.badChmod = true;
+    if (root) st.flags.badRootImage = true;
+    return { ok: true, steps, total: ins.length + 4, ctxSize: '4.1kB', image: { size: 168, user: root ? '' : user, cmd: ['gunicorn', '-b', '0.0.0.0:8000', 'notes:app'], workdir: '/app', expose: [8000], layers: [{ by: 'FROM ' + fin.base, size: 125, base: true }].concat(ins.map(x => ({ by: `${x.ins} ${x.args}`, size: /pip/.test(x.args) ? 42 : 0.1 }))), meta: { cacheOk, dataOwner: chownOk ? 10001 : root ? 0 : 0, healthcheck: true, root } } };
+  }
+
+  const dcfg = {
+    home: HOME,
+    build: (st, ctx) => evalImage(st, ctx),
+    run: (st, c, img, verb) => {
+      if (verb === 'restart' || verb === 'start') { evalContainer(st, c); return; }
+      evalContainer(st, c);
+    },
+    onCreate: (st, c, o) => {
+      if (o.privileged) st.flags.badPriv = true;
+      if (c.uid === 0 && o.user !== null) st.flags.badRootRun = true;
+      if (c.name === 'notes') c.fresh = true;
+    },
+    onInspect: (st) => { st.flags.inspected = true; },
+    onLogs: (st) => { st.flags.logsRead = true; },
+    exec: (st, c, cmd) => {
+      if (cmd[0] === 'id') { if (c.uid === 10001) st.flags.idOk = true; return c.uid === 0 ? 'uid=0(root) gid=0(root) groups=0(root)' : c.uid === 10001 ? 'uid=10001(app) gid=10001(app) groups=10001(app)' : `uid=${c.uid} gid=${c.uid} groups=${c.uid}`; }
+      if (cmd[0] === 'whoami') { if (c.uid === 10001) st.flags.idOk = true; return c.uname; }
+      if (cmd[0] === 'ls') return `total 12\ndrwxr-xr-x 2 ${c.uid === 0 ? 'root' : 'app'} ${c.uid === 0 ? 'root' : 'app'} 4096 Nov 22 16:42 .\n-rw-r--r-- 1 ${c.uid === 0 ? 'root' : 'app'} ${c.uid === 0 ? 'root' : 'app'} 8192 Nov 22 16:42 notes.db`;
+      if (cmd[0] === 'touch' || cmd[0] === 'sh' || cmd[0] === 'bash') return { text: '(The container is healthy. Try: docker exec notes id)', cls: 'muted' };
+      return undefined;
+    }
+  };
+  function curl(st, toks) {
+    const url = toks.find(x => /localhost|127\.0\.0\.1/.test(x)) || toks.find(x => !x.startsWith('-')) || '';
+    const m = url.match(/(?:localhost|127\.0\.0\.1)(?::(\d+))?(\/\S*)?/);
+    if (!m) return { text: `curl: (6) Could not resolve host: ${url}`, cls: 'err' };
+    const port = +(m[1] || 80);
+    const c = st.dk.containers.find(x => x.status === 'running' && (x.ports || []).some(p => p.host === port));
+    if (!c) return { text: `curl: (7) Failed to connect to localhost port ${port} after 0 ms: Couldn't connect to server`, cls: 'err' };
+    if ((c.ports.find(p => p.host === port) || {}).cont !== 8000) return { text: 'curl: (56) Recv failure: Connection reset by peer', cls: 'err' };
+    return ((toks.includes('-i') || toks.includes('-I')) ? 'HTTP/1.1 200 OK\nServer: gunicorn\nContent-Type: application/json\n\n' : '') + '{"status":"ok"}';
+  }
+  const cfg = {
+    user: 'ruben', home: HOME, host: 'app02', ip: '10.20.0.31', adminIp: '10.20.0.2',
+    curl: (st, toks) => curl(st, toks),
+    patch: (c, h) => {
+      const chown = c.chown.run, chmod = c.chmod.run;
+      const onData = (a) => a._pos.filter(x => !x.startsWith('-')).slice(1).some(x => { const p = L.norm(x, h.S().cwd, HOME); return p === DATA || p.startsWith(DATA + '/') || p === SRV; });
+      c.chown.run = (a, ctx) => { const st = h.S(); if (st.V.nfs && onData(a)) throw CmdError(`chown: changing ownership of '${a._pos.filter(x => !x.startsWith('-'))[1]}': Operation not permitted\n(${DATA} is an NFS share exported with root_squash: root on this server is "nobody" there.)`); return chown(a, ctx); };
+      c.chmod.run = (a, ctx) => { const st = h.S(); const mode = a._pos.filter(x => !x.startsWith('-'))[0] || ''; if (onData(a)) { if (st.V.nfs) throw CmdError(`chmod: changing permissions of '${a._pos.filter(x => !x.startsWith('-'))[1]}': Operation not permitted`); if (/^\d?\d\d[2367]$|o\+\w*w|a\+\w*w|^\+w/.test(mode)) st.flags.badChmod = true; } return chmod(a, ctx); };
+    },
+    extra: (lab) => Object.assign(CS.docker(lab, dcfg), {
+      [SRV + '/run.sh']: { raw: true, desc: 'Deploy script for notes', run: () => runScript(lab, SRV + '/run.sh') },
+      './run.sh': { raw: true, desc: 'Run ./run.sh (from /srv/notes)', run: () => { if (lab.state.cwd !== SRV) throw CmdError('bash: ./run.sh: No such file or directory'); return runScript(lab, SRV + '/run.sh'); } },
+      bash: { raw: true, aliases: ['sh'], desc: 'Run a script (bash FILE)', run: a => { const f = a._pos[0]; if (!f) return { text: '(Interactive shells aren\'t simulated: run commands directly.)', cls: 'muted' }; return runScript(lab, L.norm(f, lab.state.cwd, HOME)); } },
+      findmnt: { raw: true, desc: 'Show mounted filesystems', run: () => `TARGET            SOURCE                     FSTYPE  OPTIONS\n/                 /dev/sda2                  ext4    rw,relatime\n${lab.state.V.nfs ? `${DATA}   nas01:/export/notes        nfs4    rw,relatime,vers=4.2,sec=sys\n` : ''}/var/lib/docker   /dev/sdb1                  ext4    rw,relatime` },
+      mount: { raw: true, desc: 'Show mounts', run: () => `/dev/sda2 on / type ext4 (rw,relatime)\n/dev/sdb1 on /var/lib/docker type ext4 (rw,relatime)${lab.state.V.nfs ? `\nnas01:/export/notes on ${DATA} type nfs4 (rw,relatime,vers=4.2,root_squash,sec=sys,clientaddr=10.20.0.31)` : ''}` },
+      df: { raw: true, desc: 'Disk usage (df -h)', run: () => `Filesystem            Size  Used Avail Use% Mounted on\n/dev/sda2              40G   9.1G   29G  24% /\n/dev/sdb1             100G    21G   79G  21% /var/lib/docker${lab.state.V.nfs ? `\nnas01:/export/notes   2.0T  1.1T  0.9T  55% ${DATA}` : ''}` }
+    })
+  };
+
+  function runScript(lab, path) {
+    const st = lab.state; const n = L.get(st, path);
+    if (!n) throw CmdError(`bash: ${path}: No such file or directory`);
+    const vars = {}; const out = []; const strict = /^set -e/m.test(n.c);
+    const lines = n.c.replace(/\\\n\s*/g, ' ').split('\n');
+    for (let raw of lines) {
+      const l = raw.trim(); if (!l || l.startsWith('#') || /^set /.test(l)) continue;
+      const vm = l.match(/^(\w+)=(\S*)$/); if (vm) { vars[vm[1]] = vm[2]; continue; }
+      const tolerant = /\|\|\s*true\s*$/.test(l);
+      const cmd = l.replace(/\s*2>\/dev\/null/, '').replace(/\s*\|\|\s*true\s*$/, '').replace(/\$\{?(\w+)\}?/g, (m, k) => (vars[k] !== undefined ? vars[k] : ''));
+      try { const r = lab._run(cmd); const t = r && typeof r === 'object' ? r.text : r; if (t && !/2>\/dev\/null/.test(l)) out.push(t); }
+      catch (e) { if (tolerant) continue; out.push(e.message); if (strict) return { text: out.join('\n'), cls: 'err' }; }
+    }
+    return out.join('\n') || null;
+  }
+  function render(st) { $('#dk-panel').innerHTML = CS.dockerPanel(st); }
+  const notes = st => st.dk.containers.find(c => c.name === 'notes');
+  const penalties = st => [st.flags.badChmod && 'a world-writable directory', (st.flags.badRootRun || st.flags.badRootImage) && 'running as root', st.flags.badPriv && '--privileged'].filter(Boolean);
+
+  let lab;
+  lab = Lab({
+    id: 'docker-permissions-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@app02 — /srv/notes',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@app02:${st.cwd === HOME ? '~' : st.cwd.replace(HOME, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nDocker version 27.3.1, build ce12230\n\nLast login: Sun Nov 22 10:12:09 2026 from 10.20.0.2\nType "help" for the commands; edit files with nano.\n',
+    createState, commands: lab => L.commands(lab, cfg), render,
+    onReset: () => { document.getElementById('ed-panel').hidden = true; },
+    score: st => 100 - 25 * penalties(st).length,
+    objectives: [
+      { text: 'Diagnose: read the container\'s logs and inspect it to find which user it runs as and which path it can\'t write.',
+        check: st => (st.flags.logsRead && st.flags.inspected) || (!st.flags.logsRead ? 'Read the container logs first (docker logs).' : 'Inspect the container or image to see its user and mounts (docker inspect).'),
+        hints: ['A restarting container still keeps its logs.', '<code>docker logs</code> shows the error; <code>docker inspect</code> shows <code>Config.User</code> and the <code>Mounts</code> (bind mount or named volume, and from where).', '<code>docker logs notes</code>, <code>docker inspect --format \'{{.Config.User}} {{json .Mounts}}\' notes</code>, then compare with <code>ls -ln</code> of the host path (bind mounts) or read <code>/srv/notes/src/Dockerfile</code>.'] },
+      { text: 'Fix the cause the right way so <code>notes</code> is running and healthy as UID 10001.',
+        check: st => { const c = notes(st); if (!c) return 'There\'s no container called notes.'; if (c.status !== 'running') return 'notes isn\'t running yet (docker ps -a, docker logs notes).'; if (c.uid !== 10001) return 'notes runs, but not as UID 10001 (the hardening requirement).'; return true; },
+        hints: ['The error says which path. Ask: who owns it, and is it on the host (bind mount), in a volume, or inside the image?', st => ({ bind: 'The host folder of the bind mount belongs to root. The container user (10001) needs to own it: on the host, numeric UIDs are what count.', image: 'The failing path is inside the image, created as root before <code>USER app</code>. Fix the Dockerfile, rebuild with a new tag and redeploy.', nfs: 'Look at what kind of storage the bind mount is (<code>findmnt</code>). NFS with root_squash ignores root on this server, so chown fails. Docker can manage the storage instead.' })[st.V.cause], st => ({ bind: '<code>sudo chown -R 10001:10001 /srv/notes/data</code>, then <code>docker restart notes</code>.', image: 'In src/Dockerfile: <code>RUN mkdir -p /app/cache /data &amp;&amp; chown app:app /app/cache /data</code> before <code>USER app</code>. Then <code>docker build -t notes-api:1.5 /srv/notes/src</code>, <code>docker rm -f notes</code> and run it again with notes-api:1.5.', nfs: '<code>docker volume create notes-data</code>, <code>docker rm -f notes</code>, then run it with <code>-v notes-data:/data</code> (a new named volume copies the image\'s /data ownership, UID 10001).' })[st.V.cause]] },
+      { text: 'Re-create the container from scratch (as the next deploy will) and confirm it comes back healthy with <code>/data</code> on persistent storage.',
+        check: st => { const c = notes(st); if (!c || c.status !== 'running' || c.uid !== 10001) return 'Fix the service first.'; if (!c.fresh) return 'A restart isn\'t a re-create: remove the container and run it again (docker rm -f notes, then docker run ... or ./run.sh).'; if (!c.persistent) return 'The new container has no mount on /data: notes would be lost when it\'s removed.'; return true; },
+        hints: ['A deploy runs <code>docker rm -f</code> and <code>docker run</code>: your fix must survive that.', 'Make sure <code>run.sh</code> deploys what you fixed (image tag and the -v mount), and run it.', '<code>nano /srv/notes/run.sh</code> if the image or volume changed, then <code>/srv/notes/run.sh</code> (or the docker rm -f / docker run pair) and <code>docker ps</code>, <code>curl -i http://localhost:8081/health</code>.'] },
+      { text: 'Prove from inside that it\'s not root: the running container reports UID 10001.', optional: true,
+        check: st => st.flags.idOk || 'Ask the container who it is (docker exec).',
+        hints: ['Run a command inside the running container.', '<code>docker exec</code> runs a command in a running container.', '<code>docker exec notes id</code>'] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      s.push({ cmd: 'docker ps -a', note: 'notes is in a restart loop.' }, { cmd: 'docker logs notes', note: V.cause === 'image' ? 'PermissionError on /app/cache/sessions: a folder inside the image.' : 'It can\'t open /data/notes.db: the database folder.' });
+      s.push({ cmd: "docker inspect --format '{{.Config.User}} {{json .Mounts}}' notes", note: `It runs as app (UID 10001); /data is ${V.cause === 'image' ? 'the named volume notes-data, which is fine' : 'a bind mount of ' + DATA}.` });
+      if (V.cause === 'bind') {
+        s.push({ cmd: 'ls -ln /srv/notes', note: 'data belongs to UID 0 (root) with 755: UID 10001 can\'t write.' });
+        s.push({ cmd: 'sudo chown -R 10001:10001 /srv/notes/data', note: 'Give the folder to the container\'s UID. Numbers matter, not names: there\'s no "app" user on the host.' }, { cmd: 'docker restart notes' }, { cmd: 'docker ps' });
+        s.push({ cmd: '/srv/notes/run.sh', note: 'Re-create it the way a deploy does: still healthy, data on the host folder.' });
+      }
+      if (V.cause === 'image') {
+        s.push({ cmd: 'cat /srv/notes/src/Dockerfile', note: '/app/cache is created as root and USER app comes after, so app can\'t write in it.' });
+        s.push({ cmd: 'nano /srv/notes/src/Dockerfile', note: 'chown the runtime folders to app before switching user.' }, { run: api => api.fill('#ed-text', DF_GOOD, { instant: true }) }, { run: api => api.click('#ed-save') });
+        s.push({ cmd: 'docker build -t notes-api:1.5 /srv/notes/src', note: 'A new tag, so a rollback to 1.4 stays possible (and obvious).' });
+        s.push({ cmd: 'nano /srv/notes/run.sh', note: 'Deploy the new tag.' }, { run: api => api.fill('#ed-text', runSh(V).replace('notes-api:1.4', 'notes-api:1.5'), { instant: true }) }, { run: api => api.click('#ed-save') });
+        s.push({ cmd: '/srv/notes/run.sh' }, { cmd: 'docker ps' });
+      }
+      if (V.cause === 'nfs') {
+        s.push({ cmd: 'ls -ln /srv/notes', note: 'Owned by root.' }, { cmd: 'sudo chown -R 10001:10001 /srv/notes/data', note: 'The obvious fix fails...' }, { cmd: 'findmnt', note: '...because it\'s an NFS share with root_squash: root here is "nobody" on the NAS. Even a root container couldn\'t write.' });
+        s.push({ cmd: 'docker volume create notes-data', note: 'Let Docker manage the storage: a new named volume copies the image\'s /data (owned by 10001).' });
+        s.push({ cmd: 'nano /srv/notes/run.sh', note: 'Point the deploy at the named volume.' }, { run: api => api.fill('#ed-text', runSh(V).replace(`${DATA}:/data`, 'notes-data:/data'), { instant: true }) }, { run: api => api.click('#ed-save') });
+        s.push({ cmd: '/srv/notes/run.sh' }, { cmd: 'docker ps' });
+      }
+      s.push({ cmd: 'curl -i http://localhost:8081/health' }, { cmd: 'docker exec notes id', note: 'Still UID 10001: the hardening stays in place.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Logs, then inspect', text: 'A restart loop still keeps its logs. <code>docker logs</code> gives the failing path; <code>docker inspect</code> gives the user and whether that path is a bind mount, a named volume or the image itself.' },
+      { title: 'UIDs, not names', text: 'The kernel only sees numbers. "app" in the container is UID 10001; on the host that UID may have no name at all. <code>ls -ln</code> and <code>chown 10001:10001</code> speak the same language as the container.' },
+      { title: 'Bind mount vs named volume', text: 'A bind mount brings the host folder as-is, owner included. A new named volume is initialized from the image\'s folder, so it inherits the ownership the Dockerfile set.' },
+      { title: 'Order in the Dockerfile', text: 'Everything before <code>USER</code> runs as root. Create and <code>chown</code> runtime folders before switching user, and bump the image tag when you fix it.' },
+      { title: 'NFS root_squash', text: 'On a share exported with root_squash, root on the client is mapped to nobody: sudo chown fails, and even a root container can\'t write. Change the storage or have the NAS admin set the ownership.' },
+      { title: 'Quick fixes that undo hardening', text: '<code>chmod 777</code>, <code>--user root</code> and <code>--privileged</code> all make the error go away by removing the protection the audit asked for. The fix belongs where the mismatch is.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>

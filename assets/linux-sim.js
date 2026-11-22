@@ -365,14 +365,15 @@
             if (!n) { out.push(`ls: cannot access '${raw}': No such file or directory`); return; }
             const fmt = (path, node) => {
               const name = L.base(path) + (node.t === 'l' ? ' -> ' + node.target : '');
-              return f.has('l') ? `${L.modeStr(node)} 1 ${node.o.padEnd(8)} ${node.g.padEnd(8)} ${String(L.size(r.node && path === p ? r.node : node)).padStart(6)} ${NOW} ${name}` : L.base(path);
+              const own = x => (f.has('n') ? String(st.users[x] ? st.users[x].uid : x) : x);
+              return (f.has('l') || f.has('n')) ? `${L.modeStr(node)} 1 ${own(node.o).padEnd(8)} ${own(node.g).padEnd(8)} ${String(L.size(r.node && path === p ? r.node : node)).padStart(6)} ${NOW} ${name}` : L.base(path);
             };
             if (r.node && r.node.t === 'd' && !(n.t === 'l' && f.has('l') && !raw.endsWith('/'))) {
               if (!L.can(st, who(), r.node, 'r') || !L.canEnter(st, who(), r.path + '/x')) { out.push(`ls: cannot open directory '${raw}': Permission denied`); return; }
               let kids = L.children(st, r.path);
               if (!f.has('a')) kids = kids.filter(k => !L.base(k).startsWith('.'));
               if (paths.length > 1) out.push(raw + ':');
-              if (f.has('l')) { out.push(`total ${kids.length * 4}`); kids.forEach(k => out.push(fmt(k, st.fs[k]))); }
+              if (f.has('l') || f.has('n')) { out.push(`total ${kids.length * 4}`); kids.forEach(k => out.push(fmt(k, st.fs[k]))); }
               else out.push(kids.map(k => L.base(k) + (st.fs[k].t === 'd' ? '/' : '')).join('  '));
             } else out.push(fmt(p, n));
           });
@@ -488,8 +489,8 @@
           const st = S(); const { f, rest } = flagsOf(a._pos); const [spec, ...files] = rest;
           if (!spec || !files.length) throw CmdError('chown: missing operand');
           const [u, g] = spec.split(':');
-          if (u && !st.users[u]) throw CmdError(`chown: invalid user: '${spec}'`);
-          if (g && !Object.values(st.users).some(x => x.groups.includes(g))) throw CmdError(`chown: invalid group: '${spec}'`);
+          if (u && !st.users[u] && !/^\d+$/.test(u)) throw CmdError(`chown: invalid user: '${spec}'`);
+          if (g && !/^\d+$/.test(g) && !Object.values(st.users).some(x => x.groups.includes(g))) throw CmdError(`chown: invalid group: '${spec}'`);
           if (who() !== 'root') throw CmdError(`chown: changing ownership of '${files[0]}': Operation not permitted`);
           files.forEach(raw => {
             const p = P(raw); const r = L.resolve(st, p); if (!r.node) throw CmdError(`chown: cannot access '${raw}': No such file or directory`);
@@ -619,6 +620,7 @@
       exit: { raw: true, aliases: ['logout'], desc: 'Leave the root shell', run: () => { const st = S(); if (st.rootShell) { st.rootShell = false; st.cwd = cfg.home; return 'logout'; } return { text: '(The SSH session stays open in this simulation.)', cls: 'muted' }; } },
       console: { raw: true, desc: 'Open the provider\'s serial console (recovery)', run: () => { const st = S(); if (!st.lockedOut) return { text: 'You still have SSH access, so the serial console isn\'t needed.', cls: 'muted' }; st.lockedOut = false; st.ufw.enabled = false; return { text: `Connected to serial console of ${cfg.host} as root.\n# ufw disable\nFirewall stopped and disabled on system startup\nSSH access restored. (This counts as an outage in the objectives: reset the lab to try again cleanly.)`, cls: 'warn' }; } }
     };
+    if (cfg.patch) cfg.patch(c, { S, who, P });
     if (cfg.extra) Object.assign(c, typeof cfg.extra === 'function' ? cfg.extra(lab, who) : cfg.extra);
     return wrap(c);
 

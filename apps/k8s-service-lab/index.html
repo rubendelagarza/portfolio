@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Kubernetes Service with no traffic — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 21</div>
+    <h1>Lab: Kubernetes Service with no traffic</h1>
+    <p>After a rollout, the storefront gets errors calling <code>orders-api</code>, even though every pod is Running and Ready. Test from inside the cluster, follow the path Service → Endpoints → Pods, and fix it without opening the API to namespaces that shouldn't reach it.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">kubectl · Services · Endpoints · NetworkPolicy</span><span class="pill">3 randomized faults</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> how a Service finds its pods (label selectors, Endpoints, <code>port</code> vs <code>targetPort</code>), testing with a throwaway pod, reading "connection refused" vs "timeout", and NetworkPolicies with namespace selectors, keeping least privilege while restoring traffic.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Ticket INC-21240</h3>
+          <p style="font-size:14px" id="wo-text"></p>
+          <p class="muted" style="font-size:12px;margin:0">Jump host with <code>kubectl</code> on cluster <code>prod-mx</code>. Manifests in <code>~/k8s</code>: change them with <code>nano</code> and <code>kubectl apply -f</code>.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>namespace orders</h3>
+          <div id="k8s-panel"></div>
+          <div id="np-panel" style="font-size:12px;margin-top:10px"></div>
+        </div>
+        <div class="panel">
+          <h3>Security requirement</h3>
+          <p style="font-size:13px;margin:0">Only workloads in the <code>frontend</code> namespace may call <code>orders-api</code>. Other namespaces (for example <code>marketing</code>) must stay blocked.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 21 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script src="../../assets/container-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim, CS = ContainerSim, { CmdError } = Lab, esc = Lab.util.esc;
+  const HOME = '/home/ruben', K = HOME + '/k8s', NS = 'orders', URL = 'http://orders-api.orders/api/orders';
+  const $ = s => document.querySelector(s);
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+
+  const VARIANTS = [{ fault: 'selector' }, { fault: 'targetPort' }, { fault: 'netpol' }];
+  const ORDERS = '[{"id":1042,"status":"shipped"},{"id":1043,"status":"processing"}]';
+  const IMAGES = {
+    'ghcr.io/contoso/orders-api:1.8.0': { port: 8080, health: '/healthz', env: [], routes: { '/api/orders': ORDERS, '/healthz': '{"status":"ok"}' }, logs: ['2026-11-22T16:20:11Z INFO orders-api 1.8.0 listening on :8080', '2026-11-22T16:20:11Z INFO connected to orders-db'] },
+    'ghcr.io/contoso/web:4.1.2': { port: 80, health: '/', env: [], routes: { '/': '<!doctype html><title>Shop</title>' }, logs: ['2026/11/22 16:22:40 [error] 31#31: *1840 upstream timed out (110: Connection timed out) while connecting to upstream, upstream: "http://orders-api.orders/api/orders"'] },
+    'ghcr.io/contoso/campaign-worker:2.0.0': { port: 8000, health: '/healthz', env: [], logs: ['INFO campaign-worker started'] }
+  };
+  const nsYaml = (frontLabel) => `apiVersion: v1\nkind: Namespace\nmetadata:\n  name: orders\n  labels:\n    team: orders\n---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: frontend\n  labels:\n    team: ${frontLabel}\n---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: marketing\n  labels:\n    team: marketing\n`;
+  const deployYaml = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+        tier: backend
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/contoso/orders-api:1.8.0
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+`;
+  const svcYaml = (V, fixed) => `apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  selector:
+    app: ${!fixed && V.fault === 'selector' ? 'orders' : 'orders-api'}
+  ports:
+    - name: http
+      port: 80
+      targetPort: ${!fixed && V.fault === 'targetPort' ? 80 : 'http'}
+`;
+  const npYaml = (V, fixed) => `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orders-api-ingress
+  namespace: orders
+spec:
+  podSelector:
+    matchLabels:
+      app: orders-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              ${fixed && V.fault === 'netpol' ? 'kubernetes.io/metadata.name: frontend' : 'team: frontend'}
+      ports:
+        - protocol: TCP
+          port: 8080
+`;
+  const webYaml = (ns, name, image, label) => `apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ${name}\n  namespace: ${ns}\nspec:\n  replicas: ${ns === 'frontend' ? 2 : 1}\n  selector:\n    matchLabels:\n      app: ${label}\n  template:\n    metadata:\n      labels:\n        app: ${label}\n    spec:\n      containers:\n        - name: ${label}\n          image: ${image}\n          ports:\n            - containerPort: ${ns === 'frontend' ? 80 : 8000}\n`;
+
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/etc/hostname'] = L.f('ops-jump01\n'); fs[K] = L.d('ruben', 'ruben'); fs[K + '/orders'] = L.d('ruben', 'ruben');
+    const st = { v, V, fs, cwd: HOME, users: L.baseUsers('ruben'), services: { ssh: { installed: true, active: true, enabled: true } }, units: {}, packages: ['kubectl'], ufw: { enabled: false, defaultIn: 'deny', rules: [] }, flags: {} };
+    st.k8s = CS.k8sState({ ns: 'default', images: IMAGES });
+    const put = text => CS.yamlAll(text).forEach(d => { d.metadata.age = d.kind === 'Namespace' ? '214d' : '38d'; st.k8s.objs.push(d); });
+    ['default', 'kube-system'].forEach(n => st.k8s.objs.push({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: n, age: '214d' } }));
+    const frontLabel = V.fault === 'netpol' ? 'web' : 'frontend';
+    put(nsYaml(frontLabel)); put(deployYaml); put(svcYaml(V, false)); put(npYaml(V, false));
+    put(webYaml('frontend', 'storefront', 'ghcr.io/contoso/web:4.1.2', 'storefront'));
+    put(webYaml('marketing', 'campaign-worker', 'ghcr.io/contoso/campaign-worker:2.0.0', 'campaign-worker'));
+    st.k8s.objs.push({ apiVersion: 'v1', kind: 'Service', metadata: { name: 'storefront', namespace: 'frontend', age: '38d' }, spec: { selector: { app: 'storefront' }, ports: [{ port: 80, targetPort: 80 }] } });
+    const dkey = NS + '/orders-api'; st.k8s.history[dkey] = [{ tpl: JSON.parse(JSON.stringify(CS.kGet(st, 'Deployment', NS, 'orders-api').spec.template)), cause: '<none>' }];
+    CS.settle(st);
+    fs[K + '/namespaces.yaml'] = L.f(nsYaml(frontLabel), 'ruben', 'ruben');
+    fs[K + '/orders/deployment.yaml'] = L.f(deployYaml, 'ruben', 'ruben');
+    fs[K + '/orders/service.yaml'] = L.f(svcYaml(V, false), 'ruben', 'ruben');
+    fs[K + '/orders/networkpolicy.yaml'] = L.f(npYaml(V, false), 'ruben', 'ruben');
+    fs[K + '/README.md'] = L.f(`# cluster manifests\n\nnamespaces.yaml       namespaces and their labels${V.fault === 'netpol' ? ' (platform team renamed team labels last week: frontend -> web)' : ''}\norders/               orders-api: deployment, service, network policy\n\nApply: kubectl apply -f ~/k8s/orders/\n`, 'ruben', 'ruben');
+    return st;
+  }
+
+  const probe = (st, ns) => CS.kHttp(st, ns, { run: 'probe' }, URL);
+  const kcfg = {
+    home: HOME,
+    onHttp: (st, ns, url, r) => {
+      if (!/orders-api/.test(url)) return;
+      if (ns === 'frontend') { st.flags.frontTested = true; if (r.ok && r.code === 200) st.flags.frontOk = true; }
+      if (ns === 'marketing' && r.blocked) st.flags.mktBlocked = true;
+      if (ns !== 'frontend' && ns !== 'orders' && r.ok) st.flags.otherOpen = true;
+    },
+    onEndpoints: st => { st.flags.endpointsSeen = true; },
+    onDescribe: (st, kind) => { if (kind === 'Service') st.flags.endpointsSeen = true; if (kind === 'NetworkPolicy') st.flags.npSeen = true; },
+    onDelete: (st, o) => { if (o.kind === 'NetworkPolicy') st.flags.npDeleted = true; },
+    onLabel: (st, o) => { if (o.kind === 'Namespace') st.flags.labeled = true; }
+  };
+  const cfg = {
+    user: 'ruben', home: HOME, host: 'ops-jump01', ip: '10.0.0.4', adminIp: '10.0.0.2',
+    curl: () => ({ text: 'curl: (6) Could not resolve host: orders-api.orders\n(Cluster DNS only works inside the cluster: test from a pod, e.g. kubectl run tmp --rm -it --image=curlimages/curl -n frontend -- curl -s -m 3 http://orders-api.orders/api/orders)', cls: 'err' }),
+    extra: lab => CS.kube(lab, kcfg)
+  };
+
+  function npSummary(st) {
+    const nps = CS.kList(st, 'NetworkPolicy', NS);
+    if (!nps.length) return '<span class="bad-t">No NetworkPolicy in orders: every namespace can reach orders-api.</span>';
+    const f = probe(st, 'frontend'), m = probe(st, 'marketing');
+    const fr = f.ok ? '<b class="ok-t">allowed</b>' : f.blocked ? '<b class="bad-t">blocked</b>' : '<span class="muted">no answer</span>';
+    const mk = m.ok ? '<b class="bad-t">allowed</b>' : m.blocked ? '<b class="ok-t">blocked</b>' : '<span class="muted">no answer</span>';
+    return `NetworkPolicy <code>${esc(nps.map(n => n.metadata.name).join(', '))}</code><br>frontend → orders-api: ${fr} · marketing → orders-api: ${mk}`;
+  }
+  function render(st) { $('#k8s-panel').innerHTML = CS.k8sPanel(st, NS, 'orders-api'); $('#np-panel').innerHTML = npSummary(st); }
+  const svc = st => CS.kGet(st, 'Service', NS, 'orders-api');
+  const routeOk = st => { const s = svc(st); if (!s) return false; const e = CS.endpoints(st, s); return e.length > 0 && e.every(x => x.port === 8080); };
+  const policyOk = st => { const nps = CS.kList(st, 'NetworkPolicy', NS); if (!nps.length) return 'There\'s no NetworkPolicy protecting orders-api any more.'; const pod = CS.pods(st).find(p => p.ns === NS && p.deploy === 'orders-api'); if (!pod) return 'No orders-api pods.'; if (!CS.netAllowed(st, 'frontend', { app: 'storefront' }, pod, 8080)) return 'The policy doesn\'t let the frontend namespace in on port 8080.'; if (CS.netAllowed(st, 'marketing', { app: 'campaign-worker' }, pod, 8080) || CS.netAllowed(st, 'default', { run: 'x' }, pod, 8080)) return 'The policy lets other namespaces in too (marketing or default).'; if (CS.netAllowed(st, 'frontend', { app: 'storefront' }, pod, 9999)) return 'The policy allows every port: restrict it to 8080.'; return true; };
+
+  let lab;
+  lab = Lab({
+    id: 'k8s-service-lab', dialect: 'bash', variants: 3, termTitle: 'ruben@ops-jump01 — kubectl (prod-mx)',
+    prompt: st => `ruben@ops-jump01:${st.cwd === HOME ? '~' : st.cwd.replace(HOME, '~')}$ `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS\nkubectl v1.31.2 · context: prod-mx · default namespace: default\n\nType "help" for the commands; kubectl --help for kubectl. Edit manifests with nano.\n',
+    createState, commands: lab => L.commands(lab, cfg), render,
+    onReset: () => { document.getElementById('ed-panel').hidden = true; $('#wo-text').innerHTML = '"Since this morning\'s release, the shop shows <i>Orders are temporarily unavailable</i>. The storefront logs show timeouts calling <code>http://orders-api.orders/api/orders</code>. All orders-api pods are green." (storefront team)'; },
+    objectives: [
+      { text: 'Reproduce it from inside the cluster: call the API from a temporary pod in the <code>frontend</code> namespace.',
+        check: st => st.flags.frontTested || 'Run a throwaway curl pod in the frontend namespace against http://orders-api.orders/api/orders.',
+        hints: ['Cluster DNS names like <code>orders-api.orders</code> only resolve inside the cluster.', '<code>kubectl run</code> with <code>--rm -it</code> creates a pod, runs one command and deletes it. Use the same namespace as the caller.', '<code>kubectl run tmp --rm -it --image=curlimages/curl -n frontend -- curl -s -m 3 http://orders-api.orders/api/orders</code>'] },
+      { text: 'Follow the path: check the Service\'s endpoints and compare its selector and ports with the pods.',
+        check: st => st.flags.endpointsSeen || 'Look at the Service\'s endpoints (kubectl get endpoints / describe svc).',
+        hints: ['A Service only sends traffic to pods that match its selector and are Ready; the result is its Endpoints.', '<code>kubectl get endpoints</code> and <code>kubectl describe svc</code> show what the Service resolved to; <code>--show-labels</code> on pods shows what it should match.', '<code>kubectl get endpoints orders-api -n orders</code>, <code>kubectl describe svc orders-api -n orders</code>, <code>kubectl get pods -n orders --show-labels</code>'] },
+      { text: 'The Service routes to the orders-api pods, on the port the app actually listens on.',
+        check: st => { const s = svc(st); if (!s) return 'The orders-api Service is gone.'; const e = CS.endpoints(st, s); if (!e.length) return 'The Service has no endpoints: its selector matches no Ready pods.'; if (!e.every(x => x.port === 8080)) return `Endpoints point at port ${e[0].port}, but the app listens on 8080.`; return true; },
+        hints: ['Compare: Service selector vs pod labels, and targetPort vs containerPort.', st => ({ selector: 'Endpoints are &lt;none&gt;: the selector is wrong.', targetPort: 'Endpoints exist, but on the wrong port. Look at targetPort and the containerPort (and the logs: "listening on").', netpol: 'If endpoints look right (pod IPs on :8080) this part is already fine: the problem is elsewhere on the path.' })[st.V.fault], st => ({ selector: 'In <code>~/k8s/orders/service.yaml</code> set <code>selector: app: orders-api</code>, then <code>kubectl apply -f ~/k8s/orders/service.yaml</code>.', targetPort: 'In <code>~/k8s/orders/service.yaml</code> set <code>targetPort: http</code> (the named containerPort, 8080), then apply it.', netpol: 'Nothing to change in the Service for this one: move on to the NetworkPolicy.' })[st.V.fault]] },
+      { text: 'The NetworkPolicy is in place and allows <b>only</b> the <code>frontend</code> namespace, on port 8080.',
+        check: st => policyOk(st),
+        hints: ['A NetworkPolicy that selects a pod drops everything it doesn\'t explicitly allow. Timeouts (not refusals) are its signature.', st => st.V.fault === 'netpol' ? 'The policy allows namespaces with label <code>team: frontend</code>. Check the real labels: <code>kubectl get ns --show-labels</code>.' : 'Check it still matches the frontend namespace labels and only port 8080 (it may already be right).', st => st.V.fault === 'netpol' ? 'Select the namespace by its built-in, unchangeable label: in <code>~/k8s/orders/networkpolicy.yaml</code> use <code>kubernetes.io/metadata.name: frontend</code>, then apply. (Deleting the policy "works" but breaks the requirement.)' : 'Keep the policy as is; if you deleted it, re-apply <code>~/k8s/orders/networkpolicy.yaml</code>.'] },
+      { text: 'Verify both sides: the frontend namespace gets orders, and a pod in <code>marketing</code> is still blocked.',
+        check: st => { if (!routeOk(st) || policyOk(st) !== true) return 'Fix the Service and the policy first.'; if (!probe(st, 'frontend').ok) return 'frontend still can\'t reach orders-api.'; if (!st.flags.frontOk) return 'Test it from the frontend namespace again.'; if (!st.flags.mktBlocked) return 'Prove the isolation: the same curl from the marketing namespace must time out.'; return true; },
+        hints: ['Run the same test from both namespaces.', 'From marketing, a timeout is the expected (good) result.', '<code>kubectl run tmp --rm -it --image=curlimages/curl -n frontend -- curl -s -m 3 http://orders-api.orders/api/orders</code>, then the same with <code>-n marketing</code>.'] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      const t = ns => `kubectl run tmp --rm -it --image=curlimages/curl -n ${ns} -- curl -s -m 3 ${URL}`;
+      s.push({ cmd: 'kubectl get pods -n orders', note: 'The pods are Running and Ready: the problem is between the caller and them.' });
+      s.push({ cmd: t('frontend'), note: { selector: '"Couldn\'t connect": the Service has nowhere to send traffic.', targetPort: 'A timeout: something drops the packets.', netpol: 'A timeout: something drops the packets.' }[V.fault] });
+      s.push({ cmd: 'kubectl get endpoints orders-api -n orders', note: { selector: 'ENDPOINTS <none>: the selector matches nothing.', targetPort: 'Endpoints on port 80, but the app listens on 8080 (and the policy only allows 8080, hence the timeout).', netpol: 'Endpoints look right: pod IPs on 8080. So the Service is fine.' }[V.fault] });
+      if (V.fault === 'selector') s.push({ cmd: 'kubectl get pods -n orders --show-labels', note: 'Pods are labelled app=orders-api; the Service selects app=orders.' });
+      if (V.fault === 'targetPort') s.push({ cmd: 'kubectl describe svc orders-api -n orders', note: 'TargetPort 80/TCP. The container port is 8080, named http.' });
+      if (V.fault !== 'netpol') { s.push({ cmd: 'nano ~/k8s/orders/service.yaml', note: V.fault === 'selector' ? 'Select the pods by their real label.' : 'Target the named port http, which is 8080.' }, { run: api => api.fill('#ed-text', svcYaml(V, true), { instant: true }) }, { run: api => api.click('#ed-save') }, { cmd: 'kubectl apply -f ~/k8s/orders/service.yaml' }, { cmd: 'kubectl get endpoints orders-api -n orders' }); }
+      if (V.fault === 'netpol') {
+        s.push({ cmd: 'kubectl describe networkpolicy orders-api-ingress -n orders', note: 'It allows namespaces labelled team=frontend on 8080.' }, { cmd: 'kubectl get ns --show-labels', note: 'frontend is now labelled team=web (the platform team renamed it). Use the built-in name label, which nobody can rename.' });
+        s.push({ cmd: 'nano ~/k8s/orders/networkpolicy.yaml' }, { run: api => api.fill('#ed-text', npYaml(V, true), { instant: true }) }, { run: api => api.click('#ed-save') }, { cmd: 'kubectl apply -f ~/k8s/orders/networkpolicy.yaml' });
+      }
+      s.push({ cmd: t('frontend'), note: 'frontend gets the orders.' }, { cmd: t('marketing'), note: 'marketing times out: the isolation still holds.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Test from where the caller is', text: 'A throwaway pod in the caller\'s namespace (<code>kubectl run --rm -it --image=curlimages/curl</code>) reproduces the problem with the same DNS and the same NetworkPolicies.' },
+      { title: 'Refused vs timeout', text: '"Couldn\'t connect" right away usually means no endpoints or nothing listening on the target port. A timeout means packets are dropped, the signature of a NetworkPolicy.' },
+      { title: 'Service → Endpoints → Pods', text: 'The selector picks Ready pods with matching labels; <code>kubectl get endpoints</code> shows the result. Empty endpoints = selector; endpoints on the wrong port = targetPort.' },
+      { title: 'Name your ports', text: '<code>targetPort: http</code> follows the container\'s named port, so a change of containerPort can\'t silently break the Service (and probes can use the same name).' },
+      { title: 'Stable labels in policies', text: 'Team labels get renamed. <code>kubernetes.io/metadata.name</code> is set by Kubernetes on every namespace and can\'t be changed, so it\'s the safe way to select a namespace.' },
+      { title: 'Don\'t delete the guard rail', text: 'Removing the NetworkPolicy makes the error go away and opens orders-api to every namespace. Verify both the allowed path and the blocked one.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>

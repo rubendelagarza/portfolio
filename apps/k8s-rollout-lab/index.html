@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Fix a broken Kubernetes rollout — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 20</div>
+    <h1>Lab: Fix a broken Kubernetes rollout</h1>
+    <p>A change to the payments service left its rollout stuck: the new pod won't become ready while the old ones keep serving. Find the failing pod, read its events and logs, fix the cause in the manifests and finish the rollout.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">kubectl · Deployments · ConfigMaps · Secrets · probes</span><span class="pill">3 randomized failures</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the kubectl troubleshooting loop (<code>get</code>, <code>describe</code>, <code>events</code>, <code>logs --previous</code>), reading pod states (CrashLoopBackOff, CreateContainerConfigError, Running but not Ready), how rolling updates protect you while a new version fails, and fixing through the manifests with <code>kubectl apply</code>.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Alert from monitoring</h3>
+          <p style="font-size:14px" id="wo-text"></p>
+          <p class="muted" style="font-size:12px;margin:0">You're on the ops jump host with <code>kubectl</code> pointed at cluster <code>prod-mx</code>. Manifests live in <code>~/k8s</code> (a git checkout): change them with <code>nano</code> and <code>kubectl apply -f</code>.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>namespace payments</h3>
+          <div id="k8s-panel"></div>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 20 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script src="../../assets/container-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim, CS = ContainerSim, { CmdError } = Lab;
+  const HOME = '/home/ruben', K = HOME + '/k8s', NS = 'payments';
+  const $ = s => document.querySelector(s);
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+
+  const VARIANTS = [
+    { cause: 'cmkey', change: 'restart after config cleanup (CHG-4471)' },
+    { cause: 'secret', change: 'rotate DB credentials (CHG-4480)' },
+    { cause: 'probe', change: 'add readiness probe (CHG-4492)' }
+  ];
+  const b64 = s => btoa(s);
+  const crash = ver => (env, missing) => [
+    `{"ts":"2026-11-22T16:31:02.114Z","level":"info","msg":"payments-api ${ver} starting","pid":1}`,
+    `{"ts":"2026-11-22T16:31:02.117Z","level":"info","msg":"loading configuration from environment"}`,
+    `{"ts":"2026-11-22T16:31:02.118Z","level":"fatal","msg":"config: required environment variable ${missing[0]} is not set","env_keys":${JSON.stringify(Object.keys(env).filter(k => k.startsWith('DB') || k.startsWith('LOG')).sort())}}`
+  ];
+  const okLogs = ver => [`{"ts":"2026-11-22T16:31:02.114Z","level":"info","msg":"payments-api ${ver} starting","pid":1}`, '{"ts":"2026-11-22T16:31:02.410Z","level":"info","msg":"connected to postgres payments-db.payments.svc.cluster.local:5432"}', '{"ts":"2026-11-22T16:31:02.412Z","level":"info","msg":"http server listening","addr":":8080"}'];
+  const IMAGES = {
+    'ghcr.io/contoso/payments-api:2.3.1': { port: 8080, health: '/healthz', env: ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD'], crash: crash('2.3.1'), logs: okLogs('2.3.1') },
+    'ghcr.io/contoso/payments-api:2.4.0': { port: 8080, health: '/healthz', env: ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD'], crash: crash('2.4.0'), logs: okLogs('2.4.0') }
+  };
+
+  // ------------------------------------------------------------- manifests (text)
+  const nsYaml = 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n  labels:\n    team: payments\n';
+  const cmYaml = (bad) => `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: payments-config\n  namespace: payments\ndata:\n  ${bad ? 'DB_HOTS' : 'DB_HOST'}: payments-db.payments.svc.cluster.local\n  DB_PORT: "5432"\n  LOG_LEVEL: info\n`;
+  const secretYaml = (name, ns) => `apiVersion: v1\nkind: Secret\nmetadata:\n  name: ${name}\n  namespace: ${ns}\ntype: Opaque\ndata:\n  DB_USER: ${b64('payments_app')}\n  DB_PASSWORD: ${b64(name === 'payments-db' ? 'Pay-2026-Q3!' : 'Pay-2026-Q4!rot')}\n`;
+  const svcYaml = 'apiVersion: v1\nkind: Service\nmetadata:\n  name: payments-api\n  namespace: payments\nspec:\n  selector:\n    app: payments-api\n  ports:\n    - name: http\n      port: 80\n      targetPort: http\n';
+  function deployYaml(o) {
+    return `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  namespace: payments
+  annotations:
+    kubernetes.io/change-cause: "${o.cause}"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api${o.restartedAt ? `\n      annotations:\n        kubectl.kubernetes.io/restartedAt: "${o.restartedAt}"` : ''}
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/contoso/payments-api:${o.ver}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: payments-config
+            - secretRef:
+                name: ${o.secret}${o.probe ? `
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ${o.probe}
+            initialDelaySeconds: 5
+            periodSeconds: 10` : ''}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+`;
+  }
+  const REV1 = { cause: 'release 2.3.1 (CHG-4402)', ver: '2.3.1', secret: 'payments-db', probe: null };
+  function rev2(V) {
+    if (V.cause === 'cmkey') return { cause: V.change, ver: '2.3.1', secret: 'payments-db', probe: null, restartedAt: '2026-11-22T10:24:51-06:00' };
+    if (V.cause === 'secret') return { cause: V.change, ver: '2.4.0', secret: 'payments-db-credentials', probe: null };
+    return { cause: V.change, ver: '2.4.0', secret: 'payments-db', probe: 8081 };
+  }
+
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/etc/hostname'] = L.f('ops-jump01\n');
+    fs[K] = L.d('ruben', 'ruben');
+    const users = L.baseUsers('ruben');
+    const st = { v, V, fs, cwd: HOME, users, services: { ssh: { installed: true, active: true, enabled: true } }, units: {}, packages: ['kubectl', 'curl'], ufw: { enabled: false, defaultIn: 'deny', rules: [] }, flags: {} };
+    st.k8s = CS.k8sState({ ns: 'default', images: IMAGES });
+    const put = text => CS.yamlAll(text).forEach(d => { d.metadata.age = d.kind === 'Namespace' ? '214d' : '41d'; const i = st.k8s.objs.findIndex(o => o.kind === d.kind && o.metadata.name === d.metadata.name && (o.metadata.namespace || '') === (d.metadata.namespace || '')); if (i >= 0) st.k8s.objs[i] = d; else st.k8s.objs.push(d); });
+    ['default', 'kube-system', 'monitoring'].forEach(n => st.k8s.objs.push({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: n, age: '214d' } }));
+    // revision 1: healthy
+    put(nsYaml); put(cmYaml(false)); put(secretYaml('payments-db', NS)); put(svcYaml); put(deployYaml(REV1));
+    const key = NS + '/payments-api'; const dep = () => CS.kGet(st, 'Deployment', NS, 'payments-api');
+    st.k8s.history[key] = [{ tpl: JSON.parse(JSON.stringify(dep().spec.template)), cause: REV1.cause }];
+    CS.settle(st);
+    // revision 2: the change that broke it
+    const r2 = rev2(V);
+    if (V.cause === 'cmkey') put(cmYaml(true));
+    if (V.cause === 'secret') { st.k8s.objs = st.k8s.objs.filter(o => !(o.kind === 'Secret' && o.metadata.name === 'payments-db')); put(secretYaml('payments-db-credentials', 'default')); }
+    put(deployYaml(r2)); dep().metadata.age = '41d';
+    st.k8s.history[key].push({ tpl: JSON.parse(JSON.stringify(dep().spec.template)), cause: r2.cause });
+    CS.settle(st);
+    // files on disk = what's in git (the broken change)
+    fs[K + '/namespace.yaml'] = L.f(nsYaml, 'ruben', 'ruben');
+    fs[K + '/configmap.yaml'] = L.f(cmYaml(V.cause === 'cmkey'), 'ruben', 'ruben');
+    fs[K + '/secret.yaml'] = L.f(V.cause === 'secret' ? secretYaml('payments-db-credentials', 'default') : secretYaml('payments-db', NS), 'ruben', 'ruben');
+    fs[K + '/deployment.yaml'] = L.f(deployYaml(r2), 'ruben', 'ruben');
+    fs[K + '/service.yaml'] = L.f(svcYaml, 'ruben', 'ruben');
+    fs[K + '/README.md'] = L.f('# payments manifests\n\nApply everything:  kubectl apply -f ~/k8s/\nNamespace: payments\nThe cluster is managed from this folder: no kubectl edit/patch in prod.\n', 'ruben', 'ruben');
+    return st;
+  }
+
+  const kcfg = {
+    home: HOME, preferFailing: true,
+    onDescribe: (st, kind, ns, name) => { if (kind === 'Pod' || kind === 'Deployment') st.flags.described = true; },
+    onGet: (st, kind) => { if (kind === 'Event') st.flags.events = true; },
+    onLogs: (st, p, prev) => { if (!p.ev.ready && p.ev.reason === 'CrashLoopBackOff') st.flags.crashLogs = true; },
+    onRollout: (st, verb, d, a) => { if (verb === 'status' && CS.rollout(st, d).complete && CS.podEval(st, NS, d.spec.template).ready) st.flags.rolloutOk = true; if (verb === 'history' && a.some(t => t.startsWith('--revision'))) st.flags.histRev = true; if (verb === 'undo') st.flags.undo = true; },
+    onDelete: (st, o) => { if (o.kind === 'Pod') st.flags.deletedPod = true; }
+  };
+  const cfg = {
+    user: 'ruben', home: HOME, host: 'ops-jump01', ip: '10.0.0.4', adminIp: '10.0.0.2',
+    curl: () => ({ text: 'curl: (6) Could not resolve host\n(The service is internal to the cluster: test it from a pod with kubectl run --rm -it --image=curlimages/curl -- curl …)', cls: 'err' }),
+    extra: (lab) => Object.assign(CS.kube(lab, kcfg), {
+      base64: { raw: true, desc: 'Decode base64 (base64 -d STRING)', run: a => { const s = a._pos.filter(x => !x.startsWith('-'))[0]; if (!s) throw CmdError('Usage here: base64 -d STRING  (pipes aren\'t simulated)'); try { return a._pos.includes('-d') || a._pos.includes('--decode') ? atob(s) : btoa(s); } catch (e) { throw CmdError('base64: invalid input'); } } }
+    })
+  };
+
+  function render(st) { $('#k8s-panel').innerHTML = CS.k8sPanel(st, NS, 'payments-api'); }
+  const dep = st => CS.kGet(st, 'Deployment', NS, 'payments-api');
+  const fixed = st => { const d = dep(st); return d && CS.podEval(st, NS, d.spec.template).ready; };
+
+  let lab;
+  lab = Lab({
+    id: 'k8s-rollout-lab', dialect: 'bash', variants: 3, termTitle: 'ruben@ops-jump01 — kubectl (prod-mx)',
+    prompt: st => `ruben@ops-jump01:${st.cwd === HOME ? '~' : st.cwd.replace(HOME, '~')}$ `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS\nkubectl v1.31.2 · context: prod-mx · default namespace: default\n\nType "help" for the commands; kubectl --help for kubectl. Edit manifests with nano.\n',
+    createState, commands: lab => L.commands(lab, cfg), render,
+    onReset: st => { document.getElementById('ed-panel').hidden = true; $('#wo-text').innerHTML = `<b>KubeDeploymentRolloutStuck</b>: deployment <code>payments/payments-api</code> has not finished its rollout for 15 minutes. Last change: <i>${Lab.util.esc(st.V.change)}</i>. Customers aren't affected yet: the old pods are still serving.`; },
+    objectives: [
+      { text: 'Find the failing pod and the reason it fails (its status, events and, if it crashed, the logs of the crash).',
+        check: st => { if (!st.flags.k_get) return 'Start by listing the pods in the payments namespace.'; if (!(st.flags.described || st.flags.events)) return 'Describe the failing pod (or read the namespace events) to see why it fails.'; if (st.V.cause === 'cmkey' && !st.flags.crashLogs) return 'The container crashes: read its logs (from the previous run, too).'; return true; },
+        hints: ['Every kubectl command here needs <code>-n payments</code> (or set it as the default namespace).', 'The STATUS column tells you where to look: CrashLoopBackOff → logs; CreateContainerConfigError → describe/events; Running but 0/1 → the readiness probe in events.', '<code>kubectl get pods -n payments</code>, <code>kubectl describe pod POD -n payments</code>, <code>kubectl get events -n payments</code>, <code>kubectl logs POD -n payments --previous</code>'] },
+      { text: 'Fix the cause in the manifests in <code>~/k8s</code> and apply them.',
+        check: st => fixed(st) || 'A pod from the current Deployment template still wouldn\'t become ready.',
+        hints: ['Compare what the container needs with what the manifests give it: names, keys, namespaces, ports.', st => ({ cmkey: 'The app says which variable is missing and lists the keys it got. Look at the ConfigMap the Deployment loads with envFrom.', secret: 'The Deployment loads a Secret that doesn\'t exist in payments. Find where it was created: <code>kubectl get secrets -A</code>.', probe: 'The readiness probe asks a port the app doesn\'t serve /healthz on. Look at the container\'s ports and the app logs ("listening").' })[st.V.cause], st => ({ cmkey: 'In <code>~/k8s/configmap.yaml</code> rename <code>DB_HOTS</code> to <code>DB_HOST</code>, then <code>kubectl apply -f ~/k8s/configmap.yaml</code>. The crashing container restarts and reads the fixed value.', secret: 'In <code>~/k8s/secret.yaml</code> change <code>namespace: default</code> to <code>namespace: payments</code>, then <code>kubectl apply -f ~/k8s/secret.yaml</code>.', probe: 'In <code>~/k8s/deployment.yaml</code> set the readinessProbe <code>port: http</code> (or 8080), then <code>kubectl apply -f ~/k8s/deployment.yaml</code>.' })[st.V.cause]] },
+      { text: 'The rollout completes: 3/3 replicas updated and ready (confirm with <code>kubectl rollout status</code>).',
+        check: st => { const d = dep(st); const r = CS.rollout(st, d); if (!r.complete) return `Rollout not complete: ${r.updated}/${r.total} updated, ${r.ready} ready.`; if (!fixed(st)) return 'The rollout looks complete, but it\'s running an old revision on stale config: fix the manifests.'; return st.flags.rolloutOk || 'Confirm it: kubectl rollout status deployment/payments-api -n payments'; },
+        hints: ['Once the cause is fixed, the Deployment controller finishes the rollout by itself.', 'Deleting pods doesn\'t fix anything: the ReplicaSet recreates them from the same template.', '<code>kubectl rollout status deployment/payments-api -n payments</code>, <code>kubectl get pods -n payments</code>'] },
+      { text: 'Compare the last two revisions of the Deployment to see exactly what the change touched.', optional: true,
+        check: st => st.flags.histRev || 'Look at a specific revision with kubectl rollout history.',
+        hints: ['Deployments keep a revision history.', '<code>kubectl rollout history</code> lists revisions; <code>--revision=N</code> shows one.', '<code>kubectl rollout history deployment/payments-api -n payments --revision=1</code> and <code>--revision=2</code>'] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      s.push({ cmd: 'kubectl get pods -n payments', note: 'Three old pods still serve; the new one (a different pod-template-hash) is failing.' });
+      const fp = (CS.pods(st).find(p => p.ns === NS && !p.ev.ready) || { name: 'payments-api' }).name;
+      s.push({ cmd: `kubectl describe pod ${fp} -n payments`, note: { cmkey: 'Started, then BackOff: the container crashes. Logs next.', secret: 'CreateContainerConfigError: secret "payments-db-credentials" not found.', probe: 'Running but not Ready: the readiness probe on port 8081 gets connection refused.' }[V.cause] });
+      if (V.cause === 'cmkey') s.push({ cmd: `kubectl logs ${fp} -n payments --previous`, note: 'DB_HOST is missing, and the env keys show DB_HOTS: a typo from the "cleanup".' }, { cmd: 'kubectl describe configmap payments-config -n payments' });
+      if (V.cause === 'secret') s.push({ cmd: 'kubectl get secrets -A', note: 'The new secret was created in the default namespace. Pods can only use Secrets from their own namespace.' });
+      if (V.cause === 'probe') s.push({ cmd: `kubectl logs ${fp} -n payments`, note: 'The app listens on :8080 (8081 isn\'t anything; 9090 is metrics).' });
+      s.push({ cmd: 'kubectl rollout history deployment/payments-api -n payments --revision=2', note: 'The revision that broke it.' });
+      const file = { cmkey: 'configmap.yaml', secret: 'secret.yaml', probe: 'deployment.yaml' }[V.cause];
+      const text = { cmkey: cmYaml(false), secret: secretYaml('payments-db-credentials', NS), probe: deployYaml(Object.assign(rev2(V), { probe: 'http' })) }[V.cause];
+      s.push({ cmd: `nano ~/k8s/${file}`, note: { cmkey: 'Fix the key name.', secret: 'Put the Secret in the payments namespace.', probe: 'Probe the named port http (8080), so it follows the containerPort if it ever changes.' }[V.cause] }, { run: api => api.fill('#ed-text', text, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: `kubectl apply -f ~/k8s/${file}` });
+      s.push({ cmd: 'kubectl rollout status deployment/payments-api -n payments' }, { cmd: 'kubectl get pods -n payments', note: 'All three pods on the new template, Ready.' });
+      if (V.cause === 'secret') s.push({ cmd: 'kubectl delete secret payments-db-credentials -n default', note: 'Clean up the copy in the wrong namespace.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Status tells you where to look', text: 'CrashLoopBackOff: the process starts and dies, so read <code>logs --previous</code>. CreateContainerConfigError: Kubernetes can\'t even build the container (missing ConfigMap, Secret or key), so read <code>describe</code>/events. Running 0/1: a probe is failing.' },
+      { title: 'Rolling updates bought you time', text: 'With maxUnavailable 25% the old ReplicaSet kept serving while the new pod failed. That\'s why it was an alert, not an outage. <code>kubectl rollout undo</code> is the instant mitigation if it ever is one.' },
+      { title: 'Namespaces scope config', text: 'A pod can only reference ConfigMaps and Secrets in its own namespace. <code>kubectl get secrets -A</code> finds the one created in the wrong place.' },
+      { title: 'Probe what the app serves', text: 'A readinessProbe on the wrong port keeps pods out of the Service forever. Using the named port (<code>port: http</code>) ties the probe to the containerPort.' },
+      { title: 'Fix the template, not the pods', text: 'Deleting pods just gets you new pods from the same template with the same error. Change the manifest, <code>apply</code>, and let the controller finish.' },
+      { title: 'Manifests are the source of truth', text: 'Editing the files in git and applying them keeps the cluster and the repository in sync; <code>kubectl edit</code> in production gets overwritten by the next deploy.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>
