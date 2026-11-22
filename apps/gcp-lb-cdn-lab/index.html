@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Put a web app behind a global load balancer with Cloud CDN — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 09</div>
+    <h1>Lab: Put a web app behind a global load balancer with Cloud CDN</h1>
+    <p>Build a global external Application Load Balancer from its parts in Cloud Shell: health check, backend service, URL map, managed certificate, HTTPS proxy and forwarding rule. Then pick the right CDN cache mode and size Cloud NAT for a batch fleet.</p>
+    <div class="lab-meta"><span class="pill">Intermediate–Advanced</span><span class="pill">~12 min</span><span class="pill">gcloud</span><span class="pill">3 randomized environments</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> configuring Google Cloud managed network services (Cloud Load Balancing, Cloud CDN and Cloud NAT) to improve performance and availability, and knowing the details that make them work, like health-check source ranges and port budgets.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div class="panel">
+          <h3>Load balancer chain</h3>
+          <div class="diagram" id="chain"></div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Client brief: Contoso Shop</h3>
+          <p style="font-size:14px">The storefront runs on managed instance group <code>web-mig</code>. Put it behind a global HTTPS load balancer on <code>https://shop.contoso.com</code>, with a Google-managed certificate and Cloud CDN.</p>
+          <dl class="facts">
+            <dt>Project</dt><dd>contoso-web</dd>
+            <dt>Network</dt><dd>web-vpc</dd>
+            <dt>Backends</dt><dd>web-mig · us-central1-a · 3 VMs · tag <code>web</code> · named port http:80</dd>
+            <dt>Reserved IP</dt><dd>web-ip (global) · DNS for shop.contoso.com already points to it</dd>
+          </dl>
+        </div>
+        <div class="panel">
+          <h3>App notes from the dev team</h3>
+          <ul style="font-size:13px;padding-left:18px;margin:0">
+            <li>Listens on HTTP port 80.</li>
+            <li><code>GET /</code> returns a 302 redirect to <code>/store</code>.</li>
+            <li><code>GET /healthz</code> returns 200 "ok" when the instance is healthy.</li>
+            <li>Static assets live under <code>/static/</code>. <code>/cart</code> is personalized per session.</li>
+            <li>The app does <strong>not</strong> send Cache-Control headers.</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Bonus brief: batch egress</h3>
+          <p style="font-size:13px;margin:0"><code>batch-mig</code> (300 VMs, subnet <code>batch-subnet</code>, us-central1) calls a partner API at one IP on port 443 and needs up to <strong>2,000 concurrent connections per VM</strong>. The partner allowlists source IPs, so egress must use the pre-reserved addresses <code>nat-ip-1</code> … <code>nat-ip-12</code>.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 09 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/gcp-common.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab;
+  const G = GcpSim;
+  const P = 'contoso-web', REGION = 'us-central1', ZONE = 'us-central1-a';
+  const LB_IP = '34.120.10.20', DOMAIN = 'shop.contoso.com';
+  const GFE = ['35.191.0.0/16', '130.211.0.0/22'];
+  const PORTS_PER_IP = 64512;
+  const fw = o => Object.assign({ direction: 'INGRESS', action: 'ALLOW', sourceTags: [], targetTags: [], destinationRanges: [], priority: 1000, disabled: false, description: '', created: '2026-11-18T16:40:12.000-08:00' }, o);
+
+  function createState(v) {
+    const firewalls = [fw({ name: 'web-allow-iap-ssh', network: 'web-vpc', rules: [{ proto: 'tcp', ports: [[22, 22]] }], sourceRanges: ['35.235.240.0/20'], targetTags: ['web'] })];
+    if (v === 1) firewalls.push(fw({ name: 'allow-health-checks', network: 'web-vpc', rules: [{ proto: 'tcp', ports: [[80, 80]] }], sourceRanges: GFE.slice(), targetTags: ['webserver'], description: 'Google health checks' }));
+    if (v === 2) firewalls.push(fw({ name: 'allow-health-checks', network: 'web-vpc', rules: [{ proto: 'tcp', ports: [[8080, 8080]] }], sourceRanges: GFE.slice(), targetTags: ['web'], description: 'Google health checks' }));
+    const addresses = [{ name: 'web-ip', address: LB_IP, global: true }];
+    for (let i = 1; i <= 12; i++) addresses.push({ name: 'nat-ip-' + i, address: '34.68.10.' + (10 + i), region: REGION });
+    return {
+      v,
+      networks: [{ name: 'web-vpc' }],
+      subnets: [{ name: 'web-subnet', network: 'web-vpc', region: REGION, range: '10.40.1.0/24' }, { name: 'batch-subnet', network: 'web-vpc', region: REGION, range: '10.40.8.0/22' }],
+      instances: [['web-mig-7k2p', '10.40.1.11'], ['web-mig-9xq4', '10.40.1.12'], ['web-mig-c3vd', '10.40.1.13']].map(([n, ip]) => ({ name: n, ip, zone: ZONE, tags: ['web'] })),
+      mig: { name: 'web-mig', zone: ZONE, size: 3, namedPorts: [{ name: 'http', port: 80 }] },
+      firewalls, addresses,
+      healthChecks: [], backendServices: [], urlMaps: [], certs: [], httpsProxies: [], httpProxies: [], forwardingRules: [], routers: [],
+      cdnCache: {}, flags: {}
+    };
+  }
+
+  // ---------- model
+  const find = (arr, name) => arr.find(x => x.name === name);
+  function hcProbeOk(st, hc) {
+    if (!hc) return { ok: false, why: 'no health check' };
+    const allowed = GFE.every(r => G.evalIngress(st.firewalls, { network: 'web-vpc', srcIp: net.intToIp(net.parseCidr(r).base + 10), tags: ['web'], proto: 'tcp', port: hc.port }).allowed);
+    if (!allowed) return { ok: false, why: 'probes blocked by firewall' };
+    if (hc.port !== 80) return { ok: false, why: `nothing listens on port ${hc.port}` };
+    if (hc.protocol === 'TCP') return { ok: true };
+    if (hc.protocol === 'HTTPS') return { ok: false, why: 'the app does not serve TLS' };
+    if (hc.requestPath !== '/healthz') return { ok: false, why: `${hc.requestPath} returns ${hc.requestPath === '/' ? '302' : '404'}, not 200` };
+    return { ok: true };
+  }
+  function bsHealth(st, bs) {
+    if (!bs || !bs.backends.length) return { ok: false, why: 'no backends' };
+    const hc = find(st.healthChecks, bs.healthChecks[0]);
+    return hcProbeOk(st, hc);
+  }
+  const migBackendService = st => st.backendServices.find(b => b.backends.some(x => x.group === 'web-mig'));
+  function certStatus(st, cert) {
+    if (!cert) return { status: 'MISSING', domains: {} };
+    const domains = {};
+    cert.domains.forEach(d => { domains[d] = 'PROVISIONING'; });
+    const attached = st.forwardingRules.some(f => f.ports.includes(443) && f.targetType === 'https' && (() => { const px = find(st.httpsProxies, f.target); return px && px.certs.includes(cert.name); })());
+    const onLbIp = st.forwardingRules.some(f => f.ip === LB_IP && f.ports.includes(443) && f.targetType === 'https' && (() => { const px = find(st.httpsProxies, f.target); return px && px.certs.includes(cert.name); })());
+    cert.domains.forEach(d => {
+      if (d !== DOMAIN) domains[d] = 'FAILED_NOT_VISIBLE';
+      else if (onLbIp) domains[d] = 'ACTIVE';
+      else if (attached) domains[d] = 'FAILED_NOT_VISIBLE';
+    });
+    const all = Object.values(domains);
+    return { status: all.length && all.every(s => s === 'ACTIVE') ? 'ACTIVE' : 'PROVISIONING', domains };
+  }
+  function frontend(st, scheme, host) {
+    const port = scheme === 'https' ? 443 : 80;
+    const ip = host === DOMAIN ? LB_IP : host;
+    const fr = st.forwardingRules.find(f => f.ip === ip && f.ports.includes(port));
+    if (!fr) return { err: 'connect', port };
+    let mapName;
+    if (scheme === 'https') {
+      if (fr.targetType !== 'https') return { err: 'connect', port };
+      const px = find(st.httpsProxies, fr.target);
+      const certs = px.certs.map(c => find(st.certs, c));
+      if (!certs.some(c => certStatus(st, c).status === 'ACTIVE' && (host === DOMAIN))) return { err: 'tls', port };
+      mapName = px.urlMap;
+    } else {
+      if (fr.targetType !== 'http') return { err: 'connect', port };
+      mapName = find(st.httpProxies, fr.target).urlMap;
+    }
+    const um = find(st.urlMaps, mapName);
+    return { bs: find(st.backendServices, um.defaultService), fr };
+  }
+  function serveRequest(st, scheme, host, path) {
+    const fe = frontend(st, scheme, host);
+    if (fe.err) return fe;
+    const bs = fe.bs;
+    const h = bsHealth(st, bs);
+    const portOk = st.mig.namedPorts.some(np => np.name === bs.portName && np.port === 80);
+    if (!h.ok || !portOk || bs.protocol !== 'HTTP') return { status: 502, bs };
+    const isStatic = /^\/static\//.test(path);
+    let code = 200, type = 'text/html; charset=utf-8', body = '', extra = [];
+    if (path === '/') { code = 302; extra.push('location: /store'); body = '<a href="/store">Found</a>.'; }
+    else if (path === '/store') body = '<!doctype html><html><head><title>Contoso Shop</title><link rel="stylesheet" href="/static/app.css"></head><body><h1>Contoso Shop</h1>…</body></html>';
+    else if (path === '/healthz') { type = 'text/plain'; body = 'ok'; }
+    else if (path === '/cart') { body = '<!doctype html><h1>Your cart</h1><p>Signed in as guest-7f3a · 2 items</p>'; extra.push('set-cookie: sid=7f3a91c2; Path=/; HttpOnly; Secure'); }
+    else if (isStatic) { type = path.endsWith('.css') ? 'text/css' : path.endsWith('.js') ? 'application/javascript' : 'image/png'; body = path.endsWith('.css') ? 'body{font-family:system-ui;margin:0}…' : '(binary)'; }
+    else { code = 404; body = 'Not Found'; }
+    let age = null;
+    if (bs.enableCdn && code === 200 && scheme === 'https') {
+      const cacheable = bs.cacheMode === 'FORCE_CACHE_ALL' || (bs.cacheMode === 'CACHE_ALL_STATIC' && isStatic);
+      if (cacheable) {
+        const c = st.cdnCache[path];
+        if (c) { c.age += 7 + Math.floor(Math.random() * 30); age = c.age; } else st.cdnCache[path] = { age: 0 };
+      }
+    }
+    return { status: code, type, body, extra, age, bs };
+  }
+  function httpsWorks(st) { const r = serveRequest(st, 'https', DOMAIN, '/store'); return r.status === 200; }
+  function natCapacity(st) {
+    for (const rt of st.routers) for (const n of rt.nats) {
+      if (rt.region !== REGION || rt.network !== 'web-vpc') continue;
+      const covers = n.allSubnets || n.subnets.includes('batch-subnet');
+      return { rt, n, covers, ips: n.auto ? null : n.ips.length, minPorts: n.minPorts, vms: n.auto ? null : n.ips.length * Math.floor(PORTS_PER_IP / n.minPorts) };
+    }
+    return null;
+  }
+
+  // ---------- output helpers
+  const bsRow = b => ({ NAME: b.name, BACKENDS: b.backends.map(x => `${x.zone}/instanceGroups/${x.group}`).join(','), PROTOCOL: b.protocol });
+  const hcRow = h => ({ NAME: h.name, PROTOCOL: h.protocol });
+  const frRow = f => ({ NAME: f.name, REGION: '', IP_ADDRESS: f.ip, IP_PROTOCOL: 'TCP', TARGET: `${f.targetType === 'https' ? 'targetHttpsProxies' : 'targetHttpProxies'}/${f.target}` });
+  const certRow = (st, c) => ({ NAME: c.name, TYPE: 'MANAGED', CREATION_TIMESTAMP: c.created, EXPIRE_TIME: certStatus(st, c).status === 'ACTIVE' ? '2027-02-18T15:12:44.000-08:00' : '', REGION: '', MANAGED_STATUS: certStatus(st, c).status });
+  function needGlobal(a, cmd) { if (a.region) throw G.invalid(cmd, 'This lab builds a global external load balancer: use --global, not --region.'); if (!a.global) throw G.invalid(cmd, 'Exactly one of (--global | --region) must be specified.'); }
+  function inUse(cmd, kind, name, byKind, by) { return G.invalid(cmd, `Could not fetch resource:\n - The ${kind} resource 'projects/${P}/global/${kind === 'health_check' ? 'healthChecks' : kind}/${name}' is already being used by 'projects/${P}/global/${byKind}/${by}'`); }
+
+  function curl(st, lab, a) {
+    const toks = a._pos; const flags = toks.filter(t => t.startsWith('-')); const url = toks.find(t => !t.startsWith('-') && !['/dev/null'].includes(t));
+    if (!url) throw CmdError('curl: no URL specified!\ncurl: try \'curl --help\' for more information');
+    const m = url.match(/^(https?):\/\/([^/:]+)(?::(\d+))?(\/.*)?$/i);
+    if (!m) throw CmdError(`curl: (3) URL using bad/illegal format or missing URL`);
+    const scheme = m[1].toLowerCase(), host = m[2].toLowerCase(), path = m[4] || '/';
+    if (host !== DOMAIN && !net.isIp(host)) return { text: `curl: (6) Could not resolve host: ${host}`, cls: 'err' };
+    const head = flags.some(f => /^-[a-zA-Z]*I/.test(f) || f === '--head');
+    const incl = head || flags.some(f => /^-[a-zA-Z]*[iv]/.test(f));
+    const follow = flags.some(f => /^-[a-zA-Z]*L/.test(f));
+    let r = serveRequest(st, scheme, host, path);
+    if (r.err === 'connect') return { text: `curl: (7) Failed to connect to ${host} port ${r.port} after 31 ms: Couldn't connect to server`, cls: 'err' };
+    if (r.err === 'tls') return { text: `curl: (35) OpenSSL/3.0.13: error:0A000410:SSL routines::sslv3 alert handshake failure`, cls: 'err' };
+    if (r.status === 302 && follow) r = serveRequest(st, scheme, host, '/store');
+    const date = 'Fri, 20 Nov 2026 23:' + String(10 + Math.floor(Math.random() * 49)).padStart(2, '0') + ':07 GMT';
+    if (r.status === 502) {
+      const body = '<!DOCTYPE html>\n<html lang=en>\n  <meta charset=utf-8>\n  <title>Error 502 (Server Error)!!1</title>\n  <p><b>502.</b> <ins>That’s an error.</ins>\n  <p>Error: Server Error\n  <p>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.  <ins>That’s all we know.</ins>';
+      return { text: (incl ? `HTTP/2 502\ncontent-type: text/html; charset=UTF-8\nreferrer-policy: no-referrer\ncontent-length: 332\ndate: ${date}\nalt-svc: h3=":443"; ma=2592000\n\n` : '') + (head ? '' : body), cls: 'warn' };
+    }
+    const reason = { 200: '', 302: '', 404: '' }[r.status];
+    const headers = [`HTTP/${scheme === 'https' ? '2' : '1.1'} ${r.status}${scheme === 'http' ? ' ' + ({ 200: 'OK', 302: 'Found', 404: 'Not Found' }[r.status]) : ''}`, `content-type: ${r.type}`].concat(r.extra, [`content-length: ${r.body.length}`, 'via: 1.1 google', `date: ${date}`]);
+    if (r.age !== null && r.age > 0) headers.push(`age: ${r.age}`);
+    if (scheme === 'https') headers.push('alt-svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000');
+    void reason;
+    return { text: (incl ? headers.join('\n') + '\n\n' : '') + (head ? '' : r.body), cls: r.status >= 400 ? 'warn' : '' };
+  }
+
+  const commands = lab => {
+    const S = () => lab.state;
+    const hcCreate = proto => ({
+      desc: `Create a global ${proto} health check`, positional: ['NAME'],
+      params: { NAME: { posOnly: true, required: true }, port: { type: 'int', desc: 'Default 80 (443 for HTTPS)' }, 'request-path': { desc: 'Default /' }, 'check-interval': {}, timeout: {}, 'healthy-threshold': { type: 'int' }, 'unhealthy-threshold': { type: 'int' }, global: { type: 'switch' }, region: {}, 'use-serving-port': { type: 'switch' }, description: {} },
+      run: a => {
+        const cmd = `gcloud compute health-checks create ${proto.toLowerCase()}`;
+        if (find(S().healthChecks, a.NAME)) throw G.exists(cmd, P, 'global/healthChecks/' + a.NAME);
+        if (a['use-serving-port']) throw G.invalid(cmd, 'Use an explicit --port in this lab.');
+        const hc = { name: a.NAME, protocol: proto, port: a.port || (proto === 'HTTPS' ? 443 : 80), requestPath: proto === 'TCP' ? null : (a['request-path'] || '/'), region: a.region || null, interval: a['check-interval'] || '5s' };
+        if (hc.requestPath && !hc.requestPath.startsWith('/')) throw G.invalid(cmd, `Invalid value for field 'resource.httpHealthCheck.requestPath': '${hc.requestPath}'. Must start with /.`);
+        S().healthChecks.push(hc);
+        return { pre: `Created [${G.url(P, (hc.region ? 'regions/' + hc.region : 'global') + '/healthChecks/' + hc.name)}].`, objects: [hcRow(hc)], style: 'gcloud' };
+      }
+    });
+    const delSpec = (label, coll, path, check) => ({
+      desc: `Delete a ${label}`, positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' }, region: {} },
+      run: a => {
+        const cmd = `gcloud compute ${path.split('/')[0]} delete`;
+        const arr = S()[coll]; const x = find(arr, a.NAME);
+        if (!x) throw G.notFound(cmd, P, 'global/' + path.split('/')[1] + '/' + a.NAME);
+        if (check) check(x, cmd);
+        S()[coll] = arr.filter(y => y !== x);
+        return { text: `Deleted [${G.url(P, 'global/' + path.split('/')[1] + '/' + a.NAME)}].` };
+      }
+    });
+    return Object.assign({
+      'gcloud config list': { desc: 'Show the active configuration', run: () => `[compute]\nregion = ${REGION}\nzone = ${ZONE}\n[core]\naccount = ruben@contoso-partner.com\nproject = ${P}\n\nYour active configuration is: [default]` },
+      'gcloud compute networks list': { desc: 'List VPC networks', run: () => G.table([{ NAME: 'web-vpc', SUBNET_MODE: 'CUSTOM', BGP_ROUTING_MODE: 'REGIONAL' }]) },
+      'gcloud compute networks subnets list': { desc: 'List subnets', params: { network: {}, regions: {} }, run: () => G.table(S().subnets.map(s => ({ NAME: s.name, REGION: s.region, NETWORK: s.network, RANGE: s.range }))) },
+      'gcloud compute instances list': { desc: 'List VM instances', run: () => G.table(S().instances.map(i => ({ NAME: i.name, ZONE: i.zone, MACHINE_TYPE: 'e2-medium', INTERNAL_IP: i.ip, EXTERNAL_IP: '', STATUS: 'RUNNING' })), '(batch-mig\'s 300 instances are not listed)') },
+      'gcloud compute instances describe': { desc: 'Show a VM (tags, network)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, zone: {} }, run: a => { const i = find(S().instances, a.NAME); if (!i) throw G.notFound('gcloud compute instances describe', P, `zones/${ZONE}/instances/${a.NAME}`); return G.yaml({ name: i.name, status: 'RUNNING', networkInterfaces: [{ network: G.url(P, 'global/networks/web-vpc'), networkIP: i.ip }], tags: { items: i.tags } }); } },
+      'gcloud compute instance-groups list': { desc: 'List instance groups', run: () => G.table([{ NAME: 'web-mig', LOCATION: ZONE, SCOPE: 'zone', NETWORK: 'web-vpc', MANAGED: 'Yes', INSTANCES: '3' }, { NAME: 'batch-mig', LOCATION: REGION, SCOPE: 'region', NETWORK: 'web-vpc', MANAGED: 'Yes', INSTANCES: '300' }]) },
+      'gcloud compute instance-groups get-named-ports': { desc: 'Show an instance group\'s named ports', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, zone: {} }, run: a => { if (a.NAME !== 'web-mig') throw G.notFound('gcloud compute instance-groups get-named-ports', P, `zones/${ZONE}/instanceGroups/${a.NAME}`); return G.table(S().mig.namedPorts.map(n => ({ NAME: n.name, PORT: String(n.port) }))); } },
+      'gcloud compute instance-groups set-named-ports': {
+        desc: 'Set an instance group\'s named ports', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, 'named-ports': { required: true, desc: 'e.g. http:80' }, zone: {} },
+        run: a => { if (a.NAME !== 'web-mig') throw G.notFound('gcloud compute instance-groups set-named-ports', P, `zones/${ZONE}/instanceGroups/${a.NAME}`); S().mig.namedPorts = a['named-ports'].split(',').map(x => { const [n, p] = x.split(':'); return { name: n, port: parseInt(p, 10) }; }); return { text: `Updated [${G.url(P, 'zones/' + ZONE + '/instanceGroups/web-mig')}].` }; }
+      },
+      'gcloud compute addresses list': { desc: 'List reserved IP addresses', run: () => G.table(S().addresses.map(x => ({ NAME: x.name, 'ADDRESS/RANGE': x.address, TYPE: 'EXTERNAL', PURPOSE: '', NETWORK: '', REGION: x.region || '', SUBNET: '', STATUS: (S().forwardingRules.some(f => f.ip === x.address) || S().routers.some(r => r.nats.some(n => (n.ips || []).includes(x.name)))) ? 'IN_USE' : 'RESERVED' }))) },
+      'gcloud compute health-checks create http': hcCreate('HTTP'),
+      'gcloud compute health-checks create https': hcCreate('HTTPS'),
+      'gcloud compute health-checks create tcp': hcCreate('TCP'),
+      'gcloud compute health-checks list': { desc: 'List health checks', run: () => S().healthChecks.length ? G.table(S().healthChecks.map(hcRow)) : { text: 'Listed 0 items.' } },
+      'gcloud compute health-checks describe': { desc: 'Show a health check', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' } }, run: a => { const h = find(S().healthChecks, a.NAME); if (!h) throw G.notFound('gcloud compute health-checks describe', P, 'global/healthChecks/' + a.NAME); const o = { checkIntervalSec: 5, healthyThreshold: 2, kind: 'compute#healthCheck', name: h.name, timeoutSec: 5, type: h.protocol, unhealthyThreshold: 2 }; o[h.protocol.toLowerCase() + 'HealthCheck'] = Object.assign({ port: h.port, portSpecification: 'USE_FIXED_PORT', proxyHeader: 'NONE' }, h.requestPath ? { requestPath: h.requestPath } : {}); return G.yaml(o); } },
+      'gcloud compute health-checks update http': {
+        desc: 'Change an HTTP health check', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, port: { type: 'int' }, 'request-path': {}, global: { type: 'switch' } },
+        run: a => { const h = find(S().healthChecks, a.NAME); if (!h) throw G.notFound('gcloud compute health-checks update http', P, 'global/healthChecks/' + a.NAME); if (h.protocol !== 'HTTP') throw G.invalid('gcloud compute health-checks update http', `Health check ${a.NAME} is of type ${h.protocol}, not HTTP.`); if (a.port) h.port = a.port; if (a['request-path']) h.requestPath = a['request-path']; return { text: `Updated [${G.url(P, 'global/healthChecks/' + h.name)}].` }; }
+      },
+      'gcloud compute health-checks delete': delSpec('health check', 'healthChecks', 'health-checks/healthChecks', (x, cmd) => { const b = S().backendServices.find(b => b.healthChecks.includes(x.name)); if (b) throw inUse(cmd, 'health_check', x.name, 'backendServices', b.name); }),
+      'gcloud compute backend-services create': {
+        desc: 'Create a backend service', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, protocol: { type: 'enum', values: ['HTTP', 'HTTPS', 'HTTP2', 'TCP', 'SSL', 'UDP'], desc: 'Protocol to the backends (default HTTP)' }, 'port-name': { desc: 'Named port on the instance group (default http)' }, 'health-checks': { type: 'list' }, global: { type: 'switch' }, region: {}, 'load-balancing-scheme': { type: 'enum', values: ['EXTERNAL', 'EXTERNAL_MANAGED', 'INTERNAL', 'INTERNAL_MANAGED'] }, 'enable-cdn': { type: 'switch' }, 'cache-mode': { type: 'enum', values: ['CACHE_ALL_STATIC', 'USE_ORIGIN_HEADERS', 'FORCE_CACHE_ALL'] }, timeout: {}, description: {} },
+        run: a => {
+          const cmd = 'gcloud compute backend-services create'; needGlobal(a, cmd);
+          if (find(S().backendServices, a.NAME)) throw G.exists(cmd, P, 'global/backendServices/' + a.NAME);
+          const hcs = a['health-checks'] || [];
+          hcs.forEach(h => { const hc = find(S().healthChecks, h); if (!hc) throw G.notFound(cmd, P, 'global/healthChecks/' + h); if (hc.region) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.healthChecks[0]': regional health check '${h}' can't be used by a global backend service.`); });
+          const scheme = a['load-balancing-scheme'] || 'EXTERNAL';
+          if (scheme.startsWith('INTERNAL')) throw G.invalid(cmd, 'This lab needs an external (internet-facing) load balancer.');
+          const b = { name: a.NAME, protocol: a.protocol || 'HTTP', portName: a['port-name'] || 'http', healthChecks: hcs, scheme, backends: [], enableCdn: !!a['enable-cdn'], cacheMode: a['cache-mode'] || (a['enable-cdn'] ? 'CACHE_ALL_STATIC' : null) };
+          S().backendServices.push(b);
+          return { pre: `Created [${G.url(P, 'global/backendServices/' + b.name)}].`, objects: [bsRow(b)], style: 'gcloud' };
+        }
+      },
+      'gcloud compute backend-services add-backend': {
+        desc: 'Add an instance group to a backend service', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, 'instance-group': { required: true }, 'instance-group-zone': {}, 'instance-group-region': {}, global: { type: 'switch' }, region: {}, 'balancing-mode': { type: 'enum', values: ['UTILIZATION', 'RATE', 'CONNECTION'] }, 'max-utilization': {}, 'max-rate-per-instance': {}, 'capacity-scaler': {} },
+        run: a => {
+          const cmd = 'gcloud compute backend-services add-backend'; needGlobal(a, cmd);
+          const b = find(S().backendServices, a.NAME); if (!b) throw G.notFound(cmd, P, 'global/backendServices/' + a.NAME);
+          if (a['instance-group'] !== 'web-mig' || (a['instance-group-zone'] && a['instance-group-zone'] !== ZONE) || a['instance-group-region']) throw G.notFound(cmd, P, `zones/${a['instance-group-zone'] || ZONE}/instanceGroups/${a['instance-group']}`);
+          if (!a['instance-group-zone']) throw G.invalid(cmd, 'argument --instance-group-zone: Must be specified (web-mig is a zonal instance group).');
+          if (!b.healthChecks.length) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.backends[0].group': '${G.url(P, 'zones/' + ZONE + '/instanceGroups/web-mig')}'. Instance group backends require the backend service to have a health check.`);
+          if (b.backends.some(x => x.group === 'web-mig')) throw G.invalid(cmd, `Backend [web-mig] in zone [${ZONE}] already exists in backend service [${b.name}].`);
+          b.backends.push({ group: 'web-mig', zone: ZONE });
+          return { text: `Updated [${G.url(P, 'global/backendServices/' + b.name)}].` };
+        }
+      },
+      'gcloud compute backend-services update': {
+        desc: 'Change a backend service (health checks, Cloud CDN, cache mode)', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' }, region: {}, 'enable-cdn': { type: 'switch', desc: '--no-enable-cdn to disable' }, 'cache-mode': { type: 'enum', values: ['CACHE_ALL_STATIC', 'USE_ORIGIN_HEADERS', 'FORCE_CACHE_ALL'] }, 'default-ttl': { type: 'int' }, 'health-checks': { type: 'list' }, 'port-name': {}, protocol: { type: 'enum', values: ['HTTP', 'HTTPS', 'HTTP2'] } },
+        run: a => {
+          const cmd = 'gcloud compute backend-services update'; needGlobal(a, cmd);
+          const b = find(S().backendServices, a.NAME); if (!b) throw G.notFound(cmd, P, 'global/backendServices/' + a.NAME);
+          if (a['health-checks']) { a['health-checks'].forEach(h => { if (!find(S().healthChecks, h)) throw G.notFound(cmd, P, 'global/healthChecks/' + h); }); b.healthChecks = a['health-checks']; }
+          if (a['enable-cdn'] !== undefined) { b.enableCdn = a['enable-cdn']; if (b.enableCdn && !b.cacheMode) b.cacheMode = 'CACHE_ALL_STATIC'; S().cdnCache = {}; }
+          if (a['cache-mode']) { b.cacheMode = a['cache-mode']; S().cdnCache = {}; }
+          if (a['port-name']) b.portName = a['port-name'];
+          if (a.protocol) b.protocol = a.protocol;
+          return { text: `Updated [${G.url(P, 'global/backendServices/' + b.name)}].` };
+        }
+      },
+      'gcloud compute backend-services get-health': {
+        desc: 'Show health of each backend VM', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' }, region: {} },
+        run: a => {
+          const cmd = 'gcloud compute backend-services get-health'; needGlobal(a, cmd);
+          const b = find(S().backendServices, a.NAME); if (!b) throw G.notFound(cmd, P, 'global/backendServices/' + a.NAME);
+          if (!b.backends.length) return { text: '(no backends — add web-mig with add-backend)', cls: 'muted' };
+          const ok = bsHealth(S(), b).ok; const hc = find(S().healthChecks, b.healthChecks[0]);
+          return { text: '---\n' + Lab.util.toYaml({ backend: G.url(P, 'zones/' + ZONE + '/instanceGroups/web-mig'), status: { healthStatus: S().instances.map(i => ({ healthState: ok ? 'HEALTHY' : 'UNHEALTHY', instance: G.url(P, 'zones/' + ZONE + '/instances/' + i.name), ipAddress: i.ip, port: hc ? hc.port : 80 })), kind: 'compute#backendServiceGroupHealth' } }) };
+        }
+      },
+      'gcloud compute backend-services list': { desc: 'List backend services', run: () => S().backendServices.length ? G.table(S().backendServices.map(bsRow)) : { text: 'Listed 0 items.' } },
+      'gcloud compute backend-services describe': { desc: 'Show a backend service', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' } }, run: a => { const b = find(S().backendServices, a.NAME); if (!b) throw G.notFound('gcloud compute backend-services describe', P, 'global/backendServices/' + a.NAME); return G.yaml({ name: b.name, protocol: b.protocol, portName: b.portName, loadBalancingScheme: b.scheme, healthChecks: b.healthChecks.map(h => G.url(P, 'global/healthChecks/' + h)), backends: b.backends.map(x => ({ balancingMode: 'UTILIZATION', group: G.url(P, `zones/${x.zone}/instanceGroups/${x.group}`) })), enableCDN: b.enableCdn, cdnPolicy: b.enableCdn ? { cacheMode: b.cacheMode, defaultTtl: 3600 } : undefined }); } },
+      'gcloud compute backend-services delete': delSpec('backend service', 'backendServices', 'backend-services/backendServices', (x, cmd) => { const u = S().urlMaps.find(m => m.defaultService === x.name); if (u) throw inUse(cmd, 'backendServices', x.name, 'urlMaps', u.name); }),
+      'gcloud compute url-maps create': {
+        desc: 'Create a URL map', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, 'default-service': { desc: 'Backend service for requests that match no rule' }, 'default-backend-bucket': {}, global: { type: 'switch' }, description: {} },
+        run: a => {
+          const cmd = 'gcloud compute url-maps create';
+          if (find(S().urlMaps, a.NAME)) throw G.exists(cmd, P, 'global/urlMaps/' + a.NAME);
+          if (a['default-backend-bucket']) throw G.invalid(cmd, 'There are no backend buckets in this project.');
+          if (!a['default-service']) throw G.invalid(cmd, 'Exactly one of (--default-backend-bucket | --default-service) must be specified.');
+          if (!find(S().backendServices, a['default-service'])) throw G.notFound(cmd, P, 'global/backendServices/' + a['default-service']);
+          const u = { name: a.NAME, defaultService: a['default-service'] }; S().urlMaps.push(u);
+          return { pre: `Created [${G.url(P, 'global/urlMaps/' + u.name)}].`, objects: [{ NAME: u.name, DEFAULT_SERVICE: 'backendServices/' + u.defaultService }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute url-maps list': { desc: 'List URL maps', run: () => S().urlMaps.length ? G.table(S().urlMaps.map(u => ({ NAME: u.name, DEFAULT_SERVICE: 'backendServices/' + u.defaultService }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute url-maps delete': delSpec('URL map', 'urlMaps', 'url-maps/urlMaps', (x, cmd) => { const p = S().httpsProxies.concat(S().httpProxies).find(p => p.urlMap === x.name); if (p) throw inUse(cmd, 'urlMaps', x.name, 'targetHttpsProxies', p.name); }),
+      'gcloud compute ssl-certificates create': {
+        desc: 'Create an SSL certificate (Google-managed with --domains)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, domains: { type: 'list', desc: 'Domains for a Google-managed certificate' }, certificate: {}, 'private-key': {}, global: { type: 'switch' }, description: {} },
+        run: a => {
+          const cmd = 'gcloud compute ssl-certificates create';
+          if (find(S().certs, a.NAME)) throw G.exists(cmd, P, 'global/sslCertificates/' + a.NAME);
+          if (a.certificate || a['private-key']) throw G.invalid(cmd, 'This lab uses a Google-managed certificate: pass --domains instead of --certificate/--private-key.');
+          if (!a.domains) throw G.invalid(cmd, 'One of [--certificate, --domains] must be supplied.');
+          const c = { name: a.NAME, domains: a.domains.map(d => d.toLowerCase()), created: '2026-11-20T15:12:44.000-08:00' }; S().certs.push(c);
+          return { pre: `Created [${G.url(P, 'global/sslCertificates/' + c.name)}].`, objects: [certRow(S(), c)], style: 'gcloud' };
+        }
+      },
+      'gcloud compute ssl-certificates list': { desc: 'List SSL certificates', run: () => S().certs.length ? G.table(S().certs.map(c => certRow(S(), c))) : { text: 'Listed 0 items.' } },
+      'gcloud compute ssl-certificates describe': { desc: 'Show certificate status per domain', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' } }, run: a => { const c = find(S().certs, a.NAME); if (!c) throw G.notFound('gcloud compute ssl-certificates describe', P, 'global/sslCertificates/' + a.NAME); const s = certStatus(S(), c); return G.yaml({ name: c.name, type: 'MANAGED', managed: { domainStatus: s.domains, domains: c.domains, status: s.status } }); } },
+      'gcloud compute ssl-certificates delete': delSpec('SSL certificate', 'certs', 'ssl-certificates/sslCertificates', (x, cmd) => { const p = S().httpsProxies.find(p => p.certs.includes(x.name)); if (p) throw inUse(cmd, 'sslCertificates', x.name, 'targetHttpsProxies', p.name); }),
+      'gcloud compute target-https-proxies create': {
+        desc: 'Create a target HTTPS proxy', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, 'url-map': { required: true }, 'ssl-certificates': { type: 'list', required: true }, global: { type: 'switch' } },
+        run: a => {
+          const cmd = 'gcloud compute target-https-proxies create';
+          if (find(S().httpsProxies, a.NAME)) throw G.exists(cmd, P, 'global/targetHttpsProxies/' + a.NAME);
+          if (!find(S().urlMaps, a['url-map'])) throw G.notFound(cmd, P, 'global/urlMaps/' + a['url-map']);
+          a['ssl-certificates'].forEach(c => { if (!find(S().certs, c)) throw G.notFound(cmd, P, 'global/sslCertificates/' + c); });
+          const px = { name: a.NAME, urlMap: a['url-map'], certs: a['ssl-certificates'] }; S().httpsProxies.push(px);
+          return { pre: `Created [${G.url(P, 'global/targetHttpsProxies/' + px.name)}].`, objects: [{ NAME: px.name, SSL_CERTIFICATES: px.certs.join(','), URL_MAP: px.urlMap }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute target-https-proxies list': { desc: 'List target HTTPS proxies', run: () => S().httpsProxies.length ? G.table(S().httpsProxies.map(px => ({ NAME: px.name, SSL_CERTIFICATES: px.certs.join(','), URL_MAP: px.urlMap }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute target-https-proxies delete': delSpec('target HTTPS proxy', 'httpsProxies', 'target-https-proxies/targetHttpsProxies', (x, cmd) => { const f = S().forwardingRules.find(f => f.target === x.name); if (f) throw inUse(cmd, 'targetHttpsProxies', x.name, 'forwardingRules', f.name); }),
+      'gcloud compute target-http-proxies create': {
+        desc: 'Create a target HTTP proxy', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, 'url-map': { required: true }, global: { type: 'switch' } },
+        run: a => {
+          const cmd = 'gcloud compute target-http-proxies create';
+          if (find(S().httpProxies, a.NAME)) throw G.exists(cmd, P, 'global/targetHttpProxies/' + a.NAME);
+          if (!find(S().urlMaps, a['url-map'])) throw G.notFound(cmd, P, 'global/urlMaps/' + a['url-map']);
+          S().httpProxies.push({ name: a.NAME, urlMap: a['url-map'] });
+          return { pre: `Created [${G.url(P, 'global/targetHttpProxies/' + a.NAME)}].`, objects: [{ NAME: a.NAME, URL_MAP: a['url-map'] }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute forwarding-rules create': {
+        desc: 'Create a forwarding rule (the load balancer\'s frontend)', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, global: { type: 'switch' }, region: {}, address: { desc: 'Reserved address name or IP (default: ephemeral)' }, 'target-https-proxy': {}, 'target-http-proxy': {}, ports: { desc: 'e.g. 443' }, 'load-balancing-scheme': { type: 'enum', values: ['EXTERNAL', 'EXTERNAL_MANAGED'] }, 'network-tier': { type: 'enum', values: ['PREMIUM', 'STANDARD'] }, 'ip-protocol': { type: 'enum', values: ['TCP'] } },
+        run: a => {
+          const cmd = 'gcloud compute forwarding-rules create';
+          if (a.region) throw G.invalid(cmd, 'Global external Application Load Balancers use global forwarding rules: pass --global.');
+          if (!a.global) throw G.invalid(cmd, 'One of [--global, --region] must be supplied.');
+          if (find(S().forwardingRules, a.NAME)) throw G.exists(cmd, P, 'global/forwardingRules/' + a.NAME);
+          const tHttps = a['target-https-proxy'], tHttp = a['target-http-proxy'];
+          if (!!tHttps === !!tHttp) throw G.invalid(cmd, 'Exactly one target must be specified (--target-https-proxy or --target-http-proxy).');
+          const target = tHttps || tHttp; const type = tHttps ? 'https' : 'http';
+          const px = find(type === 'https' ? S().httpsProxies : S().httpProxies, target);
+          if (!px) throw G.notFound(cmd, P, `global/${type === 'https' ? 'targetHttpsProxies' : 'targetHttpProxies'}/${target}`);
+          const port = a.ports ? parseInt(String(a.ports).split('-')[0], 10) : (type === 'https' ? 443 : 80);
+          if ((type === 'https' && port !== 443) || (type === 'http' && ![80, 8080].includes(port))) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.portRange': '${a.ports}'. Port ${port} isn't valid for a target ${type.toUpperCase()} proxy here.`);
+          let ip;
+          if (!a.address) ip = '34.149.' + (40 + Math.floor(Math.random() * 150)) + '.' + (2 + Math.floor(Math.random() * 250));
+          else { const ad = S().addresses.find(x => x.name === a.address || x.address === a.address); if (!ad) throw G.notFound(cmd, P, 'global/addresses/' + a.address); if (!ad.global) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.IPAddress': '${a.address}'. A regional address can't be used by a global forwarding rule.`); ip = ad.address; }
+          if (S().forwardingRules.some(f => f.ip === ip && f.ports.includes(port))) throw G.invalid(cmd, `Could not fetch resource:\n - IP ${ip} and port ${port} are already used by another forwarding rule.`);
+          const um = find(S().urlMaps, px.urlMap); const bs = find(S().backendServices, um.defaultService);
+          const scheme = a['load-balancing-scheme'] || 'EXTERNAL';
+          if (bs && bs.scheme !== scheme) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.loadBalancingScheme': '${scheme}'. The forwarding rule's scheme must match backend service '${bs.name}' (${bs.scheme}).`);
+          const f = { name: a.NAME, ip, ports: [port], target, targetType: type, scheme }; S().forwardingRules.push(f);
+          return { pre: `Created [${G.url(P, 'global/forwardingRules/' + f.name)}].`, objects: [frRow(f)], style: 'gcloud' };
+        }
+      },
+      'gcloud compute forwarding-rules list': { desc: 'List forwarding rules', run: () => S().forwardingRules.length ? G.table(S().forwardingRules.map(frRow)) : { text: 'Listed 0 items.' } },
+      'gcloud compute forwarding-rules delete': delSpec('forwarding rule', 'forwardingRules', 'forwarding-rules/forwardingRules'),
+      'gcloud compute routers create': {
+        desc: 'Create a Cloud Router (needed for Cloud NAT)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, network: { required: true }, region: { required: true }, asn: { type: 'int' } },
+        run: a => {
+          const cmd = 'gcloud compute routers create';
+          if (find(S().routers, a.NAME)) throw G.exists(cmd, P, `regions/${a.region}/routers/${a.NAME}`);
+          if (a.network !== 'web-vpc') throw G.notFound(cmd, P, 'global/networks/' + a.network);
+          const r = { name: a.NAME, network: a.network, region: a.region, nats: [] }; S().routers.push(r);
+          return { pre: `Creating router [${r.name}]...done.`, objects: [{ NAME: r.name, REGION: r.region, NETWORK: r.network }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute routers list': { desc: 'List Cloud Routers', run: () => S().routers.length ? G.table(S().routers.map(r => ({ NAME: r.name, REGION: r.region, NETWORK: r.network }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute routers nats create': natSpec('create'),
+      'gcloud compute routers nats update': natSpec('update'),
+      'gcloud compute routers nats describe': {
+        desc: 'Show a Cloud NAT gateway', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, router: { required: true }, region: { required: true } },
+        run: a => { const r = find(S().routers, a.router); const n = r && find(r.nats, a.NAME); if (!n) throw G.notFound('gcloud compute routers nats describe', P, `regions/${a.region}/routers/${a.router}`); return G.yaml({ name: n.name, natIpAllocateOption: n.auto ? 'AUTO_ONLY' : 'MANUAL_ONLY', natIps: n.auto ? undefined : n.ips.map(i => G.url(P, `regions/${REGION}/addresses/${i}`)), minPortsPerVm: n.minPorts, enableDynamicPortAllocation: !!n.dynamic, sourceSubnetworkIpRangesToNat: n.allSubnets ? 'ALL_SUBNETWORKS_ALL_IP_RANGES' : 'LIST_OF_SUBNETWORKS', subnetworks: n.allSubnets ? undefined : n.subnets.map(s => ({ name: G.url(P, `regions/${REGION}/subnetworks/${s}`), sourceIpRangesToNat: ['ALL_IP_RANGES'] })) }); }
+      },
+      curl: { desc: 'Make an HTTP(S) request from Cloud Shell (the internet)', raw: true, usage: 'curl [-I | -i | -s | -L] <url>', run: a => curl(S(), lab, a) }
+    }, G.firewallCommands({ project: () => P, state: S }));
+
+    function natSpec(mode) {
+      return {
+        desc: mode === 'create' ? 'Create a Cloud NAT gateway on a Cloud Router' : 'Change a Cloud NAT gateway', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, router: { required: true }, region: { required: true }, 'nat-all-subnet-ip-ranges': { type: 'switch' }, 'nat-custom-subnet-ip-ranges': { type: 'list', desc: 'e.g. batch-subnet' }, 'auto-allocate-nat-external-ips': { type: 'switch' }, 'nat-external-ip-pool': { type: 'list', desc: 'Reserved regional address names' }, 'min-ports-per-vm': { type: 'int', desc: 'Default 64' }, 'enable-dynamic-port-allocation': { type: 'switch' }, 'max-ports-per-vm': { type: 'int' }, 'enable-logging': { type: 'switch' } },
+        run: a => {
+          const cmd = `gcloud compute routers nats ${mode}`;
+          const r = find(S().routers, a.router); if (!r || r.region !== a.region) throw G.notFound(cmd, P, `regions/${a.region}/routers/${a.router}`);
+          let n = find(r.nats, a.NAME);
+          if (mode === 'create') {
+            if (n) throw G.invalid(cmd, `NAT gateway [${a.NAME}] already exists in router [${r.name}].`);
+            if (!a['nat-all-subnet-ip-ranges'] && !a['nat-custom-subnet-ip-ranges']) throw G.invalid(cmd, 'Exactly one of (--nat-all-subnet-ip-ranges | --nat-custom-subnet-ip-ranges | --nat-primary-subnet-ip-ranges) must be specified.');
+            if (!a['auto-allocate-nat-external-ips'] && !a['nat-external-ip-pool']) throw G.invalid(cmd, 'Exactly one of (--auto-allocate-nat-external-ips | --nat-external-ip-pool) must be specified.');
+            n = { name: a.NAME, allSubnets: false, subnets: [], auto: false, ips: [], minPorts: 64, dynamic: false };
+          } else if (!n) throw G.notFound(cmd, P, `regions/${a.region}/routers/${a.router}`);
+          if (a['nat-all-subnet-ip-ranges']) { n.allSubnets = true; n.subnets = []; }
+          if (a['nat-custom-subnet-ip-ranges']) { a['nat-custom-subnet-ip-ranges'].forEach(s => { if (!S().subnets.some(x => x.name === s.split(':')[0])) throw G.notFound(cmd, P, `regions/${REGION}/subnetworks/${s}`); }); n.allSubnets = false; n.subnets = a['nat-custom-subnet-ip-ranges'].map(s => s.split(':')[0]); }
+          if (a['auto-allocate-nat-external-ips']) { n.auto = true; n.ips = []; }
+          if (a['nat-external-ip-pool']) {
+            a['nat-external-ip-pool'].forEach(i => { const ad = S().addresses.find(x => x.name === i); if (!ad) throw G.notFound(cmd, P, `regions/${REGION}/addresses/${i}`); if (ad.global) throw G.invalid(cmd, `Address '${i}' is global; Cloud NAT needs regional addresses in ${REGION}.`); });
+            n.auto = false; n.ips = [...new Set(a['nat-external-ip-pool'])];
+          }
+          if (a['min-ports-per-vm'] !== undefined) { if (a['min-ports-per-vm'] < 2 || a['min-ports-per-vm'] > 65536) throw G.invalid(cmd, `Invalid value for field 'resource.nats[0].minPortsPerVm': '${a['min-ports-per-vm']}'. Must be between 2 and 65536.`); n.minPorts = a['min-ports-per-vm']; }
+          if (a['enable-dynamic-port-allocation'] !== undefined) n.dynamic = a['enable-dynamic-port-allocation'];
+          if (mode === 'create') r.nats.push(n);
+          return { text: `${mode === 'create' ? 'Creating' : 'Updating'} NAT [${n.name}] in router [${r.name}]...done.` };
+        }
+      };
+    }
+  };
+
+  // ---------- diagram
+  function render(st) {
+    const bs = migBackendService(st); const um = bs && st.urlMaps.find(u => u.defaultService === bs.name);
+    const px = um && st.httpsProxies.find(p => p.urlMap === um.name);
+    const fr = px && st.forwardingRules.find(f => f.target === px.name && f.targetType === 'https');
+    const cert = px && st.certs.find(c => px.certs.includes(c.name));
+    const health = bsHealth(st, bs);
+    const nodes = [
+      { label: 'Forwarding rule', sub: fr ? `${fr.name} · ${fr.ip}:443` : 'not created', ok: !!fr && fr.ip === LB_IP, warn: !!fr && fr.ip !== LB_IP },
+      { label: 'HTTPS proxy', sub: px ? `${px.name} · cert ${cert ? certStatus(st, cert).status : '—'}` : 'not created', ok: !!px && !!cert && certStatus(st, cert).status === 'ACTIVE', warn: !!px },
+      { label: 'URL map', sub: um ? um.name : 'not created', ok: !!um },
+      { label: 'Backend service', sub: bs ? `${bs.name}${bs.enableCdn ? ' · CDN ' + bs.cacheMode : ''}` : 'not created', ok: !!bs && bs.enableCdn && bs.cacheMode === 'CACHE_ALL_STATIC', warn: !!bs },
+      { label: 'web-mig (3 VMs)', sub: bs && bs.backends.length ? (health.ok ? 'HEALTHY' : 'UNHEALTHY') : 'not attached', ok: !!bs && health.ok, bad: !!bs && bs.backends.length > 0 && !health.ok }
+    ];
+    const W = 760, bw = 136, gap = (W - nodes.length * bw) / (nodes.length - 1);
+    const color = n => n.ok ? ['#d1fae5', '#047857'] : n.bad ? ['#fee2e2', '#b91c1c'] : n.warn ? ['#fef3c7', '#b45309'] : ['#f1f5f9', '#94a3b8'];
+    let svg = `<svg viewBox="0 0 ${W} 96" role="img" aria-label="Load balancer chain status">`;
+    nodes.forEach((n, i) => {
+      const x = i * (bw + gap); const [fill, stroke] = color(n);
+      if (i > 0) svg += `<line x1="${x - gap + 2}" y1="40" x2="${x - 4}" y2="40" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>`;
+      svg += `<rect x="${x}" y="12" width="${bw}" height="56" rx="6" fill="${fill}" stroke="${stroke}"/>`;
+      svg += `<text x="${x + bw / 2}" y="35" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">${n.label}</text>`;
+      svg += `<text x="${x + bw / 2}" y="53" text-anchor="middle" font-size="9.5" fill="#475569">${Lab.util.esc(n.sub.length > 26 ? n.sub.slice(0, 25) + '…' : n.sub)}</text>`;
+    });
+    svg += `<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#94a3b8"/></marker></defs>`;
+    svg += `<text x="0" y="90" font-size="11" fill="#64748b">Internet → https://${DOMAIN} (${LB_IP})</text></svg>`;
+    document.getElementById('chain').innerHTML = svg;
+  }
+
+  Lab({
+    id: 'gcp-lb-cdn-lab', dialect: 'bash', variants: 3, termTitle: 'Cloud Shell — contoso-web',
+    prompt: `ruben@cloudshell:~ (${P})$ `,
+    banner: `Welcome to Cloud Shell! Type "help" to get started.\nYour Cloud Platform project in this session is set to ${P}.\ncompute/region = ${REGION}, compute/zone = ${ZONE}\n`,
+    createState, commands, render,
+    objectives: [
+      { text: 'Create a health check that matches how the app reports health (see the app notes).',
+        check: st => st.healthChecks.some(h => h.protocol === 'HTTP' && h.port === 80 && h.requestPath === '/healthz' && !h.region) || (st.healthChecks.length ? 'Your health check doesn\'t probe what the app actually exposes for health.' : 'No health check yet.'),
+        hints: ['Read the app notes: which port, and which path returns 200?', 'An HTTP health check passes only on a 200 response. <code>/</code> returns a 302 here.', '<code>gcloud compute health-checks create http hc-web --port=80 --request-path=/healthz</code>'] },
+      { text: 'Get all three VMs in <code>web-mig</code> reporting HEALTHY behind a global backend service.',
+        check: st => {
+          const bs = migBackendService(st);
+          if (!bs) return 'No backend service has web-mig as a backend yet.';
+          const h = bsHealth(st, bs);
+          return h.ok || 'Backends report UNHEALTHY. Check what the health-check probes need in order to reach the VMs.';
+        },
+        hints: ['Create the backend service with your health check, then add the instance group as a backend. Check results with <code>backend-services get-health</code>.', 'Health checks come from Google\'s probe ranges <code>35.191.0.0/16</code> and <code>130.211.0.0/22</code>. The VPC firewall must let them reach the VMs (tag <code>web</code>) on the health-check port. Inspect existing rules with <code>describe</code>.', '<code>gcloud compute backend-services create web-backend --protocol=HTTP --port-name=http --health-checks=hc-web --global</code>, <code>gcloud compute backend-services add-backend web-backend --instance-group=web-mig --instance-group-zone=us-central1-a --global</code>, and a firewall rule like <code>gcloud compute firewall-rules create allow-gfe-health-checks --network=web-vpc --action=ALLOW --rules=tcp:80 --source-ranges=35.191.0.0/16,130.211.0.0/22 --target-tags=web</code> (or fix the existing one).'] },
+      { text: 'Serve <code>https://shop.contoso.com</code> through the load balancer on the reserved IP <code>web-ip</code>, with a Google-managed certificate.',
+        check: st => {
+          if (httpsWorks(st)) return true;
+          const r = serveRequest(st, 'https', DOMAIN, '/store');
+          if (r.err === 'connect') return 'Nothing is listening on 34.120.10.20:443 yet.';
+          if (r.err === 'tls') return 'The frontend exists, but the managed certificate isn\'t ACTIVE.';
+          return 'The load balancer answers with 502: its backends can\'t serve traffic.';
+        },
+        hints: ['Frontend order: URL map → certificate → target HTTPS proxy → global forwarding rule.', 'A managed certificate only becomes ACTIVE when its domain\'s DNS points at the forwarding rule\'s IP, so use <code>--address=web-ip</code> rather than an ephemeral IP.', '<code>url-maps create web-map --default-service=web-backend</code> → <code>ssl-certificates create web-cert --domains=shop.contoso.com --global</code> → <code>target-https-proxies create web-https-proxy --url-map=web-map --ssl-certificates=web-cert</code> → <code>forwarding-rules create web-https-fr --global --address=web-ip --target-https-proxy=web-https-proxy --ports=443</code> (all prefixed with <code>gcloud compute</code>).'] },
+      { text: 'Turn on Cloud CDN with the cache mode that suits this app.',
+        check: st => {
+          const bs = migBackendService(st); if (!bs) return 'Create the backend service first.';
+          if (!bs.enableCdn) return 'Cloud CDN is off on the backend service.';
+          if (bs.cacheMode === 'FORCE_CACHE_ALL') return 'FORCE_CACHE_ALL would also cache personalized pages like /cart and serve one user\'s cart to another.';
+          if (bs.cacheMode === 'USE_ORIGIN_HEADERS') return 'The app sends no Cache-Control headers, so USE_ORIGIN_HEADERS would cache nothing.';
+          return bs.cacheMode === 'CACHE_ALL_STATIC' || 'Unexpected cache mode.';
+        },
+        hints: ['CDN is a property of the backend service.', 'Three modes: USE_ORIGIN_HEADERS (only what the origin marks cacheable), CACHE_ALL_STATIC (static content types), FORCE_CACHE_ALL (everything). Re-read the app notes.', '<code>gcloud compute backend-services update web-backend --enable-cdn --cache-mode=CACHE_ALL_STATIC --global</code>, then <code>curl -I</code> a <code>/static/</code> file twice and look for an <code>age</code> header.'] },
+      { text: 'Give batch-mig\'s 300 VMs Cloud NAT egress through the allowlisted IPs, sized so no VM runs out of ports.', optional: true,
+        check: st => {
+          const c = natCapacity(st);
+          if (!c) return 'No Cloud NAT gateway on a router in us-central1 / web-vpc yet.';
+          if (!c.covers) return 'The NAT doesn\'t cover batch-subnet.';
+          if (c.n.auto) return 'Auto-allocated IPs aren\'t on the partner\'s allowlist. Use the nat-ip-* pool.';
+          if (c.minPorts < 2000) return `Each VM needs up to 2,000 concurrent connections to one destination, but min ports per VM is ${c.minPorts}.`;
+          if (c.vms < 300) return `${c.ips} IPs × floor(64,512 ÷ ${c.minPorts}) = ${c.vms} VMs of capacity. You need 300.`;
+          return true;
+        },
+        hints: ['Cloud NAT lives on a Cloud Router in the same region and network.', 'Each NAT IP has 64,512 usable ports. With static allocation, an IP serves floor(64,512 ÷ min-ports-per-vm) VMs. Connections to the same destination IP:port each need a port.', '<code>gcloud compute routers create nat-router --network=web-vpc --region=us-central1</code>, then <code>gcloud compute routers nats create batch-nat --router=nat-router --region=us-central1 --nat-custom-subnet-ip-ranges=batch-subnet --nat-external-ip-pool=nat-ip-1,…,nat-ip-10 --min-ports-per-vm=2048</code> (2048 → 31 VMs per IP → 10 IPs).'] }
+    ],
+    solution(st) {
+      const s = [
+        { cmd: 'gcloud compute health-checks create http hc-web --port=80 --request-path=/healthz', note: 'Health check first. It must hit /healthz on port 80: "/" returns a 302, which counts as unhealthy.' },
+        { cmd: 'gcloud compute backend-services create web-backend --protocol=HTTP --port-name=http --health-checks=hc-web --global', note: 'A global backend service that sends traffic to the named port "http" (80).' },
+        { cmd: 'gcloud compute backend-services add-backend web-backend --instance-group=web-mig --instance-group-zone=us-central1-a --global', note: 'Attach the managed instance group.' },
+        { cmd: 'gcloud compute backend-services get-health web-backend --global', note: 'Backends are UNHEALTHY, so something blocks the probes.' }
+      ];
+      if (st.v === 0) s.push({ cmd: 'gcloud compute firewall-rules create allow-gfe-health-checks --network=web-vpc --direction=INGRESS --action=ALLOW --rules=tcp:80 --source-ranges=35.191.0.0/16,130.211.0.0/22 --target-tags=web', note: 'There\'s no rule for Google\'s probe ranges. Allow both ranges to the web VMs on port 80.' });
+      if (st.v === 1) { s.push({ cmd: 'gcloud compute firewall-rules describe allow-health-checks', note: 'A health-check rule exists. describe shows it targets tag "webserver", but the VMs are tagged "web".' }); s.push({ cmd: 'gcloud compute firewall-rules update allow-health-checks --target-tags=web', note: 'Point it at the right tag.' }); }
+      if (st.v === 2) { s.push({ cmd: 'gcloud compute firewall-rules describe allow-health-checks', note: 'A health-check rule exists, but it opens tcp:8080 while the probes use port 80.' }); s.push({ cmd: 'gcloud compute firewall-rules update allow-health-checks --rules=tcp:80', note: 'Fix the port.' }); }
+      s.push(
+        { cmd: 'gcloud compute backend-services get-health web-backend --global', note: 'All three VMs are HEALTHY now.' },
+        { cmd: 'gcloud compute url-maps create web-map --default-service=web-backend', note: 'Frontend: URL map…' },
+        { cmd: 'gcloud compute ssl-certificates create web-cert --domains=shop.contoso.com --global', note: '…a Google-managed certificate…' },
+        { cmd: 'gcloud compute target-https-proxies create web-https-proxy --url-map=web-map --ssl-certificates=web-cert', note: '…the HTTPS proxy that terminates TLS…' },
+        { cmd: 'gcloud compute forwarding-rules create web-https-fr --global --address=web-ip --target-https-proxy=web-https-proxy --ports=443', note: '…and the forwarding rule on the reserved IP DNS already points to. That\'s what lets the managed cert go ACTIVE.' },
+        { cmd: 'curl -I https://shop.contoso.com/store', note: 'The site is live over HTTPS.' },
+        { cmd: 'gcloud compute backend-services update web-backend --enable-cdn --cache-mode=CACHE_ALL_STATIC --global', note: 'CDN: CACHE_ALL_STATIC caches /static/ assets but never the personalized /cart page.' },
+        { cmd: 'curl -I https://shop.contoso.com/static/app.css' },
+        { cmd: 'curl -I https://shop.contoso.com/static/app.css', note: 'The second request is served from cache (age header).' },
+        { cmd: 'gcloud compute routers create nat-router --network=web-vpc --region=us-central1', note: 'Bonus, Cloud NAT: 2,000 connections per VM → 2048 min ports → floor(64,512 ÷ 2048) = 31 VMs per IP → 10 IPs for 300 VMs.' },
+        { cmd: 'gcloud compute routers nats create batch-nat --router=nat-router --region=us-central1 --nat-custom-subnet-ip-ranges=batch-subnet --nat-external-ip-pool=nat-ip-1,nat-ip-2,nat-ip-3,nat-ip-4,nat-ip-5,nat-ip-6,nat-ip-7,nat-ip-8,nat-ip-9,nat-ip-10 --min-ports-per-vm=2048' }
+      );
+      return s;
+    },
+    debrief: [
+      { title: 'Health checks decide everything', text: 'An HTTP check needs a 200. A redirecting "/" quietly marks every backend unhealthy, and the load balancer answers 502. Point checks at a purpose-built endpoint like <code>/healthz</code>.' },
+      { title: 'Probes come from Google, not the internet', text: 'Health checks and proxied traffic originate from <code>35.191.0.0/16</code> and <code>130.211.0.0/22</code>. The firewall must allow both, on the right port, to the right tag. Each environment broke a different one of those three.' },
+      { title: 'A load balancer is a chain', text: 'Forwarding rule → target proxy (TLS) → URL map → backend service → instance group. Each part references the next, so you build them backend-first and debug them frontend-first.' },
+      { title: 'Managed certs need DNS to match', text: 'Google only issues the certificate once the domain resolves to the forwarding rule\'s IP. Using the reserved <code>web-ip</code> that DNS already points to is what makes it go ACTIVE without a DNS change.' },
+      { title: 'Cache mode is a privacy decision', text: 'With no Cache-Control headers, USE_ORIGIN_HEADERS caches nothing and FORCE_CACHE_ALL would serve one shopper\'s /cart to another. CACHE_ALL_STATIC is the safe performance win here.' },
+      { title: 'NAT is a port budget', text: '64,512 ports per IP ÷ ports per VM = VMs per IP. Sizing it up front avoids the intermittent "connection timed out" incidents that port exhaustion causes (see Lab 06\'s original case).' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

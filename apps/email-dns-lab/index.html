@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Set up DNS for email (MX, SPF, DKIM, DMARC) — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 11</div>
+    <h1>Lab: Set up DNS for email (MX, SPF, DKIM, DMARC)</h1>
+    <p>Contoso Travel is moving its mail to Microsoft 365 and sends marketing through an email service. Configure the DNS records so mail arrives, authenticates and aligns, then roll DMARC from monitoring to enforcement.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">DNS dashboard · M365 · mail tester</span><span class="pill">3 randomized starting zones</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the mail DNS work behind every Microsoft 365 migration I support: cutting MX over cleanly, keeping one valid SPF record, enabling DKIM, getting third-party senders DMARC-aligned and enforcing DMARC without blocking legitimate mail.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main lab-gui">
+        <div class="mock-console">
+          <div class="mock-head"><span><strong>DNS dashboard</strong> <span class="muted">· simulation modeled on Cloudflare</span></span><span class="muted">contoso-travel.com</span></div>
+          <div style="padding:14px 16px">
+            <table class="data" id="rec-table" style="font-size:12px"><thead><tr><th>Type</th><th>Name</th><th>Content</th><th>Prio</th><th>Proxy</th><th></th></tr></thead><tbody></tbody></table>
+            <div class="mock-section mt-16">
+              <h4><span id="rec-form-title">Add record</span></h4>
+              <div class="row" style="align-items:flex-end;gap:8px">
+                <div style="width:96px"><label for="rec-type">Type</label><select id="rec-type"><option>A</option><option>AAAA</option><option selected>CNAME</option><option>MX</option><option>TXT</option><option>CAA</option></select></div>
+                <div style="flex:1;min-width:150px"><label for="rec-name">Name</label><input type="text" id="rec-name" placeholder="@ or subdomain" spellcheck="false" /></div>
+                <div style="width:80px" id="rec-prio-wrap"><label for="rec-priority">Priority</label><input type="number" id="rec-priority" value="10" /></div>
+              </div>
+              <div class="field" style="margin-top:8px"><label for="rec-content">Content / target</label><input type="text" id="rec-content" spellcheck="false" /></div>
+              <div class="row" id="rec-proxy-wrap"><label class="row" style="gap:6px;color:var(--text);font-size:13px;margin:0"><input type="checkbox" id="rec-proxied" checked /> Proxied (orange cloud)</label><span class="muted" style="font-size:12px">Proxied records hide the real target behind Cloudflare.</span></div>
+              <div class="row mt-16"><button type="button" class="sm" id="rec-save">Save</button><button type="button" class="ghost sm" id="rec-cancel" hidden>Cancel edit</button><span id="rec-msg" class="inline-msg" style="margin:0"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="panel">
+            <h3>Microsoft 365 · Domains</h3>
+            <p style="font-size:13px;margin-top:0">contoso-travel.com · <span class="badge ok">Verified</span></p>
+            <table class="brief" id="m365-req"></table>
+            <div class="row mt-16"><button type="button" class="ghost sm" id="m365-check">Check DNS</button><button type="button" class="sm" id="m365-dkim">Enable DKIM signing</button></div>
+            <div id="m365-out" class="inline-msg"></div>
+          </div>
+          <div class="panel">
+            <h3>SendFlow · Sender authentication</h3>
+            <p style="font-size:13px;margin-top:0">Marketing's email platform (fictional). Its setup page asks for:</p>
+            <table class="brief">
+              <tr><th>Purpose</th><th>Record</th></tr>
+              <tr><td>SPF</td><td>add <code>include:spf.sendflow.example</code> to your existing SPF record</td></tr>
+              <tr><td>DKIM (branded)</td><td>CNAME <code>sf1._domainkey</code> → <code>sf1.dkim.sendflow.example</code></td></tr>
+            </table>
+            <div class="row mt-16"><button type="button" class="sm" id="sf-verify">Verify domain</button></div>
+            <div id="sf-out" class="inline-msg"></div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="panel">
+            <h3>Mail tester</h3>
+            <div class="row" style="gap:6px">
+              <button type="button" class="ghost sm" id="t-inbound">Send to info@ from outside</button>
+              <button type="button" class="ghost sm" id="t-m365">Send from M365 to Gmail</button>
+              <button type="button" class="ghost sm" id="t-campaign">Send SendFlow campaign</button>
+            </div>
+            <pre class="log mt-16" id="t-out">Run a test to see delivery and the Authentication-Results header.</pre>
+          </div>
+          <div class="panel">
+            <h3>DNS lookup</h3>
+            <div class="row" style="gap:6px;align-items:flex-end">
+              <div style="width:90px"><label for="lk-type">Type</label><select id="lk-type"><option>A</option><option>CNAME</option><option>MX</option><option selected>TXT</option></select></div>
+              <div style="flex:1"><label for="lk-name">Name</label><input type="text" id="lk-name" value="contoso-travel.com" spellcheck="false" /></div>
+              <button type="button" class="ghost sm" id="lk-go">Look up</button>
+            </div>
+            <pre class="log mt-16" id="lk-out">Public DNS answers appear here.</pre>
+          </div>
+        </div>
+      </div>
+
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Project brief</h3>
+          <p style="font-size:14px">Mailboxes are already migrated to Microsoft 365 (tenant <code>contosotravel.onmicrosoft.com</code>). The old host, OldMail, will be shut down tonight. Marketing sends from <code>news@contoso-travel.com</code> through SendFlow. Leadership wants DMARC enforced, but not at the cost of blocking legitimate mail.</p>
+          <p class="muted" style="font-size:12px;margin:0" id="variant-note"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>SPF lookup costs</h3>
+          <table class="brief"><tr><th>Mechanism</th><th>Lookups</th></tr><tr><td>include:spf.protection.outlook.com</td><td>2</td></tr><tr><td>include:spf.sendflow.example</td><td>1</td></tr><tr><td>include:_spf.oldmail.example</td><td>2</td></tr></table>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 11 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const $ = s => document.querySelector(s);
+  const esc = Lab.util.esc;
+  const D = 'contoso-travel.com';
+  const MX = 'contosotravel-com.mail.protection.outlook.com';
+  const DKIM = { selector1: 'selector1-contosotravel-com._domainkey.contosotravel.onmicrosoft.com', selector2: 'selector2-contosotravel-com._domainkey.contosotravel.onmicrosoft.com' };
+  const SF = { name: 'sf1._domainkey', target: 'sf1.dkim.sendflow.example' };
+  const SPF_COST = { 'spf.protection.outlook.com': 2, 'spf.sendflow.example': 1, '_spf.oldmail.example': 2 };
+
+  function createState(v) {
+    const r = (id, type, name, content, extra) => Object.assign({ id, type, name, content, priority: null, proxied: false }, extra || {});
+    const records = [
+      r('r1', 'A', '@', '203.0.113.80', { proxied: true }),
+      r('r2', 'CNAME', 'www', D, { proxied: true }),
+      r('r3', 'MX', '@', 'mx1.oldmail.example', { priority: 10 }),
+      r('r4', 'MX', '@', 'mx2.oldmail.example', { priority: 20 }),
+      r('r5', 'TXT', '@', 'v=spf1 include:_spf.oldmail.example ~all'),
+      r('r6', 'TXT', '@', 'MS=ms48213397')
+    ];
+    if (v === 1) records.push(r('r7', 'CNAME', 'autodiscover', 'autodiscover.outlook.com', { proxied: true }));
+    if (v === 2) records.push(r('r7', 'TXT', '@', 'v=spf1 include:spf.sendflow.example ~all'));
+    return { v, records, nextId: 10, dkim: false, sfVerified: false, dmarcHistory: [], editing: null, flags: { monitored: {} } };
+  }
+
+  // ---------- DNS model
+  const fqdn = n => (n === '@' ? D : n + '.' + D);
+  const normName = n => { n = String(n || '').trim().toLowerCase().replace(/\.$/, ''); if (!n || n === D) return '@'; if (n.endsWith('.' + D)) n = n.slice(0, -(D.length + 1)); return n; };
+  const normHost = h => String(h || '').trim().toLowerCase().replace(/\.$/, '');
+  const recs = (st, name, type) => st.records.filter(r => r.name === name && (!type || r.type === type));
+  const txt = (st, name) => recs(st, name, 'TXT').map(r => r.content);
+  const spfRecords = st => txt(st, '@').filter(t => /^v=spf1(\s|$)/i.test(t));
+  const cnameOk = (st, name, target) => { const r = recs(st, name, 'CNAME'); return r.length === 1 && normHost(r[0].content) === target && !r[0].proxied; };
+  const fakeIp = n => `104.21.${(n.length * 7) % 200}.${(n.length * 13) % 250}`;
+  function lookup(st, type, name) {
+    const n = normName(name); const out = [];
+    const c = recs(st, n, 'CNAME')[0];
+    if (c && c.proxied) {
+      if (type === 'A' || type === 'CNAME') return [`${fqdn(n)}.  300  IN  A  ${fakeIp(n)}`, `${fqdn(n)}.  300  IN  A  172.67.${(n.length * 5) % 200}.${(n.length * 3) % 250}`, '; proxied: Cloudflare answers with its own IPs and hides the CNAME target'];
+      return [`; no ${type} records (name is proxied by Cloudflare)`];
+    }
+    if (c && type !== 'CNAME') { out.push(`${fqdn(n)}.  300  IN  CNAME  ${normHost(c.content)}.`); if (type === 'TXT' && /_domainkey/.test(n)) out.push(`${normHost(c.content)}.  3600  IN  TXT  "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA…"`); return out; }
+    recs(st, n, type).forEach(r => {
+      if (r.proxied && (type === 'A' || type === 'AAAA')) out.push(`${fqdn(n)}.  300  IN  A  ${fakeIp(n)}   ; proxied`);
+      else out.push(`${fqdn(n)}.  300  IN  ${type}  ${type === 'MX' ? r.priority + ' ' + normHost(r.content) + '.' : type === 'TXT' ? '"' + r.content + '"' : normHost(r.content) + (type === 'CNAME' ? '.' : '')}`);
+    });
+    return out.length ? out : [`; no ${type} records for ${fqdn(n)} (NOERROR, empty answer)`];
+  }
+  function spfEval(st) {
+    const spfs = spfRecords(st);
+    if (!spfs.length) return { result: 'none', why: 'no SPF record' };
+    if (spfs.length > 1) return { result: 'permerror', why: 'more than one SPF record' };
+    const mech = spfs[0].split(/\s+/).slice(1);
+    let cost = 0; const incs = [];
+    mech.forEach(m => { const x = m.replace(/^[+~?-]/, ''); if (x.startsWith('include:')) { const d = x.slice(8).toLowerCase(); incs.push(d); cost += SPF_COST[d] || 1; } else if (/^(a|mx|ptr|exists)(:|\/|$)/i.test(x) || x.startsWith('redirect=')) cost++; });
+    if (cost > 10) return { result: 'permerror', why: 'too many DNS lookups', incs, cost };
+    return { result: 'ok', incs, cost, all: (mech[mech.length - 1] || '').toLowerCase() };
+  }
+  function dmarcRec(st) { const t = txt(st, '_dmarc').filter(x => /^v=DMARC1/i.test(x)); if (t.length !== 1) return t.length ? { err: 'multiple' } : null; const tags = {}; t[0].split(';').forEach(p => { const m = p.trim().match(/^(\w+)\s*=\s*(.+)$/); if (m) tags[m[1].toLowerCase()] = m[2].trim(); }); return tags; }
+  const m365DkimDnsOk = st => cnameOk(st, 'selector1._domainkey', DKIM.selector1) && cnameOk(st, 'selector2._domainkey', DKIM.selector2);
+  const sfDnsOk = st => cnameOk(st, SF.name, SF.target);
+  function sendTest(st, sender) {
+    const L = [];
+    const spf = spfEval(st); const dm = dmarcRec(st);
+    let spfRes, spfAligned, dkimRes, dkimD;
+    if (sender === 'm365') {
+      L.push(`From: anna@${D}  →  someone@gmail.com`, `Return-Path: <anna@${D}>   (envelope domain ${D})`);
+      spfRes = spf.result === 'ok' ? (spf.incs.includes('spf.protection.outlook.com') ? 'pass' : (spf.all.startsWith('-') ? 'fail' : 'softfail')) : spf.result;
+      spfAligned = true;
+      dkimRes = 'pass'; dkimD = st.dkim && m365DkimDnsOk(st) ? D : 'contosotravel.onmicrosoft.com';
+    } else {
+      L.push(`From: news@${D}  →  subscriber@gmail.com  (sent by SendFlow)`, 'Return-Path: <bounce-71x2@bounce.sendflow.example>   (envelope domain sendflow.example)');
+      spfRes = 'pass'; spfAligned = false;
+      dkimRes = 'pass'; dkimD = st.sfVerified && sfDnsOk(st) ? D : 'sendflow.example';
+    }
+    const dkimAligned = dkimD === D;
+    let dmarcRes = 'none', action = 'none';
+    if (dm && !dm.err) {
+      const pass = (spfRes === 'pass' && spfAligned) || (dkimRes === 'pass' && dkimAligned);
+      dmarcRes = pass ? 'pass' : 'fail';
+      action = pass ? 'none' : ({ none: 'none', quarantine: 'quarantine', reject: 'reject' }[(dm.p || 'none').toLowerCase()] || 'none');
+    } else if (dm && dm.err) dmarcRes = 'permerror';
+    L.push('', 'Authentication-Results: mx.google.com;', `       spf=${spfRes} (${spfRes === 'permerror' ? spf.why : sender === 'm365' ? `domain of ${D}` : 'domain of bounce.sendflow.example'}) smtp.mailfrom=${sender === 'm365' ? D : 'bounce.sendflow.example'}${spfAligned ? '' : '  [not aligned with From domain]'};`, `       dkim=${dkimRes} header.d=${dkimD}${dkimAligned ? '' : '  [not aligned with From domain]'};`, `       dmarc=${dmarcRes} (p=${dm && !dm.err ? (dm.p || 'none').toUpperCase() : 'NONE'}) header.from=${D}`);
+    L.push('', dmarcRes === 'fail' && action !== 'none' ? `Result: delivered to ${action === 'reject' ? 'nowhere (rejected)' : 'Spam'}, because DMARC failed and the policy is ${action}.` : dmarcRes === 'pass' ? 'Result: delivered to Inbox. DMARC aligned.' : dmarcRes === 'fail' ? 'Result: delivered (policy p=none only reports). This sender would fail under enforcement.' : 'Result: delivered, but there\'s no DMARC policy to protect the domain from spoofing.');
+    if (dmarcRes === 'pass' && dm && (dm.p || '').toLowerCase() === 'none') st.flags.monitored[sender] = true;
+    return L.join('\n');
+  }
+  function inbound(st) {
+    const mx = recs(st, '@', 'MX').slice().sort((a, b) => a.priority - b.priority);
+    if (!mx.length) return 'Sending to info@contoso-travel.com…\n✖ 550 5.1.2 Host unknown: no MX records for contoso-travel.com';
+    const top = mx.filter(r => r.priority === mx[0].priority);
+    const host = normHost(top[0].content);
+    const lines = ['Sending to info@contoso-travel.com…', `MX lookup: ${mx.map(r => r.priority + ' ' + normHost(r.content)).join(', ')}`];
+    if (top.length > 1) lines.push('⚠ Several MX records share the lowest priority: delivery would alternate between them.');
+    if (host === MX) lines.push(`Connected to ${MX}`, '250 2.6.0 Queued mail for delivery → Exchange Online mailbox info@contoso-travel.com ✓');
+    else lines.push(`Connected to ${host}`, '250 OK → delivered to OldMail, NOT Microsoft 365. (OldMail shuts down tonight.)');
+    if (mx.length > 1 && host === MX) lines.push(`⚠ Backup MX records still point elsewhere: if Exchange Online is briefly unreachable, mail queues at ${normHost(mx[1].content)}.`);
+    return lines.join('\n');
+  }
+  function updateHistory(st) { const d = dmarcRec(st); const p = d && !d.err ? (d.p || 'none').toLowerCase() : null; if (p && st.dmarcHistory[st.dmarcHistory.length - 1] !== p) st.dmarcHistory.push(p); }
+
+  // ---------- UI
+  let lab; const S = () => lab.state;
+  const msg = (id, t, cls) => { $(id).textContent = t || ''; $(id).className = 'inline-msg' + (cls ? ' ' + cls : ''); };
+  function formSync() { const t = $('#rec-type').value; $('#rec-prio-wrap').style.visibility = t === 'MX' ? 'visible' : 'hidden'; $('#rec-proxy-wrap').style.visibility = ['A', 'AAAA', 'CNAME'].includes(t) ? 'visible' : 'hidden'; }
+  $('#rec-type').addEventListener('change', () => { formSync(); if (['A', 'AAAA', 'CNAME'].includes($('#rec-type').value)) $('#rec-proxied').checked = true; });
+  $('#rec-save').addEventListener('click', () => {
+    const st = S(); const type = $('#rec-type').value; const name = normName($('#rec-name').value); let content = $('#rec-content').value.trim();
+    if (!$('#rec-name').value.trim()) return msg('#rec-msg', 'Name is required (use @ for the domain itself).', 'err');
+    if (!content) return msg('#rec-msg', 'Content is required.', 'err');
+    if (type === 'TXT') content = content.replace(/^"|"$/g, '');
+    if (type === 'A' && !Lab.net.isIp(content)) return msg('#rec-msg', 'Content for A record must be a valid IPv4 address. (Code: 9005)', 'err');
+    if (type === 'MX' && Lab.net.isIp(content)) return msg('#rec-msg', 'Content for MX record must be a hostname, not an IP address. (Code: 9004)', 'err');
+    if (['CNAME', 'MX'].includes(type) && !/^[a-z0-9._-]+\.[a-z]{2,}\.?$/i.test(content)) return msg('#rec-msg', 'Content must be a valid hostname.', 'err');
+    const others = st.records.filter(r => r.id !== st.editing && r.name === name);
+    if (type === 'CNAME' && others.length) return msg('#rec-msg', 'An A, AAAA, or CNAME record with that host already exists. (Code: 81053)', 'err');
+    if (type !== 'CNAME' && others.some(r => r.type === 'CNAME')) return msg('#rec-msg', 'A CNAME record with that host already exists. (Code: 81054)', 'err');
+    if (others.some(r => r.type === type && normHost(r.content) === normHost(content))) return msg('#rec-msg', 'An identical record already exists. (Code: 81058)', 'err');
+    const rec = { id: st.editing || 'r' + st.nextId++, type, name, content: ['CNAME', 'MX'].includes(type) ? normHost(content) : content, priority: type === 'MX' ? +$('#rec-priority').value : null, proxied: ['A', 'AAAA', 'CNAME'].includes(type) && $('#rec-proxied').checked };
+    if (st.editing) st.records = st.records.map(r => (r.id === st.editing ? rec : r)); else st.records.push(rec);
+    msg('#rec-msg', `${st.editing ? 'Updated' : 'Added'} ${type} ${fqdn(name)}${rec.proxied ? ' (proxied)' : ''}.`, 'ok');
+    st.editing = null; $('#rec-form-title').textContent = 'Add record'; $('#rec-cancel').hidden = true;
+    $('#rec-name').value = ''; $('#rec-content').value = '';
+    updateHistory(st); lab.touch(); lab.refresh();
+  });
+  $('#rec-cancel').addEventListener('click', () => { S().editing = null; $('#rec-form-title').textContent = 'Add record'; $('#rec-cancel').hidden = true; });
+  $('#rec-table').addEventListener('click', e => {
+    const st = S(); const del = e.target.closest('button[data-del]'); const ed = e.target.closest('button[data-edit]');
+    if (del) { st.records = st.records.filter(r => r.id !== del.dataset.del); updateHistory(st); lab.touch(); lab.refresh(); msg('#rec-msg', 'Record deleted.', ''); }
+    if (ed) { const r = st.records.find(x => x.id === ed.dataset.edit); st.editing = r.id; $('#rec-type').value = r.type; formSync(); $('#rec-name').value = r.name; $('#rec-content').value = r.content; $('#rec-priority').value = r.priority || 10; $('#rec-proxied').checked = r.proxied; $('#rec-form-title').textContent = `Edit ${r.type} ${fqdn(r.name)}`; $('#rec-cancel').hidden = false; }
+    if (e.target.closest('button[data-proxy]')) { const r = st.records.find(x => x.id === e.target.closest('button').dataset.proxy); r.proxied = !r.proxied; lab.touch(); lab.refresh(); }
+  });
+  $('#m365-check').addEventListener('click', () => { S().flags.checked = true; lab.touch(); lab.refresh(); });
+  $('#m365-dkim').addEventListener('click', () => {
+    const st = S();
+    if (!m365DkimDnsOk(st)) { msg('#m365-out', 'CnameMissing: Sync Error. Failed to enable DKIM: the CNAME records for selector1 and selector2 were not found (or are proxied). Publish them as DNS-only first.', 'err'); return; }
+    st.dkim = true; msg('#m365-out', 'DKIM signing enabled for contoso-travel.com.', 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#sf-verify').addEventListener('click', () => {
+    const st = S(); const spf = spfEval(st);
+    if (!sfDnsOk(st)) { msg('#sf-out', `DKIM: ✖ ${recs(st, SF.name, 'CNAME')[0] && recs(st, SF.name, 'CNAME')[0].proxied ? 'sf1._domainkey is proxied: SendFlow sees Cloudflare IPs instead of the CNAME.' : 'CNAME sf1._domainkey → sf1.dkim.sendflow.example not found.'}`, 'err'); return; }
+    st.sfVerified = true;
+    msg('#sf-out', `DKIM: ✓ verified. SPF: ${spf.result === 'ok' && spf.incs.includes('spf.sendflow.example') ? '✓ include found' : '✖ include:spf.sendflow.example not found in a single valid SPF record'}.`, spf.result === 'ok' && spf.incs.includes('spf.sendflow.example') ? 'ok' : 'err');
+    lab.touch(); lab.refresh();
+  });
+  $('#t-inbound').addEventListener('click', () => { $('#t-out').textContent = inbound(S()); lab.touch(); lab.refresh(); });
+  $('#t-m365').addEventListener('click', () => { $('#t-out').textContent = sendTest(S(), 'm365'); lab.touch(); lab.refresh(); });
+  $('#t-campaign').addEventListener('click', () => { $('#t-out').textContent = sendTest(S(), 'campaign'); lab.touch(); lab.refresh(); });
+  $('#lk-go').addEventListener('click', () => { $('#lk-out').textContent = `$ dig ${$('#lk-name').value.trim()} ${$('#lk-type').value} +noall +answer\n` + lookup(S(), $('#lk-type').value, $('#lk-name').value).join('\n'); });
+
+  function render(st) {
+    $('#rec-table tbody').innerHTML = st.records.map(r => `<tr><td><b>${r.type}</b></td><td class="mono">${esc(r.name)}</td><td class="mono" style="overflow-wrap:anywhere;max-width:280px">${esc(r.content)}</td><td>${r.priority === null ? '' : r.priority}</td>
+      <td>${['A', 'AAAA', 'CNAME'].includes(r.type) ? `<button type="button" class="ghost sm" data-proxy="${r.id}" title="Toggle proxy">${r.proxied ? '🟠 Proxied' : '⚪ DNS only'}</button>` : '<span class="muted">DNS only</span>'}</td>
+      <td style="white-space:nowrap"><button type="button" class="ghost sm" data-edit="${r.id}" id="edit-${r.id}">Edit</button> <button type="button" class="ghost sm" data-del="${r.id}" id="del-${r.id}">Delete</button></td></tr>`).join('');
+    const spf = spfEval(st); const mx = recs(st, '@', 'MX');
+    const row = (label, val, ok) => `<tr><td>${label}</td><td style="font-size:11px">${val}</td><td>${st.flags.checked ? (ok ? '<span class="badge ok">✓</span>' : '<span class="badge err">✗</span>') : ''}</td></tr>`;
+    $('#m365-req').innerHTML = '<tr><th>Type</th><th>Expected value</th><th></th></tr>' +
+      row('MX @', `0 ${MX}${st.flags.checked && mx.length > 1 ? '<br><span style="color:var(--danger)">Other MX records found</span>' : ''}`, mx.length === 1 && normHost(mx[0].content) === MX) +
+      row('TXT @', 'v=spf1 include:spf.protection.outlook.com -all' + (st.flags.checked && spfRecords(st).length > 1 ? '<br><span style="color:var(--danger)">Multiple SPF records found</span>' : ''), spf.result === 'ok' && spf.incs.includes('spf.protection.outlook.com')) +
+      row('CNAME autodiscover', 'autodiscover.outlook.com', cnameOk(st, 'autodiscover', 'autodiscover.outlook.com')) +
+      row('CNAME selector1._domainkey', DKIM.selector1, cnameOk(st, 'selector1._domainkey', DKIM.selector1)) +
+      row('CNAME selector2._domainkey', DKIM.selector2, cnameOk(st, 'selector2._domainkey', DKIM.selector2)) +
+      `<tr><td>DKIM signing</td><td>${st.dkim ? 'Enabled' : 'Disabled'}</td><td></td></tr>`;
+  }
+  function onReset(st) {
+    $('#variant-note').textContent = st.v === 1 ? 'Note: someone already started the migration last week.' : st.v === 2 ? 'Note: marketing already "set up SendFlow" in DNS themselves.' : '';
+    ['#rec-name', '#rec-content'].forEach(s => { $(s).value = ''; }); $('#rec-type').value = 'CNAME'; $('#rec-proxied').checked = true; formSync();
+    ['#rec-msg', '#m365-out', '#sf-out'].forEach(s => msg(s, ''));
+    $('#t-out').textContent = 'Run a test to see delivery and the Authentication-Results header.'; $('#lk-out').textContent = 'Public DNS answers appear here.';
+    $('#rec-form-title').textContent = 'Add record'; $('#rec-cancel').hidden = true;
+  }
+
+  lab = Lab({
+    id: 'email-dns-lab', variants: 3, terminal: null, createState, render, onReset,
+    objectives: [
+      { text: 'Inbound mail goes only to Microsoft 365: one MX record, pointing to Exchange Online.',
+        check: st => { const mx = recs(st, '@', 'MX'); if (!mx.some(r => normHost(r.content) === MX)) return 'No MX record points to Exchange Online.'; if (mx.length > 1) return 'Old MX records are still published, so some mail can still land at OldMail.'; return true; },
+        hints: ['The Microsoft 365 panel lists the exact MX target.', 'Leaving the old MX records "as backup" means mail can still be delivered to a host that\'s about to disappear.', `Delete both oldmail MX records and add MX <code>@</code> → <code>${MX}</code> with priority 0.`] },
+      { text: 'Publish exactly one SPF record that authorizes Microsoft 365 and SendFlow (and not the retired host).',
+        check: st => {
+          const n = spfRecords(st).length; if (!n) return 'No SPF record at the domain apex.'; if (n > 1) return `There are ${n} SPF records. Receivers treat that as permerror, so SPF fails for every sender.`;
+          const s = spfEval(st); if (s.result !== 'ok') return 'SPF is invalid: ' + s.why + '.';
+          if (!s.incs.includes('spf.protection.outlook.com')) return 'Microsoft 365 isn\'t authorized.'; if (!s.incs.includes('spf.sendflow.example')) return 'SendFlow isn\'t authorized.';
+          if (s.incs.includes('_spf.oldmail.example')) return 'The retired OldMail include is still there.';
+          if (!/^[~-]all$/.test(s.all)) return 'End the record with ~all or -all.';
+          return true;
+        },
+        hints: ['SPF is a single TXT record per domain. Use the lookup tool to see what\'s published at the apex.', 'Merge every authorized sender into one record; adding a second "v=spf1" record breaks SPF for everyone.', 'One TXT at <code>@</code>: <code>v=spf1 include:spf.protection.outlook.com include:spf.sendflow.example -all</code>. Delete any other v=spf1 record.'] },
+      { text: 'Enable DKIM signing for Microsoft 365.',
+        check: st => (st.dkim && m365DkimDnsOk(st)) || (st.dkim ? 'DKIM was enabled, but its CNAME records are no longer correct.' : 'DKIM signing is still disabled in Microsoft 365.'),
+        hints: ['Microsoft 365 needs two selector CNAME records before signing can be turned on.', 'DKIM CNAMEs must be DNS-only: a proxied record hides the CNAME behind Cloudflare\'s IPs.', 'Add CNAME <code>selector1._domainkey</code> and <code>selector2._domainkey</code> (targets in the M365 panel) with Proxied <strong>off</strong>, then click Enable DKIM signing.'] },
+      { text: 'Make SendFlow campaigns pass DMARC (aligned DKIM for contoso-travel.com).',
+        check: st => (st.sfVerified && sfDnsOk(st)) || (sfDnsOk(st) ? 'The record is published: verify the domain in SendFlow.' : 'SendFlow still signs as sendflow.example, which isn\'t aligned with contoso-travel.com.'),
+        hints: ['SendFlow\'s envelope sender is its own domain, so SPF can never align for its mail. DKIM has to.', 'Publish SendFlow\'s branded DKIM CNAME (DNS-only), then click Verify domain so it signs as contoso-travel.com.', 'CNAME <code>sf1._domainkey</code> → <code>sf1.dkim.sendflow.example</code> (Proxied off), then SendFlow → Verify domain.'] },
+      { text: 'Publish DMARC in monitoring mode (p=none, with aggregate reports), confirm both senders pass, then move it to p=quarantine.',
+        check: st => {
+          const d = dmarcRec(st); if (!d) return 'No DMARC record at _dmarc.contoso-travel.com.'; if (d.err) return 'More than one DMARC record.';
+          if (!/^mailto:[^@]+@contoso-travel\.com$/i.test(d.rua || '')) return 'Add aggregate reporting: rua=mailto:dmarc@contoso-travel.com.';
+          if (st.dmarcHistory[0] !== 'none') return 'DMARC went straight to enforcement without a monitoring phase. Reset the lab and start with p=none.';
+          const p = (d.p || '').toLowerCase();
+          if (p === 'none') return (st.flags.monitored.m365 && st.flags.monitored.campaign) ? 'Both senders pass. Time to move to p=quarantine.' : 'Monitoring: run the M365 and SendFlow tests and confirm both show dmarc=pass.';
+          if (!(st.flags.monitored.m365 && st.flags.monitored.campaign)) return 'Policy was enforced before both senders were confirmed passing under p=none.';
+          return ['quarantine', 'reject'].includes(p) || 'Unknown policy value.';
+        },
+        hints: ['DMARC lives in a TXT record at <code>_dmarc</code>.', 'Start with <code>p=none</code> plus <code>rua</code> reports, run both outbound tests while monitoring, then edit the record to <code>p=quarantine</code>.', '<code>v=DMARC1; p=none; rua=mailto:dmarc@contoso-travel.com</code>, run both tests, then edit it to <code>v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-travel.com</code>.'] },
+      { text: 'Publish Autodiscover so Outlook configures itself.',
+        check: st => cnameOk(st, 'autodiscover', 'autodiscover.outlook.com') || (recs(st, 'autodiscover', 'CNAME')[0] && recs(st, 'autodiscover', 'CNAME')[0].proxied ? 'The autodiscover record is proxied, so Outlook gets Cloudflare instead of Microsoft.' : 'No correct autodiscover CNAME yet.'),
+        hints: ['It\'s in the Microsoft 365 required records.', 'It must be DNS-only, like every record that points at Microsoft 365.', 'CNAME <code>autodiscover</code> → <code>autodiscover.outlook.com</code>, Proxied off (toggle an existing proxied record to DNS only).'] },
+      { text: 'Publish a TLS-RPT record so you get reports about failed TLS deliveries.', optional: true,
+        check: st => txt(st, '_smtp._tls').some(t => /^v=TLSRPTv1;\s*rua=mailto:[^@\s]+@contoso-travel\.com$/i.test(t)) || 'No valid TLS-RPT record at _smtp._tls.',
+        hints: ['It\'s a TXT record under <code>_smtp._tls</code>.', 'Format: <code>v=TLSRPTv1; rua=mailto:…</code>', 'TXT <code>_smtp._tls</code> → <code>v=TLSRPTv1; rua=mailto:tlsrpt@contoso-travel.com</code>'] }
+    ],
+    solution(st) {
+      const add = (type, name, content, opts) => [
+        { run: api => api.fill('#rec-type', type) }, { run: api => api.fill('#rec-name', name) }, { run: api => api.fill('#rec-content', content) },
+        ...(type === 'MX' ? [{ run: api => api.fill('#rec-priority', String(opts.priority)) }] : []),
+        ...(['A', 'AAAA', 'CNAME'].includes(type) ? [{ run: api => api.check('#rec-proxied', false) }] : []),
+        { run: api => api.click('#rec-save') }];
+      const s = [
+        { note: 'MX: remove both OldMail records so nothing can still be delivered there, then point MX at Exchange Online.', run: api => api.click('#del-r3') }, { run: api => api.click('#del-r4') },
+        ...add('MX', '@', MX, { priority: 0 }),
+        { note: 'SPF: one record only. Delete the old one' + (st.v === 2 ? ' and marketing\'s second v=spf1 record (two records is a permerror)' : '') + ', then publish a merged record.', run: api => api.click('#del-r5') }
+      ];
+      if (st.v === 2) s.push({ run: api => api.click('#del-r7') });
+      s.push(...add('TXT', '@', 'v=spf1 include:spf.protection.outlook.com include:spf.sendflow.example -all'));
+      s.push({ note: 'DKIM for Microsoft 365: two selector CNAMEs, DNS-only. Cloudflare proxies new CNAMEs by default, so switch it off.', run: () => {} }, ...add('CNAME', 'selector1._domainkey', DKIM.selector1), ...add('CNAME', 'selector2._domainkey', DKIM.selector2));
+      s.push({ run: api => api.click('#m365-dkim') });
+      s.push({ note: 'SendFlow: its branded DKIM CNAME lets it sign as contoso-travel.com, which is the only way its mail can align.', run: () => {} }, ...add('CNAME', SF.name, SF.target), { run: api => api.click('#sf-verify') });
+      if (st.v === 1) s.push({ note: 'Autodiscover exists but is proxied, so Outlook would reach Cloudflare instead of Microsoft. Switch it to DNS only.', run: api => api.click('button[data-proxy="r7"]') });
+      else s.push({ note: 'Autodiscover for Outlook, DNS-only.', run: () => {} }, ...add('CNAME', 'autodiscover', 'autodiscover.outlook.com'));
+      s.push({ note: 'DMARC phase 1: monitor with p=none and aggregate reports.', run: () => {} }, ...add('TXT', '_dmarc', 'v=DMARC1; p=none; rua=mailto:dmarc@contoso-travel.com'));
+      s.push({ note: 'Prove both senders pass while nothing is enforced yet.', run: api => api.click('#t-m365'), wait: 1200 }, { run: api => api.click('#t-campaign'), wait: 1400 });
+      s.push({ note: 'Both pass DMARC, so enforce: edit the record to p=quarantine.', run: api => api.click('#edit-' + api.state.records.find(x => x.name === '_dmarc').id) },
+        { run: api => api.fill('#rec-content', 'v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-travel.com') }, { run: api => api.click('#rec-save') });
+      s.push({ note: 'Bonus: TLS-RPT reporting.', run: () => {} }, ...add('TXT', '_smtp._tls', 'v=TLSRPTv1; rua=mailto:tlsrpt@contoso-travel.com'));
+      s.push({ note: 'Final checks: inbound delivery and the Microsoft 365 DNS status.', run: api => api.click('#t-inbound'), wait: 900 }, { run: api => api.click('#m365-check') });
+      return s;
+    },
+    debrief: [
+      { title: 'MX is all or nothing', text: 'Leaving old MX records "as backup" lets mail land on a host you\'re decommissioning. Cut over to the single Exchange Online target.' },
+      { title: 'One SPF record, always', text: 'Two <code>v=spf1</code> records is a permerror, and SPF then fails for every sender. Merge includes and stay under 10 DNS lookups.' },
+      { title: 'DNS-only for anything Microsoft or ESPs verify', text: 'A proxied CNAME returns Cloudflare\'s IPs and hides the target, so DKIM keys and Autodiscover silently break. Cloudflare proxies new records by default.' },
+      { title: 'Alignment is what DMARC checks', text: 'SendFlow passes SPF for its own bounce domain, which never aligns with contoso-travel.com. Branded DKIM (d=contoso-travel.com) is how third-party senders pass DMARC.' },
+      { title: 'Monitor, then enforce', text: 'p=none with rua reports shows who sends as your domain. Enforcing before every legitimate sender passes sends real customer mail to spam.' },
+      { title: 'Reports close the loop', text: 'DMARC aggregate reports and TLS-RPT turn "mail is going missing" from guesswork into data you can act on.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

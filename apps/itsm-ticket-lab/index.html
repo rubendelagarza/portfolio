@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: ITSM ticket simulator (modeled on ServiceNow) — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 04</div>
+    <h1>Lab: ITSM ticket simulator (modeled on ServiceNow)</h1>
+    <p>Document an incident from the first call to closure, one guided step at a time. Each step is checked against service-desk documentation best practice before the next one unlocks, and graded for quality.</p>
+    <div class="lab-meta"><span class="pill">Guided</span><span class="pill">~12 min</span><span class="pill">Incident form</span><span class="pill">3 randomized incidents</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the ticket discipline behind the SLA and KPI work I did at TCS and Teleperformance: classify correctly, prioritize with the impact × urgency matrix, write notes the next engineer can act on, communicate clearly with users, and close with reusable knowledge.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>ITSM console</strong> <span class="muted">· simulation modeled on ServiceNow</span></span><span class="row" style="gap:12px"><span class="mode-toggle" role="group" aria-label="Guidance level"><span>Guidance</span><button type="button" id="mode-easy">Easy</button><button type="button" id="mode-std">Standard</button></span><span class="muted" id="sla">Opened 09:12</span></span></div>
+          <div style="padding:16px 18px">
+            <div class="row space-between mb-8"><h3 style="margin:0">Incident <span class="mono" id="inc-num">INC0052318</span></h3><span class="badge" id="prio-badge">Priority —</span></div>
+            <div class="itsm-grid">
+              <div><label for="f-caller">Caller</label><select id="f-caller"></select></div>
+              <div><label for="f-contact">Contact type</label><select id="f-contact"><option value="">— None —</option><option>Phone</option><option>Email</option><option>Self-service</option><option>Walk-in</option></select></div>
+              <div><label for="f-category">Category</label><select id="f-category"></select></div>
+              <div><label for="f-sub">Subcategory</label><select id="f-sub"></select></div>
+              <div class="full"><label for="f-ci">Configuration item</label><select id="f-ci"></select></div>
+              <div><label for="f-impact">Impact</label><select id="f-impact"><option value="">— None —</option><option value="1">1 - High (company / site)</option><option value="2">2 - Medium (department / group)</option><option value="3">3 - Low (single user)</option></select></div>
+              <div><label for="f-urgency">Urgency</label><select id="f-urgency"><option value="">— None —</option><option value="1">1 - High (work stopped, deadline today)</option><option value="2">2 - Medium (degraded)</option><option value="3">3 - Low (workaround / can wait)</option></select></div>
+              <div><label for="f-group">Assignment group</label><select id="f-group"><option value="">— None —</option><option>Service Desk</option><option>Endpoint Support</option><option>Messaging (Exchange)</option><option>Network Operations</option><option>Windows Server Team</option><option>Identity &amp; Access</option></select></div>
+              <div><label for="f-assigned">Assigned to</label><select id="f-assigned"><option value="">— None —</option><option>Ruben de la Garza</option><option>Diana Castro</option><option>Marco Ibarra</option></select></div>
+              <div><label for="f-state">State</label><select id="f-state"><option>New</option><option>In Progress</option><option>On Hold</option><option>Resolved</option><option>Closed</option></select></div>
+              <div><label>Priority (calculated)</label><input type="text" id="f-priority" readonly /></div>
+              <div class="full"><label for="f-short">Short description</label><input type="text" id="f-short" maxlength="160" /></div>
+              <div class="full"><label for="f-desc">Description</label><textarea id="f-desc" rows="4"></textarea></div>
+            </div>
+            <div class="tabs mt-16" id="itsm-tabs"><button type="button" class="active" data-t="notes">Notes</button><button type="button" data-t="res">Resolution information</button><button type="button" data-t="rel">Related records</button></div>
+            <div data-tp="notes">
+              <div class="grid-2">
+                <div><label for="f-worknote">Work notes <span class="muted">(internal, IT only)</span></label><textarea id="f-worknote" rows="4" style="background:#fffbeb"></textarea><button type="button" class="sm mt-16" id="btn-worknote">Post work note</button></div>
+                <div><label for="f-comment">Additional comments <span class="muted">(customer visible)</span></label><textarea id="f-comment" rows="4"></textarea><button type="button" class="sm mt-16" id="btn-comment">Post comment</button></div>
+              </div>
+              <label class="mt-16">Activity</label>
+              <div class="activity" id="activity"></div>
+            </div>
+            <div data-tp="res" hidden>
+              <div class="itsm-grid">
+                <div><label for="f-rescode">Resolution code</label><select id="f-rescode"><option value="">— None —</option><option>Solved (Permanently)</option><option>Solved (Work Around)</option><option>Not Solved (Not Reproducible)</option><option>Closed/Resolved by Caller</option><option>Duplicate</option></select></div>
+                <div></div>
+                <div class="full"><label for="f-resnotes">Resolution notes</label><textarea id="f-resnotes" rows="4"></textarea></div>
+                <div class="full row" style="gap:10px"><button type="button" class="sm" id="btn-resolve">Resolve</button><span class="inline-msg" id="resolve-msg"></span></div>
+              </div>
+            </div>
+            <div data-tp="rel" hidden>
+              <div class="itsm-grid">
+                <div><label for="f-causedby">Caused by change</label><select id="f-causedby"><option value="">— None —</option><option>CHG0031337 · FS01 share permission cleanup (Nov 19)</option><option>CHG0031290 · Exchange transport rule update (Nov 18)</option><option>CHG0031301 · Intune Wi-Fi profile v2 (Nov 17)</option></select></div>
+                <div></div>
+                <div class="full"><label for="f-kbq">Knowledge base search</label><div class="row"><input type="text" id="f-kbq" placeholder="e.g. Outlook password prompt" style="flex:1" /><button type="button" class="ghost sm" id="btn-kbsearch">Search</button></div>
+                  <div id="kb-results" style="font-size:13px;margin-top:8px"></div></div>
+                <div class="full"><button type="button" class="ghost sm" id="btn-kbnew">Create knowledge article</button><span class="muted" style="font-size:12px;margin-left:8px" id="kb-attached"></span></div>
+              </div>
+              <div class="mock-section mt-16" id="kb-form" hidden>
+                <h4>New knowledge article (draft)</h4>
+                <div class="field"><label for="kb-title">Title</label><input type="text" id="kb-title" /></div>
+                <div class="field"><label for="kb-symptoms">Symptoms</label><textarea id="kb-symptoms" rows="2"></textarea></div>
+                <div class="field"><label for="kb-cause">Cause</label><textarea id="kb-cause" rows="2"></textarea></div>
+                <div class="field"><label for="kb-resolution">Resolution steps</label><textarea id="kb-resolution" rows="3"></textarea></div>
+                <button type="button" class="sm" id="btn-kbsave">Save draft</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="coach" id="coach"></div>
+        <div class="panel">
+          <h3>Steps</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Caller conversation</h3>
+          <div class="chat" id="chat"></div>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 04 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const $ = s => document.querySelector(s);
+  const $$ = s => [...document.querySelectorAll(s)];
+  const esc = Lab.util.esc;
+  const CALLERS = ['Patricia Salinas (CFO, Finance)', 'Tomas Vega (Finance)', 'Elena Hernandez (Sales)', 'Laura Perez (Finance)', 'Jorge Perez (Sales)'];
+  const CATS = { 'Network': ['Wireless', 'VPN', 'Wired / LAN'], 'Hardware': ['Laptop', 'Printer', 'Peripheral'], 'Software': ['Application error', 'Installation'], 'Email': ['Outlook client', 'Mailbox', 'Mail flow'], 'Access & Identity': ['Password / lockout', 'Permissions request'], 'File & Storage': ['File share access', 'OneDrive / SharePoint'], 'Inquiry / Help': ['How-to'] };
+  const CIS = ['Exchange Online', 'CTSO-LT-0102 (Patricia Salinas laptop)', 'CTSO-LT-0233 (Elena Hernandez laptop)', 'FS01 (File server)', 'Corporate Wi-Fi (CONTOSO-CORP)', 'VPN gateway MEX-01'];
+  const MATRIX = { '11': 1, '12': 2, '13': 3, '21': 2, '22': 3, '23': 4, '31': 3, '32': 4, '33': 5 };
+  const SLA = { 1: ['15m', '4h'], 2: ['30m', '8h'], 3: ['2h', '1 business day'], 4: ['8h', '3 business days'], 5: ['1 business day', '5 business days'] };
+
+  const SCEN = [
+    { key: 'A', inc: 'INC0052318', caller: CALLERS[0], cat: 'Email', sub: 'Outlook client', ci: CIS[1], impact: '3', urgency: '1', group: 'Service Desk', assigned: 'Ruben de la Garza', code: 'Solved (Permanently)',
+      call: [['Patricia Salinas', 'Hi, this is Patricia Salinas, the CFO. Since I changed my password this morning, Outlook on my laptop keeps popping up a window asking for my password.'],
+             ['Patricia Salinas', 'It says "Enter password for patricia.salinas@contoso.com". I type the new password, it goes away, and a minute later it\'s back. Webmail on my phone works fine.'],
+             ['Patricia Salinas', 'I have the board meeting at 2pm today and I need my email on the laptop for it. Nobody else on my team has this problem.']],
+      sdSubject: ['outlook'], sdSymptom: ['password', 'prompt', 'credential', 'asking'], sdScope: ['cfo', 'salinas', 'single user', '1 user', 'one user', 'vip'],
+      facts: [['the symptom (repeated password prompt)', ['prompt', 'asking for', 'keeps asking', 'pop']], ['the exact message', ['enter password for']], ['when it started', ['this morning', 'since', 'password change', 'changed her password', 'changed my password']], ['the scope (only her)', ['only', 'single', 'nobody else', 'no one else', 'other users']], ['what still works', ['webmail', 'phone', 'owa']], ['the business impact', ['board', '2pm', '2 pm', 'meeting']]],
+      wnKw: ['webmail', 'owa', 'credential', 'cached', 'cache', 'profile', 'outlook'], jargon: ['owa', 'mapi', 'cred mgr', 'autodiscover', 'exo', 'tenant', 'token'],
+      causeKw: ['cached', 'cache', 'stored credential', 'saved credential', 'old password', 'credential manager'], fixKw: ['cleared', 'removed', 'deleted', 'reset', 'recreated'],
+      worknote: 'Webmail works for the user, so Exchange Online and the account are fine. Isolated to Outlook on CTSO-LT-0102. Found a stale cached credential for patricia.salinas@contoso.com in Windows Credential Manager (saved before this morning\'s password change). Removed the cached entries and restarted Outlook. Outlook connected without prompting; monitoring for 10 min.',
+      comment: 'Hi Patricia, thanks for the details. Your laptop was still holding on to your old password, which is why Outlook kept asking. I\'ve cleared it and Outlook should now stay connected. I\'ll check back with you within 15 minutes, well before your 2pm meeting.',
+      after6: ['Patricia Salinas', 'It hasn\'t asked again. Thank you, that\'s a relief before the board meeting!'],
+      resnotes: 'Cause: a stale cached credential (old password) in Windows Credential Manager on CTSO-LT-0102 after the user\'s password change. Fix: removed the cached Office credentials and restarted Outlook. Verified: Outlook connected and stayed connected for 15 minutes; user confirmed by phone.',
+      link: 'kb-new', kbSearch: [] },
+    { key: 'B', inc: 'INC0052326', caller: CALLERS[1], cat: 'File & Storage', sub: 'File share access', ci: CIS[3], impact: '2', urgency: '1', group: 'Windows Server Team', assigned: '', code: 'Solved (Permanently)',
+      call: [['Tomas Vega', 'Hi, I\'m calling for the whole Finance team: none of us can open the S: drive since about 8:30 this morning.'],
+             ['Tomas Vega', 'Windows says "\\\\fs01\\finance is not accessible. You might not have permission to use this network resource. Access is denied." Our other drives and the internet work fine.'],
+             ['Tomas Vega', 'It\'s month-end close today. We have to submit the numbers by 5pm, so this is blocking about 40 people.']],
+      sdSubject: ['s:', 'share', 'fs01', 'finance drive', 'drive', 'folder'], sdSymptom: ['access denied', 'denied', 'not accessible', 'cannot access', "can't access", 'cannot open', "can't open", 'permission'], sdScope: ['finance', 'department', 'team', '40', 'all users'],
+      facts: [['the symptom', ['access is denied', 'access denied', 'not accessible', 'cannot open', "can't open"]], ['the exact message or path', ['\\\\fs01\\finance', 'fs01\\finance', 'not accessible', 'access is denied']], ['when it started', ['8:30', 'this morning', 'since']], ['the scope (whole department)', ['finance', '40', 'team', 'department', 'all']], ['what still works', ['other drives', 'internet', 'other shares']], ['the business impact', ['month-end', 'month end', '5pm', '5 pm', 'deadline', 'close']]],
+      wnKw: ['fs01', 'acl', 'permission', 'chg0031337', 'change', 'group', 'gg-finance', 'reachable', 'ping', 'other shares'], jargon: ['acl', 'ntfs', 'smb', 'gg-finance', 'chg0031337', 'ad group', 'sid'],
+      handoff: { scope: ['finance', '40', 'department'], done: ['checked', 'verified', 'confirmed', 'tested'], cause: ['chg0031337', 'change'], ask: ['please', 'request', 'need', 'can you', 'could you'] },
+      causeKw: ['chg0031337', 'change', 'cleanup', 'clean-up', 'removed'], fixKw: ['re-added', 'readded', 'restored', 'added back', 're-granted'],
+      worknote: 'Escalation to Windows Server Team. Summary: all ~40 Finance users get Access Denied on \\\\fs01\\finance since 08:30; month-end close is due 17:00 (P2). Done so far: verified FS01 is reachable and other shares work for the same users, and confirmed a Finance user\'s token still includes GG-Finance-Users. Suspected cause: last night\'s CHG0031337 (FS01 share permission cleanup) appears to have removed GG-Finance-Users from the share/NTFS ACL. Please restore Modify for GG-Finance-Users on \\\\fs01\\finance and update this ticket.',
+      comment: 'Hi Tomas, thanks for reporting this so quickly. We\'ve found the likely cause: a maintenance change last night affected access to the Finance drive. Our server team is restoring it now as a high-priority item. I\'ll update you within 30 minutes, and sooner if it\'s fixed.',
+      serverNote: 'Windows Server Team (M. Ibarra): Confirmed. CHG0031337\'s cleanup script removed GG-Finance-Users from the \\\\fs01\\finance ACL. Re-added GG-Finance-Users with Modify; tested access with a Finance test account. Change owner notified for review.',
+      after6: ['Tomas Vega', 'We can open S: again, all good on our side. Thanks!'],
+      resnotes: 'Cause: CHG0031337 (FS01 share permission cleanup) removed GG-Finance-Users from the \\\\fs01\\finance ACL. Fix: Windows Server Team re-added GG-Finance-Users with Modify permission. Verified: Finance users can open S: again; Tomas Vega confirmed for the team at 10:05. Change owner notified for post-implementation review.',
+      link: 'caused-by', kbSearch: [] },
+    { key: 'C', inc: 'INC0052331', caller: CALLERS[2], cat: 'Network', sub: 'Wireless', ci: CIS[2], impact: '3', urgency: '3', group: 'Service Desk', assigned: 'Ruben de la Garza', code: 'Solved (Work Around)',
+      call: [['Elena Hernandez', 'Hi, my laptop keeps dropping the office Wi-Fi every time it wakes from sleep. I have to turn Wi-Fi off and on again.'],
+             ['Elena Hernandez', 'There\'s no error message, it just shows "No internet". It started after last week\'s updates, I think. My colleagues don\'t have this.'],
+             ['Elena Hernandez', 'It\'s annoying, but I can work: I\'ve been plugging in the network cable at my desk. No rush, whenever someone can look.']],
+      sdSubject: ['wi-fi', 'wifi', 'wireless'], sdSymptom: ['drop', 'disconnect', 'sleep', 'wake', 'lost'], sdScope: ['hernandez', 'single user', '1 user', 'one user', 'laptop', 'ctso-lt-0233'],
+      facts: [['the symptom (drops after sleep)', ['sleep', 'wake', 'resume']], ['what she sees', ['no internet']], ['when it started', ['last week', 'update', 'since']], ['the scope (only her)', ['only', 'single', 'colleagues', 'nobody else', 'other users']], ['the workaround in use', ['cable', 'wired', 'ethernet', 'toggle', 'off and on']], ['the business impact (low)', ['no rush', 'can work', 'low', 'minimal', 'workaround']]],
+      wnKw: ['driver', 'ax211', 'power', 'power management', 'kb0010234', 'intune', 'adapter', 'sleep'], jargon: ['ax211', 'intune', 'kb0010234', 'nic', 'power management policy', 'driver ring'],
+      causeKw: ['driver', 'power', 'power management', 'power-saving', 'power saving', 'known issue'], fixKw: ['disabled', 'turned off', 'changed', 'unchecked', 'workaround'], pendingKw: ['driver update', 'update', 'patch', 'permanent', 'problem', 'scheduled', 'pending'],
+      worknote: 'Reproduced: CTSO-LT-0233 loses CONTOSO-CORP after resume from sleep. Intel AX211 driver is on 22.180 (known issue, KB0010234). Workaround applied: disabled "Allow the computer to turn off this device to save power" on the Wi-Fi adapter. Permanent fix: driver 23.40 is in the next Intune driver ring (Nov 26).',
+      comment: 'Hi Elena, thanks for the clear description. I changed a power setting on your Wi-Fi adapter so it no longer drops after sleep, and a permanent driver update will arrive automatically next week. I\'ll check in with you tomorrow morning to make sure it\'s holding up.',
+      after6: ['Elena Hernandez', 'I closed the lid a few times and it reconnected every time. Perfect, and the update next week is fine.'],
+      resnotes: 'Cause: known issue with the Intel AX211 driver and power management after sleep (KB0010234). Workaround: disabled the adapter\'s power-saving option. Verified: Wi-Fi reconnects after sleep on 3 tests; user confirmed. Permanent fix pending: driver update via Intune driver ring on Nov 26.',
+      link: 'kb-attach', kbSearch: [['KB0010234', 'Wi-Fi drops after sleep on Intel AX211 laptops: workaround and fix'], ['KB0009981', 'Connect to CONTOSO-GUEST Wi-Fi']] }
+  ];
+
+  // ---------- Easy-mode guidance per scenario (good option first in each list; shown shuffled)
+  const GUIDE = {
+    A: {
+      sd: { what: ['Outlook repeatedly prompts for password after reset', 'Outlook not working', 'Email problem', 'Password issue'], who: ['CFO laptop', 'Patricia', 'all users', 'Exchange Online'], impact: ['board meeting 2pm', 'URGENT!!', 'please help', 'low priority'] },
+      facts: ['Outlook on her laptop repeatedly prompts for the password.', 'Exact message: "Enter password for patricia.salinas@contoso.com".', 'Started this morning, right after she changed her password.', 'Only this user is affected; nobody else on her team.', 'Webmail on her phone works fine.', 'Business impact: she needs Outlook on the laptop for the board meeting at 2pm today.'],
+      bad: [['Probably an Exchange Online outage.', 'a guess the facts contradict (webmail works)'], ['She sounded stressed and a bit rude on the phone.', 'an opinion about the caller'], ['Her new password is Spring2026!', 'a password: never write one in a ticket']],
+      chips: ['Outlook password prompt', 'Credential Manager', 'VPN disconnects'],
+      why: { caller: [0, 'She introduces herself: Patricia Salinas, the CFO.'], contact: [null, 'She phoned you, so the contact type is Phone.'], category: [0, 'What fails is Outlook, an email client.'], sub: [0, 'It is the Outlook client on her laptop, not the mailbox or mail flow.'], ci: [1, 'Webmail on her phone works, so Exchange Online is fine: the broken item is her laptop.'], impact: [2, 'Nobody else on her team has it: one user. Being the CFO doesn\'t raise impact.'], urgency: [2, 'Board meeting at 2pm today: she is blocked with a deadline.'], group: [null, 'Clearing a cached password on a laptop is a service desk fix: keep it and assign it to yourself.'], rescode: [null, 'The cause was removed for good, so it is solved permanently.'] } },
+    B: {
+      sd: { what: ['Finance S: drive access denied', 'S: drive not working', 'Network issue', 'Permissions problem'], who: ['whole department', 'Tomas', 'one user', 'entire company'], impact: ['month-end close blocked', 'ASAP!!!', 'help needed', 'when possible'] },
+      facts: ['Finance users cannot open the S: drive.', 'Exact error: "\\\\fs01\\finance is not accessible. You might not have permission to use this network resource. Access is denied."', 'Started at about 8:30 this morning.', 'Scope: the whole Finance department (~40 users).', 'Other drives and the internet work fine.', 'Business impact: month-end close numbers are due by 5pm today.'],
+      bad: [['Tomas thinks IT broke it on purpose.', 'an opinion, not a fact'], ['Probably a virus on the file server.', 'a guess with no evidence'], ['Tomas gave his personal mobile, 81 5555 0144.', 'personal data the ticket doesn\'t need']],
+      chips: ['Access denied file share', 'S: drive', 'Wi-Fi sleep'],
+      why: { caller: [0, 'Tomas Vega is calling on behalf of the Finance team.'], contact: [null, 'He phoned you, so the contact type is Phone.'], category: [1, '"Access is denied" on a network drive is a file storage problem.'], sub: [1, 'The S: drive is a file share (\\\\fs01\\finance), not OneDrive or SharePoint.'], ci: [1, 'The path in the error names the server: FS01.'], impact: [2, 'About 40 people in one department: medium impact (2).'], urgency: [2, 'Month-end numbers are due by 5pm today: urgency 1.'], group: [null, 'Share permissions live on the file server, which the Windows Server Team owns. Leave the assignee for them to pick up.'], rescode: [null, 'Access was restored for good, so it is solved permanently.'] } },
+    C: {
+      sd: { what: ['Wi-Fi drops after sleep', 'Wi-Fi broken', 'Laptop issue', 'Internet down'], who: ['single laptop (E. Hernandez)', 'whole office', 'Elena', 'Corporate Wi-Fi'], impact: ['wired workaround in use', 'URGENT', 'fix now!!', 'help'] },
+      facts: ['Her laptop drops the office Wi-Fi every time it wakes from sleep.', 'It shows "No internet" until Wi-Fi is turned off and on again.', 'Started after last week\'s updates.', 'Only this user is affected; her colleagues are fine.', 'Workaround: she uses the network cable at her desk.', 'Low impact: she can work and said there is no rush.'],
+      bad: [['The office Wi-Fi is probably overloaded.', 'a guess the facts contradict (colleagues are fine)'], ['She thinks the laptop is too old and should be replaced.', 'an opinion, not a fact'], ['Her Wi-Fi password is Contoso2024.', 'a password: never write one in a ticket']],
+      chips: ['Wi-Fi sleep', 'Wi-Fi drops', 'Guest Wi-Fi', 'Outlook password prompt'],
+      why: { caller: [0, 'Elena Hernandez reports it herself.'], contact: [null, 'She phoned you, so the contact type is Phone.'], category: [0, 'The office Wi-Fi drops: a network problem.'], sub: [0, 'Specifically wireless, not VPN or a wired LAN.'], ci: [1, 'Her colleagues are fine, so the Wi-Fi network works: the broken item is her laptop.'], impact: [1, 'Only her laptop: low impact (3).'], urgency: [2, 'She has a workaround (the cable) and said no rush: urgency 3.'], group: [null, 'A laptop power setting is a service desk fix: keep it and assign it to yourself.'], rescode: [null, 'The permanent driver fix is still pending, so this is a workaround.'] } }
+  };
+  // Step 5/6 builders. Each row: good option (string, or {short, warm} for the comment tone), bad options with the reason they fail, and whether the row may be left out.
+  const WN = {
+    A: [
+      { label: 'Checked', good: 'Webmail works for the user, so Exchange Online and the account are fine.', bad: [['Checked stuff on the laptop.', 'vague: say what you checked'], ['Hi team, I had a look at this one.', 'a greeting: work notes are internal']] },
+      { label: 'Found', good: 'Found a stale cached credential in Windows Credential Manager, saved before this morning\'s password change.', bad: [['Outlook is broken.', 'a restated symptom, not a finding'], ['User\'s new password is Spring2026!', 'a password: never write one in a ticket']] },
+      { label: 'Did', good: 'Removed the cached entries and restarted Outlook; it connected without prompting.', bad: [['Fixed it.', 'vague: say what you did']] },
+      { label: 'Next', good: 'Monitoring for 10 minutes.', bad: [], empty: true }],
+    B: [
+      { label: 'Summary & impact', good: 'Escalation to Windows Server Team: all ~40 Finance users get Access Denied on \\\\fs01\\finance since 08:30; month-end close is due 17:00 (P2).', bad: [['Finance can\'t get into a folder.', 'vague: no scope, error or deadline'], ['Hi guys, quick one for you!', 'a greeting: work notes are internal']] },
+      { label: 'Checked so far', good: 'Checked so far: FS01 is reachable, other shares work for the same users, and a Finance user\'s token still includes GG-Finance-Users.', bad: [['Not sure what\'s wrong.', 'it says nothing about what was checked']] },
+      { label: 'Suspected cause', good: 'Suspected cause: last night\'s CHG0031337 (FS01 share permission cleanup) appears to have removed GG-Finance-Users from the ACL.', bad: [], empty: true },
+      { label: 'Request', good: 'Please restore Modify for GG-Finance-Users on \\\\fs01\\finance and update this ticket.', bad: [['Have a look when you get a chance.', 'no specific ask']] }],
+    C: [
+      { label: 'Checked', good: 'Reproduced: CTSO-LT-0233 loses CONTOSO-CORP after resume from sleep; colleagues on the same access point are fine.', bad: [['Looked at the Wi-Fi.', 'vague: say what you checked'], ['Hello! Thanks for assigning me this.', 'a greeting: work notes are internal']] },
+      { label: 'Found', good: 'Intel AX211 driver is on 22.180, a known issue (KB0010234).', bad: [['The Wi-Fi is bad.', 'a restated symptom, not a finding'], ['Wi-Fi password is Contoso2024.', 'a password: never write one in a ticket']] },
+      { label: 'Did', good: 'Workaround: disabled "Allow the computer to turn off this device to save power" on the Wi-Fi adapter.', bad: [['Tried some things.', 'vague: say what you did']] },
+      { label: 'Next', good: 'Permanent fix: driver 23.40 arrives in the Intune driver ring on Nov 26.', bad: [], empty: true }]
+  };
+  const CM = {
+    A: [
+      { label: 'Greeting', good: 'Hi Patricia, thanks for the details.', bad: [['Dear user,', 'impersonal: use their name']], empty: true },
+      { label: 'What we found or did', good: { short: 'Your laptop was still holding on to your old password. I\'ve cleared it, so Outlook should stay connected.', warm: 'I know the board meeting is close, so I went straight to it: your laptop was still holding on to your old password, which is why Outlook kept asking. I\'ve cleared it and Outlook should now stay connected.' }, bad: [['Purged the stale MAPI token from Cred Mgr.', 'internal jargon the caller won\'t understand']] },
+      { label: 'Next update', good: { short: 'I\'ll check back within 15 minutes.', warm: 'I\'ll check back with you within 15 minutes, well before your 2pm meeting, to make sure it\'s holding.' }, bad: [['We\'ll get back to you.', 'no time for the next update']] }],
+    B: [
+      { label: 'Greeting', good: 'Hi Tomas, thanks for reporting this so quickly.', bad: [['Dear user,', 'impersonal: use their name']], empty: true },
+      { label: 'What we found or did', good: { short: 'A maintenance change last night affected access to the Finance drive, and our server team is restoring it now.', warm: 'I know month-end close is due today, so this is a high priority: a maintenance change last night affected access to the Finance drive, and our server team is restoring it right now.' }, bad: [['CHG0031337 removed GG-Finance-Users from the FS01 ACL.', 'internal jargon and ticket IDs the caller won\'t understand']] },
+      { label: 'Next update', good: { short: 'I\'ll update you within 30 minutes.', warm: 'I\'ll update you within 30 minutes, and sooner if it\'s fixed, so your team can plan around the 5pm deadline.' }, bad: [['We\'ll let you know.', 'no time for the next update']] }],
+    C: [
+      { label: 'Greeting', good: 'Hi Elena, thanks for the clear description.', bad: [['Dear user,', 'impersonal: use their name']], empty: true },
+      { label: 'What we found or did', good: { short: 'I changed a power setting on your Wi-Fi adapter so it no longer drops after sleep. A permanent update will arrive automatically next week.', warm: 'Thanks for your patience while using the cable. I changed a power setting on your Wi-Fi adapter so it no longer drops after sleep, and a permanent update will arrive automatically next week, so you won\'t need to do anything.' }, bad: [['Disabled NIC power management; AX211 driver fix ships via the Intune driver ring.', 'internal jargon the caller won\'t understand']] },
+      { label: 'Next update', good: { short: 'I\'ll check in with you tomorrow morning.', warm: 'I\'ll check in with you tomorrow morning to make sure it\'s holding up.' }, bad: [['Let us know if it happens again.', 'no time for the next update']] }]
+  };
+  // Step 7: resolution notes builder rows
+  const RN = {
+    A: [
+      { label: 'Cause', good: 'Cause: a stale cached credential (old password) in Windows Credential Manager after the user\'s password change.', bad: [['Cause: unknown.', 'no cause recorded'], ['Cause: user error.', 'it blames the user and explains nothing']] },
+      { label: 'Fix', good: 'Fix: removed the cached Office credentials and restarted Outlook.', bad: [['Fix: fixed.', 'vague: say what you did'], ['Fix: rebooted until it stopped.', 'not the real fix']] },
+      { label: 'Verification', good: 'Verified: Outlook stayed connected for 15 minutes.', bad: [['Should be OK now.', 'not verified']] },
+      { label: 'Caller confirmation', good: 'User confirmed by phone.', bad: [], empty: true }],
+    B: [
+      { label: 'Cause', good: 'Cause: CHG0031337 (FS01 share permission cleanup) removed GG-Finance-Users from the \\\\fs01\\finance ACL.', bad: [['Cause: unknown.', 'no cause recorded'], ['Cause: Finance users clicked something.', 'it blames the users and explains nothing']] },
+      { label: 'Fix', good: 'Fix: Windows Server Team re-added GG-Finance-Users with Modify permission.', bad: [['Fix: sorted by the server team.', 'vague: say what was changed']] },
+      { label: 'Verification', good: 'Verified: Finance users can open S: again.', bad: [['Should be OK now.', 'not verified']] },
+      { label: 'Caller confirmation', good: 'Tomas Vega confirmed for the team at 10:05. Change owner notified for post-implementation review.', bad: [], empty: true }],
+    C: [
+      { label: 'Cause', good: 'Cause: known issue with the Intel AX211 driver and power management after sleep (KB0010234).', bad: [['Cause: unknown.', 'no cause recorded'], ['Cause: the user closes the lid too often.', 'it blames the user and explains nothing']] },
+      { label: 'Fix', good: 'Workaround: disabled the adapter\'s power-saving option.', bad: [['Fix: sorted.', 'vague: say what you did'], ['Fix: told her to keep using the cable.', 'that is her own workaround, not a fix']] },
+      { label: 'Verification', good: 'Verified: Wi-Fi reconnects after sleep on 3 tests.', bad: [['Should be OK now.', 'not verified']] },
+      { label: 'Caller confirmation', good: 'User confirmed.', bad: [], empty: true },
+      { label: 'Permanent fix and when', good: 'Permanent fix pending: driver update via Intune driver ring on Nov 26.', bad: [['Will look at it later.', 'no plan and no date']] }]
+  };
+  // Plain-language swaps for internal jargon in customer comments
+  const SWAPS = {
+    A: [['\\bOWA\\b', 'webmail'], ['\\bMAPI\\b', 'Outlook connection'], ['Cred Mgr', 'saved passwords'], ['\\bautodiscover\\b', 'Outlook setup'], ['\\bEXO\\b', 'email service'], ['\\btenant\\b', 'company account'], ['\\btokens?\\b', 'sign-in']],
+    B: [['CHG\\d+', 'a maintenance change'], ['GG-Finance(-Users)?', 'the Finance team group'], ['\\bACLs?\\b', 'access permissions'], ['\\bNTFS\\b', 'file permissions'], ['\\bSMB\\b', 'file sharing'], ['\\bAD group\\b', 'access group'], ['\\bSIDs?\\b', 'account ID']],
+    C: [['\\bAX211\\b', 'Wi-Fi'], ['\\bIntune\\b', 'our update system'], ['KB\\d+', 'our help article'], ['\\bNIC\\b', 'network adapter'], ['power management policy', 'power setting'], ['driver ring', 'update schedule']]
+  };
+  let tone = 'short';
+  const SD = { A: 'Outlook repeatedly prompts for password after reset – CFO laptop – board meeting 2pm', B: 'Finance S: drive access denied – whole department – month-end close blocked', C: 'Wi-Fi drops after sleep – single laptop (E. Hernandez) – wired workaround in use' };
+  const WHY_FIELDS = { caller: '#f-caller', contact: '#f-contact', category: '#f-category', sub: '#f-sub', ci: '#f-ci', impact: '#f-impact', urgency: '#f-urgency', group: '#f-group', rescode: '#f-rescode' };
+  let easy = true;
+  try { easy = localStorage.getItem('itsm:mode') !== 'standard'; } catch (e) { /* storage unavailable */ }
+
+  const STEPS = [
+    { title: 'Log the call', do: 'Set the caller, how they contacted you, the category and subcategory, and the configuration item (CI) that is actually affected.', tips: ['The CI is the thing that\'s broken, not the service the user mentions. It feeds trend reports and problem management.', 'Pick the most specific category: wrong categories send tickets to the wrong queue and skew reporting.'] },
+    { title: 'Write the short description', do: 'One line someone can scan in a queue: what is broken, who or where, and the impact.', tips: ['Pattern: <em>What – Who/Where – Impact</em>, e.g. "Outlook repeatedly prompts for password – CFO laptop – board meeting at 2pm".', 'Avoid "help", "issue", "not working", ALL CAPS and exclamation marks.'] },
+    { title: 'Write the description', do: 'Capture the facts from the call so nobody has to call the user again.', tips: ['Include: symptom, exact error text, when it started, scope, what still works or was tried, and business impact.', 'Facts, not guesses. Quote error messages exactly.'] },
+    { title: 'Prioritize', do: 'Set impact and urgency. Priority is calculated from the matrix.', tips: ['Impact = how many people/services are affected. Urgency = how quickly it hurts the business.', 'A VIP doesn\'t raise impact; a deadline raises urgency.'] },
+    { title: 'Assign and start work', do: 'Route the ticket to the team that can fix it, set the assignee if it\'s you, and move it to In Progress.', tips: ['Own it if the service desk can fix it: first-contact resolution is the best outcome.', 'If you escalate, post a handoff work note: summary and impact, what you already checked, suspected cause, and exactly what you need.'] },
+    { title: 'Document and communicate', do: 'Post a technical work note (internal) and an update to the caller (customer-visible).', tips: ['Work notes: what you checked → what you found → what you did. No greetings, never passwords.', 'Comments: plain language, no internal jargon or ticket IDs, and always say when the next update will be.'] },
+    { title: 'Resolve', do: 'Set the resolution code and write resolution notes, then move the ticket to Resolved.', tips: ['Notes = cause + fix + how you verified it (ideally confirmed by the user).', '"Solved (Work Around)" when the permanent fix is still pending, so problem management can follow up.'] },
+    { title: 'Link related records', do: 'Connect the ticket to what it relates to: knowledge, or the change that caused it.', tips: ['Search the knowledge base before writing a new article; duplicates rot.', 'Incidents caused by a change should reference it, so the change review sees the impact.', 'Knowledge articles are generic: no user names or personal data.'] }
+  ];
+
+  function createState(v) {
+    return { v, sc: SCEN[v], steps: STEPS.map(() => ({ passed: false, quality: 0, attempts: 0, results: null })), notes: [], kb: null, kbAttached: null, clock: 0, chat: SCEN[v].call.slice(), flags: {} };
+  }
+
+  // ---------- helpers
+  const has = (text, kws) => kws.some(k => String(text || '').toLowerCase().includes(k.toLowerCase()));
+  const val = id => ($(id).value || '').trim();
+  const prio = () => { const i = val('#f-impact'), u = val('#f-urgency'); return i && u ? MATRIX[i + u] : null; };
+  const pw = /(password\s*(is|:|=)\s*\S+|welcome#|p@ss|temp#)/i;
+  const clockStr = m => { const t = 9 * 60 + 12 + m; return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`; };
+  const STEP_MIN = [2, 1, 3, 1, 2, 15, 20, 5];
+
+  function evaluate(i, st) {
+    const sc = st.sc; const R = [];
+    const req = (ok, text) => R.push({ ok, text, req: true, w: 1 });
+    const opt = (ok, text, w) => R.push({ ok, text, req: false, w: w || 1 });
+    // In Easy mode a wrong dropdown says why, using the same explanation as its "Why?" link.
+    const why = (field, ok, text) => req(ok, ok || !easy || !val(WHY_FIELDS[field]) ? text : `${text}: ${GUIDE[sc.key].why[field][1]}`);
+    if (i === 0) {
+      why('caller', val('#f-caller') === sc.caller, 'Caller is the person who reported it');
+      why('contact', val('#f-contact') === 'Phone', 'Contact type matches how they reached you (phone call)');
+      why('category', val('#f-category') === sc.cat, `Category fits the issue${!easy && val('#f-category') && val('#f-category') !== sc.cat ? ' (look again at what is actually failing)' : ''}`);
+      why('sub', val('#f-sub') === sc.sub, 'Subcategory is the most specific match');
+      why('ci', val('#f-ci') === sc.ci, `CI is the affected item${easy ? '' : val('#f-ci') === 'Exchange Online' ? ' (webmail works, so the service is fine)' : val('#f-ci') === 'Corporate Wi-Fi (CONTOSO-CORP)' ? ' (only one user is affected, so the network itself is fine)' : ''}`);
+    }
+    if (i === 1) {
+      const s = val('#f-short');
+      req(s.length >= 20 && s.length <= 100, `Length 20–100 characters (now ${s.length})`);
+      req(!/^(help|issue|problem|not working|urgent|broken|error)\b/i.test(s) && !/^\W*(outlook|email|wifi|wi-fi|s drive|drive)\W*$/i.test(s), 'Not a generic placeholder ("help", "issue", "not working")');
+      req(has(s, sc.sdSubject), 'Names what is affected');
+      req(has(s, sc.sdSymptom), 'Says what is wrong');
+      opt(has(s, sc.sdScope), 'Mentions who/where (scope)', 2);
+      opt(!/!/.test(s) && !/\b[A-Z]{5,}\b/.test(s), 'No exclamation marks or shouting');
+    }
+    if (i === 2) {
+      const d = val('#f-desc');
+      const hit = sc.facts.filter(([, kws]) => has(d, kws));
+      req(d.length >= 80, `At least a few sentences (now ${d.length} characters)`);
+      req(hit.length >= 4, `Captures at least 4 of the 6 key facts (found ${hit.length})`);
+      sc.facts.forEach(([name, kws]) => opt(has(d, kws), `Includes ${name}`));
+      req(!pw.test(d), 'Contains no passwords');
+      GUIDE[sc.key].bad.forEach(([t, reason]) => { if (d.includes(t)) opt(false, `Leave out ${reason}: "${t}"`, 2); });
+    }
+    if (i === 3) {
+      const ip = val('#f-impact'), ur = val('#f-urgency');
+      why('impact', ip === sc.impact, `Impact reflects how many are affected${!easy && ip && ip !== sc.impact ? (sc.key === 'A' && ip !== '3' ? ' (a VIP is still one user)' : sc.key === 'B' ? ' (one department)' : ' (one user)') : ''}`);
+      why('urgency', ur === sc.urgency, `Urgency reflects business timing${!easy && ur && ur !== sc.urgency ? (sc.key === 'C' ? ' (she has a workaround and said no rush)' : ' (there\'s a deadline today)') : ''}`);
+      opt(true, `Calculated priority: P${prio() || '?'}`);
+    }
+    if (i === 4) {
+      why('group', val('#f-group') === sc.group, sc.group === 'Service Desk' ? 'Kept with the Service Desk (you can fix this yourself)' : 'Escalated to the team that owns the server permissions');
+      req(val('#f-state') === 'In Progress', 'State is In Progress');
+      if (sc.group === 'Service Desk') req(val('#f-assigned') === sc.assigned, 'Assigned to you, since you own it');
+      else {
+        req(val('#f-assigned') === '' || val('#f-assigned') === 'Marco Ibarra', 'Left for the server team to pick up (or assigned to their engineer)');
+        const h = st.notes.filter(n => n.t === 'wn').map(n => n.text).join('\n');
+        req(!!h, 'A handoff work note has been posted');
+        if (h && easy) WN[sc.key].forEach(r => r.bad.forEach(([t, reason]) => { if (h.includes(t)) opt(false, `Leave out ${reason}: "${t}"`, 2); }));
+        if (h) { const H = sc.handoff; req(has(h, H.scope), 'Handoff states scope/impact'); req(has(h, H.done), 'Handoff says what was already checked'); opt(has(h, H.cause), 'Handoff names the suspected cause', 2); req(has(h, H.ask), 'Handoff says exactly what you need'); }
+      }
+    }
+    if (i === 5) {
+      const wns = st.notes.filter(n => n.t === 'wn'), cms = st.notes.filter(n => n.t === 'ac');
+      req(wns.length > 0, 'At least one work note posted');
+      req(cms.length > 0, 'At least one customer comment posted');
+      const wn = wns.map(n => n.text).join('\n'), cm = cms.map(n => n.text).join('\n');
+      if (easy) [[WN, wn], [CM, cm]].forEach(([D, txt]) => D[sc.key].forEach(r => r.bad.forEach(([t, reason]) => { if (txt.includes(t)) opt(false, `Leave out ${reason}: "${t}"`, 2); })));
+      if (wns.length) { req(sc.wnKw.filter(k => has(wn, [k])).length >= 2, 'Work note records concrete technical findings'); opt(!/^\s*(hi|hello|dear)\b/i.test(wns[wns.length - 1].text), 'Work note has no greeting (it\'s internal)'); req(!pw.test(wn), 'Work notes contain no passwords'); }
+      if (cms.length) {
+        const last = cms[cms.length - 1].text;
+        req(last.length >= 60, 'Comment is a real update, not one word');
+        req(/(within|by \d|by \w+day|minutes|\bhour|today|tomorrow|this afternoon|update you|i'll|i will|next update|check (back|in))/i.test(last), 'Comment tells the caller when they\'ll hear back');
+        const j = sc.jargon.filter(k => new RegExp('(^|[^a-z0-9])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^a-z0-9])', 'i').test(last)); req(!j.length, j.length ? `Avoid internal jargon in customer comments (${j.join(', ')})` : 'No internal jargon');
+        req(!pw.test(cm), 'No passwords in customer comments');
+        opt(/(thank|thanks|sorry|appreciate)/i.test(last), 'Polite and human');
+      }
+    }
+    if (i === 6) {
+      const n = val('#f-resnotes');
+      req(val('#f-state') === 'Resolved', 'State is Resolved (use the Resolve button)');
+      if (easy) RN[sc.key].forEach(r => r.bad.forEach(([t, reason]) => { if (n.includes(t)) opt(false, `Leave out ${reason}: "${t}"`, 2); }));
+      why('rescode', val('#f-rescode') === sc.code, sc.code === 'Solved (Work Around)' ? 'Resolution code shows the permanent fix is still pending' : 'Resolution code matches the outcome');
+      req(has(n, sc.causeKw), 'Notes state the cause');
+      req(has(n, sc.fixKw), 'Notes state the fix');
+      req(/(confirmed|verified|tested|working)/i.test(n), 'Notes say how it was verified');
+      if (sc.pendingKw) req(has(n, sc.pendingKw), 'Notes say what the permanent fix is and when');
+      opt(/confirm/i.test(n), 'Caller confirmation recorded', 2);
+    }
+    if (i === 7) {
+      if (sc.link === 'kb-new') {
+        req(!!st.kb, 'A knowledge article draft was created');
+        if (st.kb) { req(st.kb.title.length >= 15, 'Article has a searchable title'); req(st.kb.symptoms.length >= 20 && st.kb.cause.length >= 15, 'Symptoms and cause are filled in'); req(st.kb.resolution.length >= 40, 'Resolution has real steps'); const all = Object.values(st.kb).join(' '); req(!/salinas|patricia/i.test(all), 'Article is generic (no user names)'); }
+      }
+      if (sc.link === 'caused-by') { req(val('#f-causedby').startsWith('CHG0031337'), '"Caused by change" points at the change that broke it'); opt(!st.kb, 'No unnecessary knowledge article (one-off change error)'); }
+      if (sc.link === 'kb-attach') { req(st.kbAttached === 'KB0010234', 'Existing article attached'); req(!st.kb, 'No duplicate article created'); }
+    }
+    const tot = R.reduce((a, r) => a + r.w, 0), got = R.filter(r => r.ok).reduce((a, r) => a + r.w, 0);
+    return { results: R, passed: R.filter(r => r.req).every(r => r.ok), raw: tot ? Math.round(got / tot * 100) : 100 };
+  }
+
+  // ---------- UI
+  let lab;
+  const S = () => lab.state;
+  function fillSelect(id, opts, keep) { const el = $(id); const cur = keep ? el.value : ''; el.innerHTML = '<option value="">— None —</option>' + opts.map(o => `<option>${esc(o)}</option>`).join(''); el.value = opts.includes(cur) ? cur : ''; }
+  $('#f-category').addEventListener('change', () => fillSelect('#f-sub', CATS[val('#f-category')] || [], false));
+  ['#f-impact', '#f-urgency'].forEach(id => $(id).addEventListener('change', () => { const p = prio(); $('#f-priority').value = p ? `${p} - ${['', 'Critical', 'High', 'Moderate', 'Low', 'Planning'][p]}` : ''; $('#prio-badge').textContent = p ? `P${p}` : 'Priority —'; $('#prio-badge').className = 'badge' + (p === 1 || p === 2 ? ' err' : p === 3 ? ' warn' : ''); }));
+  $('#itsm-tabs').addEventListener('click', e => { const b = e.target.closest('button[data-t]'); if (!b) return; $$('#itsm-tabs button').forEach(x => x.classList.toggle('active', x === b)); $$('[data-tp]').forEach(p => { p.hidden = p.dataset.tp !== b.dataset.t; }); });
+  function post(kind) {
+    const id = kind === 'wn' ? '#f-worknote' : '#f-comment'; const text = val(id); if (!text) return;
+    S().notes.push({ t: kind, text, at: clockStr(S().clock), by: 'Ruben de la Garza' }); $(id).value = '';
+    lab.touch(); lab.refresh();
+  }
+  $('#btn-worknote').addEventListener('click', () => post('wn'));
+  $('#btn-comment').addEventListener('click', () => post('ac'));
+  $('#btn-kbsearch').addEventListener('click', () => {
+    const q = val('#f-kbq').toLowerCase(); const st = S();
+    const hits = st.sc.kbSearch.filter(([, t]) => q && q.split(/\s+/).some(w => w.length > 2 && t.toLowerCase().includes(w)));
+    $('#kb-results').innerHTML = hits.length ? hits.map(([id, t]) => `<div class="row" style="gap:8px;margin-bottom:4px"><span class="mono">${id}</span><span style="flex:1">${esc(t)}${easy && id === 'KB0010234' ? ' <span class="badge ok">matches your incident</span>' : ''}</span><button type="button" class="ghost sm" data-attach="${id}" id="kb-attach-${id}">Attach</button></div>`).join('') : `<span class="muted">No articles match "${esc(val('#f-kbq'))}".${easy ? ' Try the symptom words (what fails and when). If nothing exists, create a new article or link the related record.' : ''}</span>`;
+    st.flags.kbSearched = true;
+  });
+  $('#kb-results').addEventListener('click', e => { const b = e.target.closest('button[data-attach]'); if (!b) return; S().kbAttached = b.dataset.attach; lab.touch(); lab.refresh(); });
+  $('#btn-kbnew').addEventListener('click', () => { $('#kb-form').hidden = false; });
+  $('#btn-kbsave').addEventListener('click', () => { S().kb = { title: val('#kb-title'), symptoms: val('#kb-symptoms'), cause: val('#kb-cause'), resolution: val('#kb-resolution') }; $('#kb-form').hidden = true; lab.touch(); lab.refresh(); });
+
+  // ---------- Easy-mode helpers
+  const shuffle = a => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(x => x[1]);
+  const fieldBox = id => $(id).closest('div');
+  // "Why?" links beside each dropdown label
+  Object.entries(WHY_FIELDS).forEach(([k, id]) => {
+    const lbl = document.querySelector(`label[for="${id.slice(1)}"]`);
+    lbl.insertAdjacentHTML('beforeend', ` <button type="button" class="why easy-only" data-why="${k}" id="why-${k}">Why?</button>`);
+    fieldBox(id).insertAdjacentHTML('beforeend', `<div class="why-text" id="whyt-${k}" hidden></div>`);
+  });
+  document.addEventListener('click', e => {
+    const b = e.target.closest('button[data-why]'); if (!b) return;
+    const [idx, text] = GUIDE[S().sc.key].why[b.dataset.why]; const box = $('#whyt-' + b.dataset.why);
+    box.hidden = !box.hidden; box.textContent = text;
+    $$('#chat .msg').forEach((m, j) => m.classList.toggle('hl', !box.hidden && j === idx));
+  });
+  // Priority matrix (impact rows × urgency columns)
+  fieldBox('#f-urgency').insertAdjacentHTML('afterend', '<div class="full easy-only" id="prio-matrix"></div>');
+  function renderMatrix() {
+    const i = val('#f-impact'), u = val('#f-urgency'); const lab3 = ['', 'High', 'Medium', 'Low'];
+    $('#prio-matrix').innerHTML = `<table class="prio-matrix"><thead><tr><th>Impact ↓ · Urgency →</th>${[1, 2, 3].map(c => `<th>${c} ${lab3[c]}</th>`).join('')}</tr></thead><tbody>${[1, 2, 3].map(r => `<tr><th>${r} ${lab3[r]}</th>${[1, 2, 3].map(c => `<td class="${String(r) === i && String(c) === u ? 'on' : ''}">P${MATRIX[r + '' + c]}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  }
+  ['#f-impact', '#f-urgency'].forEach(id => $(id).addEventListener('change', renderMatrix));
+  // Short description builder
+  fieldBox('#f-short').insertAdjacentHTML('afterbegin', '<div class="picker easy-only" id="sd-picker"><div class="picker-head">Build it: <b>What</b> – <b>Who/where</b> – <b>Impact</b></div><div class="picker-row"><select id="sd-what" aria-label="What is broken"></select><select id="sd-who" aria-label="Who or where"></select><select id="sd-impact" aria-label="Impact"></select></div></div>');
+  ['#sd-what', '#sd-who', '#sd-impact'].forEach(id => $(id).addEventListener('change', () => { $('#f-short').value = ['#sd-what', '#sd-who', '#sd-impact'].map(val).filter(Boolean).join(' – '); }));
+  // Description fact picker
+  fieldBox('#f-desc').insertAdjacentHTML('afterbegin', '<div class="picker easy-only" id="desc-picker"><div class="picker-head">Pick the facts from the call that belong in the ticket, then insert them.</div><div id="desc-facts" class="check-list"></div><button type="button" class="ghost sm" id="btn-insert-facts">Insert selected</button></div>');
+  $('#btn-insert-facts').addEventListener('click', () => { const picked = $$('#desc-facts input:checked').map(x => x.value); if (!picked.length) return; const cur = val('#f-desc'); $('#f-desc').value = (cur ? cur + ' ' : '') + picked.join(' '); $$('#desc-facts input').forEach(x => { x.checked = false; }); });
+  // Templates for the long text fields
+  const TEMPLATES = {
+  };
+  Object.keys(TEMPLATES).forEach(id => { const lbl = document.querySelector(`label[for="${id.slice(1)}"]`); lbl.insertAdjacentHTML('beforeend', ` <button type="button" class="why easy-only" data-tpl="${id}" id="tpl-${id.slice(3)}">Insert template</button>`); });
+  document.addEventListener('click', e => { const b = e.target.closest('button[data-tpl]'); if (!b) return; const el = $(b.dataset.tpl); const t = TEMPLATES[b.dataset.tpl](); el.value = el.value.trim() ? el.value.trimEnd() + '\n' + t : t; el.focus(); });
+  // Knowledge base search chips
+  $('#kb-results').insertAdjacentHTML('beforebegin', '<div class="chips easy-only" id="kb-chips"></div>');
+  $('#kb-chips').addEventListener('click', e => { const b = e.target.closest('button[data-chip]'); if (!b) return; $('#f-kbq').value = b.dataset.chip; $('#btn-kbsearch').click(); });
+  // Step 5/6 builders: work note (or handoff) and customer comment
+  const goodText = (r, t) => (typeof r.good === 'string' ? r.good : r.good[t || tone]);
+  const optText = (r, key) => (key === 'g' ? goodText(r) : key && key[0] === 'b' ? r.bad[+key.slice(1)][0] : '');
+  $('#f-worknote').closest('div').insertAdjacentHTML('afterbegin', '<div class="picker easy-only" id="wn-picker"><div class="picker-head" id="wn-head">Build the note: pick one option per row.</div><div id="wn-rows" class="builder"></div></div>');
+  $('#f-worknote').insertAdjacentHTML('afterend', '<ul class="live-check easy-only" id="wn-live"></ul>');
+  $('#f-comment').closest('div').insertAdjacentHTML('afterbegin', '<div class="picker easy-only" id="cm-picker"><div class="picker-head row space-between"><span>Build the update: pick one option per row.</span><span class="tone" role="radiogroup" aria-label="Tone"><label><input type="radio" name="tone" id="tone-short" value="short" checked /> Short</label><label><input type="radio" name="tone" id="tone-warm" value="warm" /> Reassuring</label></span></div><div id="cm-rows" class="builder"></div></div>');
+  $('#f-comment').insertAdjacentHTML('afterend', '<ul class="live-check easy-only" id="cm-live"></ul><div class="easy-only" id="cm-swaps"></div><div class="mail-preview easy-only"><div class="mail-head">What the caller sees</div><div id="cm-preview"></div></div>');
+  function rowsHtml(prefix, rows) {
+    return rows.map((r, j) => { const opts = [['g', goodText(r)]].concat(r.bad.map(([t], k) => ['b' + k, t])); return `<label for="${prefix}-r${j}">${esc(r.label)}</label><select id="${prefix}-r${j}" data-row="${j}"><option value="">— Choose —</option>${shuffle(opts).map(([k, t]) => `<option value="${k}">${esc(t)}</option>`).join('')}${r.empty ? '<option value="e">(leave out)</option>' : ''}</select>`; }).join('');
+  }
+  function compose(prefix, rows, target) { $(target).value = rows.map((r, j) => optText(r, val(`#${prefix}-r${j}`))).filter(Boolean).join(' '); liveChecks(); }
+  $('#wn-rows').addEventListener('change', () => compose('wn', WN[S().sc.key], '#f-worknote'));
+  $('#cm-rows').addEventListener('change', () => compose('cm', CM[S().sc.key], '#f-comment'));
+  $$('[name="tone"]').forEach(r => r.addEventListener('change', () => {
+    tone = r.value; const rows = CM[S().sc.key];
+    rows.forEach((row, j) => { const sel = $(`#cm-r${j}`); const g = sel.querySelector('option[value="g"]'); if (g) g.textContent = goodText(row); });
+    if (rows.some((row, j) => val(`#cm-r${j}`))) compose('cm', rows, '#f-comment');
+  }));
+  ['#f-worknote', '#f-comment'].forEach(id => $(id).addEventListener('input', liveChecks));
+  const jargonHits = (text, key) => SWAPS[key].filter(([re]) => new RegExp(re, 'i').test(text));
+  function liveChecks() {
+    if (!lab) return; const st = S(); const sc = st.sc; const wn = $('#f-worknote').value, cm = $('#f-comment').value;
+    const li = (ok, t) => `<li class="${ok ? 'pass' : 'fail'}">${ok ? '✓' : '○'} ${t}</li>`;
+    const handoffDone = sc.handoff && st.steps[4].passed;
+    let w;
+    if (handoffDone) w = li(true, 'Your step 5 handoff counts as the work note for this step.');
+    else if (sc.handoff) w = [li(has(wn, sc.handoff.scope), 'States scope and impact'), li(has(wn, sc.handoff.done), 'Says what was already checked'), li(has(wn, sc.handoff.cause), 'Names the suspected cause (quality)'), li(has(wn, sc.handoff.ask), 'Says exactly what you need'), li(!!wn.trim() && !/^\s*(hi|hello|dear)\b/i.test(wn), 'No greeting (internal note)'), li(!!wn.trim() && !pw.test(wn), 'No passwords')].join('');
+    else w = [li(sc.wnKw.filter(k => has(wn, [k])).length >= 2, 'Concrete technical findings'), li(!!wn.trim() && !/^\s*(hi|hello|dear)\b/i.test(wn), 'No greeting (internal note)'), li(!!wn.trim() && !pw.test(wn), 'No passwords')].join('');
+    $('#wn-live').innerHTML = w;
+    const rn = $('#f-resnotes').value; $('#rn-live').innerHTML = rnChecks().map(([ok, t]) => li(ok && !!rn.trim(), t)).join('');
+    const jh = jargonHits(cm, sc.key);
+    $('#cm-live').innerHTML = [li(cm.trim().length >= 60, 'A real update (60+ characters)'), li(/(within|by \d|by \w+day|minutes|\bhour|today|tomorrow|this afternoon|update you|i'll|i will|next update|check (back|in))/i.test(cm), 'Says when they\'ll hear back'), li(!!cm.trim() && !jh.length, 'No internal jargon'), li(!!cm.trim() && !pw.test(cm), 'No passwords'), li(/(thank|thanks|sorry|appreciate)/i.test(cm), 'Polite and human (quality)')].join('');
+    $('#cm-swaps').innerHTML = jh.length ? '<span class="muted" style="font-size:12px">Plain-language swaps:</span> ' + jh.map(([re, plain], k) => `<button type="button" class="chip" data-swap="${k}" id="swap-${k}">${esc(cm.match(new RegExp(re, 'i'))[0])} → ${esc(plain)}</button>`).join(' ') : '';
+    let body = esc(cm.trim()); jh.forEach(([re]) => { body = body.replace(new RegExp(re, 'gi'), m => `<mark>${m}</mark>`); });
+    $('#cm-preview').innerHTML = `<div class="mail-meta">From: IT Service Desk · To: ${esc(sc.caller.replace(/ \(.*/, ''))}</div>${body ? body.replace(/\n/g, '<br>') : '<span class="muted">Your comment will appear here, exactly as the caller reads it. Work notes never do.</span>'}`;
+  }
+  $('#cm-swaps').addEventListener('click', e => { const b = e.target.closest('button[data-swap]'); if (!b) return; const [re, plain] = jargonHits($('#f-comment').value, S().sc.key)[+b.dataset.swap]; $('#f-comment').value = $('#f-comment').value.replace(new RegExp(re, 'gi'), plain); liveChecks(); });
+  // Step 7: resolution code helper, notes builder, reuse, live checklist, Resolve button
+  $('#f-rescode').insertAdjacentHTML('afterend', '<div class="picker easy-only" id="code-helper" style="margin-top:6px"><div class="picker-head">Is the underlying cause permanently removed?</div><div class="row" style="gap:6px"><button type="button" class="ghost sm" id="code-yes">Yes</button><button type="button" class="ghost sm" id="code-no">No, a workaround is in place</button></div><div id="code-why" class="muted" style="margin-top:6px"></div></div>');
+  const setCode = (code, why) => { $('#f-rescode').value = code; $('#code-why').textContent = why; };
+  $('#code-yes').addEventListener('click', () => setCode('Solved (Permanently)', 'Solved (Permanently): the cause is gone, so nothing needs follow-up.'));
+  $('#code-no').addEventListener('click', () => setCode('Solved (Work Around)', 'Solved (Work Around): the user can work, but problem management follows up until the permanent fix lands.'));
+  $('#f-resnotes').closest('div').insertAdjacentHTML('afterbegin', '<div class="picker easy-only" id="rn-picker"><div class="picker-head row space-between"><span>Build the notes: cause → fix → verification. <button type="button" class="why" id="rn-confirm-hint">Where is the confirmation?</button></span><button type="button" class="ghost sm" id="btn-reuse">Reuse from my work note</button></div><div id="rn-rows" class="builder"></div><div id="rn-msg" class="muted" style="margin-top:4px"></div></div>');
+  $('#f-resnotes').insertAdjacentHTML('afterend', '<ul class="live-check easy-only" id="rn-live"></ul>');
+  $('#rn-rows').addEventListener('change', () => compose('rn', RN[S().sc.key], '#f-resnotes'));
+  $('#f-resnotes').addEventListener('input', liveChecks);
+  $('#rn-confirm-hint').addEventListener('click', () => {
+    const msgs = $$('#chat .msg'); const confirmed = S().chat.length > S().sc.call.length;
+    msgs.forEach((m, j) => m.classList.toggle('hl', confirmed && j === msgs.length - 1));
+    $('#rn-msg').textContent = confirmed ? 'The caller\'s last message (highlighted) confirms it works: record that in the Caller confirmation row.' : 'The caller confirms after your update in step 6.';
+  });
+  $('#btn-reuse').addEventListener('click', () => {
+    const st = S(); const sc = st.sc; const wn = st.notes.filter(n => n.t === 'wn').map(n => n.text).join('\n');
+    const got = [];
+    if (has(wn, sc.causeKw)) { $('#rn-r0').value = 'g'; got.push('cause'); }
+    if (has(wn, sc.fixKw)) { $('#rn-r1').value = 'g'; got.push('fix'); }
+    $('#rn-msg').textContent = got.length ? `Picked the ${got.join(' and ')} from your work notes. Add how it was verified.` : 'Your work notes don\'t state a cause or fix yet, so pick them below.';
+    if (got.length) compose('rn', RN[sc.key], '#f-resnotes');
+  });
+  function rnChecks() {
+    const sc = S().sc; const n = $('#f-resnotes').value;
+    const c = [[has(n, sc.causeKw), 'Cause'], [has(n, sc.fixKw), 'Fix'], [/(confirmed|verified|tested|working)/i.test(n), 'How it was verified']];
+    if (sc.pendingKw) c.push([has(n, sc.pendingKw), 'Permanent fix and when']);
+    c.push([/confirm/i.test(n), 'Caller confirmation (quality)']);
+    return c;
+  }
+  $('#btn-resolve').addEventListener('click', () => {
+    const m = (t, c) => { $('#resolve-msg').textContent = t; $('#resolve-msg').className = 'inline-msg ' + c; };
+    if (!val('#f-rescode')) return m('Choose a resolution code first.', 'err');
+    if (!val('#f-resnotes')) return m('Resolution notes are required to resolve.', 'err');
+    if (easy) { const miss = rnChecks().filter(([ok, t]) => !ok && !/quality/.test(t)).map(([, t]) => t.toLowerCase()); if (miss.length) return m(`Add to the notes: ${miss.join(', ')}.`, 'err'); }
+    const el = $('#f-state'); el.value = 'Resolved'; el.dispatchEvent(new Event('change', { bubbles: true }));
+    m(`State set to Resolved. Press "Check step ${currentStep(S()) + 1}".`, 'ok');
+  });
+
+  function buildBuilders(st) {
+    const k = st.sc.key; tone = 'short'; $('#tone-short').checked = true;
+    $('#wn-head').textContent = st.sc.handoff ? 'Build the handoff for the server team: pick one option per row.' : 'Build the note: pick one option per row.';
+    $('#rn-rows').innerHTML = rowsHtml('rn', RN[k]); $('#rn-msg').textContent = ''; $('#code-why').textContent = ''; $('#resolve-msg').textContent = '';
+    $('#wn-rows').innerHTML = rowsHtml('wn', WN[k]); $('#cm-rows').innerHTML = rowsHtml('cm', CM[k]); liveChecks();
+  }
+
+  function buildPickers(st) {
+    const g = GUIDE[st.sc.key];
+    ['what', 'who', 'impact'].forEach(k => { $('#sd-' + k).innerHTML = `<option value="">— ${k === 'who' ? 'Who/where' : k[0].toUpperCase() + k.slice(1)} —</option>` + shuffle(g.sd[k]).map(o => `<option>${esc(o)}</option>`).join(''); });
+    const facts = g.facts.map((t, j) => ({ t, id: 'fact-g' + j })).concat(g.bad.map(([t], j) => ({ t, id: 'fact-b' + j })));
+    $('#desc-facts').innerHTML = shuffle(facts).map(f => `<label><input type="checkbox" id="${f.id}" value="${esc(f.t)}" /> ${esc(f.t)}</label>`).join('');
+    $('#kb-chips').innerHTML = '<span class="muted">Try:</span> ' + g.chips.map((c, j) => `<button type="button" class="chip" data-chip="${esc(c)}" id="kbchip-${j}">${esc(c)}</button>`).join('');
+    $$('.why-text').forEach(x => { x.hidden = true; });
+  }
+  function applyMode() {
+    document.body.classList.toggle('itsm-easy', easy);
+    $('#mode-easy').classList.toggle('active', easy); $('#mode-std').classList.toggle('active', !easy);
+    $('#mode-easy').setAttribute('aria-pressed', easy); $('#mode-std').setAttribute('aria-pressed', !easy);
+  }
+  [['#mode-easy', true], ['#mode-std', false]].forEach(([id, m]) => $(id).addEventListener('click', () => { if (lab.playing) return; easy = m; try { localStorage.setItem('itsm:mode', m ? 'easy' : 'standard'); } catch (e) { /* ignore */ } applyMode(); lab.refresh(); }));
+  // Model answers, shown for a step once it has passed
+  const DESC_MODEL = k => ({ A: 'Since changing her password this morning, Outlook on the user\'s laptop repeatedly prompts "Enter password for patricia.salinas@contoso.com". Entering the new password works briefly, then the prompt returns about a minute later. Webmail on her phone works fine. Only this user is affected; no one else on her team. Business impact: she needs Outlook on the laptop for the board meeting at 2pm today.', B: 'Since about 8:30 this morning, Finance users cannot open the S: drive (\\\\fs01\\finance). Error: "\\\\fs01\\finance is not accessible. You might not have permission to use this network resource. Access is denied." Scope: the whole Finance department (~40 users); other drives and internet work. Business impact: month-end close numbers are due by 5pm today.', C: 'The user\'s laptop loses the office Wi-Fi every time it wakes from sleep and shows "No internet" until Wi-Fi is toggled off and on. Started after last week\'s updates. Only this user is affected; her colleagues are fine. Workaround: she uses the network cable at her desk. Low impact: she can work and said there is no rush.' }[k]);
+  function model(j, sc) {
+    return [
+      `Caller: ${sc.caller} · Contact type: Phone · ${sc.cat} / ${sc.sub} · CI: ${sc.ci}`,
+      SD[sc.key],
+      DESC_MODEL(sc.key),
+      `Impact ${sc.impact}, urgency ${sc.urgency} → P${MATRIX[sc.impact + sc.urgency]}.`,
+      sc.handoff ? `Assignment group: ${sc.group} (no assignee), State: In Progress. Handoff work note:\n${sc.worknote}` : `Assignment group: ${sc.group}, assigned to ${sc.assigned}, State: In Progress.`,
+      (sc.handoff ? '' : `Work note:\n${sc.worknote}\n\n`) + `Customer comment:\n${sc.comment}`,
+      `Resolution code: ${sc.code}\n${sc.resnotes}`,
+      { 'kb-new': 'Searched first (nothing found), then created a generic article: "Outlook keeps prompting for password after a password change", with symptoms, cause and numbered steps.', 'caused-by': 'Caused by change: CHG0031337 · FS01 share permission cleanup (Nov 19). No knowledge article: a one-off change error.', 'kb-attach': 'Searched "Wi-Fi sleep" and attached KB0010234 instead of writing a duplicate.' }[sc.link]
+    ][j];
+  }
+
+  function currentStep(st) { return st.steps.findIndex(s => !s.passed); }
+  function validate() {
+    const st = S(); const i = currentStep(st); if (i < 0) return;
+    const r = evaluate(i, st); const s = st.steps[i];
+    s.attempts++; s.results = r.results;
+    if (r.passed) {
+      s.passed = true; s.quality = Math.max(50, r.raw - 5 * (s.attempts - 1));
+      st.clock += STEP_MIN[i];
+      if (i === 5) {
+        if (st.sc.serverNote) st.notes.push({ t: 'wn', text: st.sc.serverNote, at: clockStr(st.clock + 25), by: 'Marco Ibarra' });
+        st.chat.push(st.sc.after6);
+      }
+    }
+    lab.touch(); lab.refresh();
+  }
+  const modelHtml = (j, st) => `<details class="model"><summary>Step ${j + 1} passed: compare with a model answer</summary><div>${esc(model(j, st.sc))}</div></details>`;
+  function renderCoach(st) {
+    const i = currentStep(st);
+    if (i < 0) { $('#coach').innerHTML = modelHtml(7, st) + '<h4>All steps complete</h4><p style="font-size:13px;margin:0">The ticket is documented end to end. See the debrief below for your quality score per step.</p>'; return; }
+    const s = STEPS[i]; const res = st.steps[i].results;
+    $('#coach').innerHTML = `${i > 0 ? modelHtml(i - 1, st) : ''}<h4>Step ${i + 1} of 8 · ${s.title}${easy ? ' <span class="badge">Easy</span>' : ''}</h4><p style="font-size:13px;margin:0 0 6px">${s.do}</p><ul>${s.tips.map(t => `<li>${t}</li>`).join('')}</ul>
+      ${res ? `<div class="mt-16" style="font-size:13px"><strong>Last check</strong><ul class="res">${res.map(r => `<li class="${r.ok ? 'pass' : 'fail'}">${r.ok ? '✓' : '✗'} ${esc(r.text)}${r.req ? '' : ' <span class="muted">(quality)</span>'}</li>`).join('')}</ul></div>` : ''}
+      <button type="button" class="sm mt-16" id="btn-validate">Check step ${i + 1}</button>`;
+    $('#btn-validate').addEventListener('click', validate);
+  }
+  function render(st) {
+    renderCoach(st); renderMatrix(); liveChecks();
+    $('#activity').innerHTML = st.notes.length ? st.notes.slice().reverse().map(n => `<div class="ent ${n.t}"><div class="meta">${n.t === 'wn' ? 'Work note' : 'Additional comment (customer visible)'} · ${esc(n.by)} · ${n.at}</div>${esc(n.text)}</div>`).join('') : '<span class="muted" style="font-size:13px">No activity yet.</span>';
+    $('#chat').innerHTML = st.chat.map(([who, t]) => `<div class="msg"><b>${esc(who)}</b>${esc(t)}</div>`).join('');
+    $('#kb-attached').textContent = (st.kbAttached ? `Attached ${st.kbAttached}. ` : '') + (st.kb ? `Draft: "${st.kb.title}"` : '');
+    const p = prio(); const passed4 = st.steps[4].passed;
+    $('#sla').textContent = `Opened 09:12 · now ${clockStr(st.clock)}` + (p ? ` · SLA (P${p}): respond ${SLA[p][0]}, resolve ${SLA[p][1]}` : '') + (passed4 ? ' · response met ✓' : '');
+  }
+  function onReset(st) {
+    $('#inc-num').textContent = st.sc.inc;
+    fillSelect('#f-caller', CALLERS); fillSelect('#f-category', Object.keys(CATS)); fillSelect('#f-sub', []); fillSelect('#f-ci', CIS);
+    ['#f-contact', '#f-impact', '#f-urgency', '#f-group', '#f-assigned', '#f-rescode', '#f-causedby'].forEach(id => { $(id).value = ''; });
+    $('#f-state').value = 'New';
+    ['#f-short', '#f-desc', '#f-worknote', '#f-comment', '#f-resnotes', '#f-kbq', '#kb-title', '#kb-symptoms', '#kb-cause', '#kb-resolution', '#f-priority'].forEach(id => { $(id).value = ''; });
+    $('#kb-results').innerHTML = ''; $('#kb-form').hidden = true; $('#prio-badge').textContent = 'Priority —'; $('#prio-badge').className = 'badge';
+    $('#itsm-tabs button').click();
+    buildPickers(st); buildBuilders(st); applyMode(); renderMatrix();
+  }
+
+  lab = Lab({
+    id: 'itsm-ticket-lab', variants: 3, terminal: null, sequential: true,
+    createState, onReset, render,
+    hintPrice: level => (easy ? 0 : [2, 5, 10][level] || 10),
+    score: st => { const done = st.steps.filter(s => s.passed); return done.length ? done.reduce((a, s) => a + s.quality, 0) / done.length : 100; },
+    objectives: STEPS.map((s, i) => ({
+      text: s.title,
+      check: st => st.steps[i].passed || (st.steps[i].results ? 'The last check found issues: see the coach panel.' : 'Not checked yet.'),
+      hints: [
+        ['Read the caller conversation: who called, how, and what exactly is failing?', 'Use what the caller says works to rule services in or out.', 'Look for the correct CI: if only one person is affected, it\'s usually their device.'][Math.min(i, 2)] || 'Re-read the coach tips for this step.',
+        'The coach lists each check after you press Check: fix the ✗ items first.',
+        'Example answers are what "Watch solution" types. Watching gives no score, so try once more first.'
+      ]
+    })),
+    solution(st) {
+      const sc = st.sc; const steps = [];
+      const check = note => ({ note, run: api => api.click('#btn-validate'), wait: 600 });
+      const tab = t => ({ run: api => api.click(`#itsm-tabs button[data-t="${t}"]`) });
+      steps.push({ note: 'Step 1: log who called, how, and what is really affected.', run: api => api.fill('#f-caller', sc.caller) });
+      steps.push({ run: api => api.fill('#f-contact', 'Phone') }, { run: api => api.fill('#f-category', sc.cat) }, { run: api => api.fill('#f-sub', sc.sub) }, { run: api => api.fill('#f-ci', sc.ci) });
+      steps.push(check(`The CI is ${sc.ci}${sc.key === 'A' ? ': webmail works, so Exchange Online is fine and the problem is on her laptop' : sc.key === 'C' ? ': only her laptop is affected, not the Wi-Fi network' : ''}.`));
+      const g = GUIDE[sc.key];
+      if (easy) steps.push({ note: 'Step 2: what – who/where – impact, in one scannable line. Pick the specific option in each part.', run: api => api.fill('#sd-what', g.sd.what[0]) }, { run: api => api.fill('#sd-who', g.sd.who[0]) }, { run: api => api.fill('#sd-impact', g.sd.impact[0]) }, check());
+      else steps.push({ note: 'Step 2: what – who/where – impact, in one scannable line.', run: api => api.fill('#f-short', SD[sc.key]) }, check());
+      const desc = {
+        A: 'Since changing her password this morning, Outlook on the user\'s laptop repeatedly prompts "Enter password for patricia.salinas@contoso.com". Entering the new password works briefly, then the prompt returns about a minute later. Webmail on her phone works fine. Only this user is affected; no one else on her team. Business impact: she needs Outlook on the laptop for the board meeting at 2pm today.',
+        B: 'Since about 8:30 this morning, Finance users cannot open the S: drive (\\\\fs01\\finance). Error: "\\\\fs01\\finance is not accessible. You might not have permission to use this network resource. Access is denied." Scope: the whole Finance department (~40 users); other drives and internet work. Business impact: month-end close numbers are due by 5pm today.',
+        C: 'The user\'s laptop loses the office Wi-Fi every time it wakes from sleep and shows "No internet" until Wi-Fi is toggled off and on. Started after last week\'s updates. Only this user is affected; her colleagues are fine. Workaround: she uses the network cable at her desk. Low impact: she can work and said there is no rush.'
+      }[sc.key];
+      if (easy) {
+        steps.push({ note: 'Step 3: tick the six facts (symptom, exact error, when, scope, what works, impact). Leave out guesses, opinions and passwords.', run: api => api.check('#fact-g0', true) });
+        for (let j = 1; j < g.facts.length; j++) steps.push({ run: api => api.check('#fact-g' + j, true) });
+        steps.push({ run: api => api.click('#btn-insert-facts') }, check());
+      } else steps.push({ note: 'Step 3: the facts from the call, so nobody has to call her back.', run: api => api.fill('#f-desc', desc) }, check());
+      steps.push({ note: `Step 4: impact ${sc.impact}, urgency ${sc.urgency} → P${MATRIX[sc.impact + sc.urgency]}.${sc.key === 'A' ? ' A VIP is still one user; the 2pm deadline raises urgency.' : ''}`, run: api => api.fill('#f-impact', sc.impact) }, { run: api => api.fill('#f-urgency', sc.urgency) }, check());
+      steps.push({ note: sc.group === 'Service Desk' ? 'Step 5: the service desk can fix this, so own it.' : 'Step 5: server ACLs belong to the Windows Server Team, so escalate with a complete handoff.', run: api => api.fill('#f-group', sc.group) });
+      if (sc.assigned) steps.push({ run: api => api.fill('#f-assigned', sc.assigned) });
+      steps.push({ run: api => api.fill('#f-state', 'In Progress') });
+      const pickRows = (prefix, n) => Array.from({ length: n }, (_, j) => ({ run: api => api.fill(`#${prefix}-r${j}`, 'g') }));
+      if (sc.handoff) { if (easy) steps.push(...pickRows('wn', WN.B.length), { run: api => api.click('#btn-worknote') }); else steps.push({ run: api => api.fill('#f-worknote', sc.worknote) }, { run: api => api.click('#btn-worknote') }); }
+      steps.push(check());
+      if (easy) {
+        if (!sc.handoff) steps.push({ note: 'Step 6: internal work note with the technical trail: checked, found, did, next. No greeting.', run: api => api.click('#itsm-tabs button[data-t="notes"]') }, ...pickRows('wn', WN[sc.key].length), { run: api => api.click('#btn-worknote') });
+        steps.push({ note: '…and a plain-language update for the caller. Reassuring tone for a caller under pressure; always say when the next update is.', run: api => api.check('#tone-warm', true) }, ...pickRows('cm', CM[sc.key].length), { run: api => api.click('#btn-comment') }, check());
+      } else {
+        if (!sc.handoff) steps.push({ note: 'Step 6: internal work note with the technical trail…', run: api => api.fill('#f-worknote', sc.worknote) }, { run: api => api.click('#btn-worknote') });
+        steps.push({ note: '…and a plain-language update for the caller, with a time for the next update.', run: api => api.fill('#f-comment', sc.comment) }, { run: api => api.click('#btn-comment') }, check());
+      }
+      steps.push({ note: 'Step 7: cause + fix + verification. The caller has confirmed it works.', run: async api => { await api.click('#itsm-tabs button[data-t="res"]'); } });
+      if (easy) {
+        steps.push({ run: api => api.click(sc.code === 'Solved (Work Around)' ? '#code-no' : '#code-yes'), note: sc.code === 'Solved (Work Around)' ? 'The permanent driver fix is still pending, so this is a workaround.' : 'The cause is gone for good: solved permanently.' });
+        steps.push({ run: api => api.click('#btn-reuse'), note: 'Reuse the cause and fix from the work notes, then add verification and the caller\'s confirmation.' }, ...RN[sc.key].map((r, j) => ({ run: api => api.fill(`#rn-r${j}`, 'g') })));
+      } else steps.push({ run: api => api.fill('#f-rescode', sc.code) }, { run: api => api.fill('#f-resnotes', sc.resnotes) });
+      steps.push({ run: api => api.click('#btn-resolve'), note: 'Resolve sets the State once the code and notes are in.' }, check());
+      steps.push(tab('rel'));
+      if (sc.link === 'kb-new') {
+        steps.push({ note: 'Step 8: nothing in the knowledge base yet, so write a generic article (no names).', run: api => api.fill('#f-kbq', 'Outlook password prompt') }, { run: api => api.click('#btn-kbsearch') }, { run: api => api.click('#btn-kbnew') });
+        steps.push({ run: api => api.fill('#kb-title', 'Outlook keeps prompting for password after a password change') }, { run: api => api.fill('#kb-symptoms', 'After a password change, Outlook repeatedly asks for the password even though webmail works.') }, { run: api => api.fill('#kb-cause', 'Windows Credential Manager still holds the old cached credential.') }, { run: api => api.fill('#kb-resolution', '1. Close Outlook. 2. Open Credential Manager > Windows Credentials. 3. Remove entries starting with MicrosoftOffice16_Data. 4. Reopen Outlook and sign in with the new password.') }, { run: api => api.click('#btn-kbsave') });
+      }
+      if (sc.link === 'caused-by') steps.push({ note: 'Step 8: link the change that caused it, so its review sees the impact.', run: api => api.fill('#f-causedby', 'CHG0031337 · FS01 share permission cleanup (Nov 19)') });
+      if (sc.link === 'kb-attach') steps.push(easy ? { note: 'Step 8: search first. There\'s already an article, so attach it instead of writing a duplicate.', run: api => api.click('#kbchip-0') } : { note: 'Step 8: search first. There\'s already an article, so attach it instead of writing a duplicate.', run: async api => { await api.fill('#f-kbq', 'Wi-Fi sleep'); await api.click('#btn-kbsearch'); } }, { run: api => api.click('#kb-attach-KB0010234') });
+      steps.push(check());
+      return steps;
+    },
+    debrief: [
+      { title: 'Classification feeds everything downstream', text: 'Category and CI drive routing, SLA reports and problem management. "Exchange Online" for a single laptop\'s cached credential would have pointed a trend report at the wrong service.' },
+      { title: 'A short description is a queue headline', text: 'What, who/where and impact let a dispatcher triage without opening the ticket. "Outlook not working!!!" can\'t be prioritized.' },
+      { title: 'Impact × urgency, not volume or rank', text: 'The CFO\'s laptop is still one user (impact 3); her deadline makes it urgent. A whole department at month-end is P2; a single user with a workaround is P5. The matrix keeps that consistent across agents.' },
+      { title: 'Handoffs that don\'t bounce', text: 'Scope, what\'s already checked, suspected cause and a specific ask let the next team act immediately instead of re-triaging or calling the user again.' },
+      { title: 'Two audiences, two voices', text: 'Work notes are a technical trail for IT. Comments are for the user: plain language, no ticket IDs or jargon, and always a time for the next update.' },
+      { title: 'Close the loop with knowledge', text: 'Resolution notes record cause, fix and verification. Linking the change or the right knowledge article (instead of a duplicate) is what turns one ticket into fewer future tickets.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

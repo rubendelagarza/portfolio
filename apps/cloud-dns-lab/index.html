@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Migrate a zone to Cloud DNS and enable DNSSEC — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 07</div>
+    <h1>Lab: Migrate a zone to Cloud DNS and enable DNSSEC</h1>
+    <p>Move contoso-shop.com off its legacy DNS host with zero downtime. Fix a broken zone export, lock down certificate issuance with CAA, verify Cloud DNS before cutover, switch the delegation, then sign the zone and publish the DS record in the right order.</p>
+    <div class="lab-meta"><span class="pill">Advanced</span><span class="pill">~12 min</span><span class="pill">gcloud · dig · registrar</span><span class="pill">3 randomized zone exports</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> operating Cloud DNS, including DNSSEC: zone-file hygiene, CAA, pre-cutover verification and the DNSSEC chain of trust, where the order of steps decides whether a domain stays online.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div class="grid-2">
+          <div class="panel">
+            <h3 class="row space-between" style="margin-bottom:8px">Editor · contoso-shop.zone <span class="pill">saved automatically</span></h3>
+            <textarea class="editor" id="zone-editor" spellcheck="false" aria-label="Zone file editor"></textarea>
+          </div>
+          <div class="panel lab-gui">
+            <h3>Registrar · contoso-shop.com</h3>
+            <p class="muted" style="font-size:12px;margin-top:0">Simulated registrar control panel (changes take effect at the .com parent zone immediately).</p>
+            <label for="reg-ns">Name servers (one per line)</label>
+            <textarea id="reg-ns" rows="4" spellcheck="false" style="font-family:var(--mono);font-size:12px;width:100%;padding:8px;border:1px solid var(--border-strong);border-radius:4px"></textarea>
+            <div class="row mt-16"><button type="button" class="sm" id="reg-ns-save">Save name servers</button><span id="reg-ns-msg" class="inline-msg" style="margin:0"></span></div>
+            <hr class="soft" style="margin:14px 0" />
+            <label>DNSSEC: DS records</label>
+            <div id="ds-list" style="font-family:var(--mono);font-size:12px;margin-bottom:8px"></div>
+            <div class="grid-3" style="gap:8px">
+              <div><label for="ds-keytag">Key tag</label><input type="text" id="ds-keytag" /></div>
+              <div><label for="ds-alg">Algorithm</label><select id="ds-alg"><option value="8">8 · RSASHA256</option><option value="13">13 · ECDSAP256SHA256</option></select></div>
+              <div><label for="ds-dtype">Digest type</label><select id="ds-dtype"><option value="2">2 · SHA-256</option><option value="1">1 · SHA-1</option></select></div>
+            </div>
+            <div class="field" style="margin-top:8px"><label for="ds-digest">Digest</label><input type="text" id="ds-digest" spellcheck="false" style="font-family:var(--mono);font-size:12px" /></div>
+            <div class="row"><button type="button" class="sm" id="ds-add">Add DS record</button><span id="ds-msg" class="inline-msg" style="margin:0"></span></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Chain of trust (as a validating resolver sees it)</h3>
+          <div class="diagram" id="trust"></div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Change request CHG-2291</h3>
+          <p style="font-size:14px">Move <code>contoso-shop.com</code> from OldHost DNS to Cloud DNS (project <code>contoso-shop-prod</code>) and enable DNSSEC. The site and email must never stop resolving. OldHost's export is in <code>contoso-shop.zone</code>, but their export tool is known to be sloppy.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Records that must resolve</h3>
+          <table class="brief">
+            <tr><th>Name</th><th>Type</th><th>Value</th></tr>
+            <tr><td>contoso-shop.com</td><td>A</td><td>34.120.10.20</td></tr>
+            <tr><td>www</td><td>CNAME</td><td>contoso-shop.com.</td></tr>
+            <tr><td>shop-lb</td><td>A</td><td>34.120.10.20</td></tr>
+            <tr><td>api</td><td>A</td><td>34.120.10.21</td></tr>
+            <tr><td>contoso-shop.com</td><td>MX</td><td>1 smtp.google.com.</td></tr>
+            <tr><td>mail</td><td>CNAME</td><td>ghs.googlehosted.com.</td></tr>
+            <tr><td>_dmarc</td><td>TXT</td><td>v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-shop.com</td></tr>
+            <tr><td>contoso-shop.com</td><td>TXT</td><td>v=spf1 include:_spf.google.com include:spf.mailwave.example ~all</td></tr>
+            <tr><td>contoso-shop.com</td><td>CAA</td><td>see certificate policy below</td></tr>
+          </table>
+        </div>
+        <div class="panel">
+          <h3>Certificate policy (security team)</h3>
+          <p style="font-size:13px;margin-top:0">Only these certificate authorities may issue certificates for contoso-shop.com:</p>
+          <table class="brief"><tr><th>CA</th><th>CAA value</th><th>Used for</th></tr>
+            <tr><td>Google Trust Services</td><td>pki.goog</td><td>Load balancer managed certificate</td></tr>
+            <tr><td>Let's Encrypt</td><td>letsencrypt.org</td><td>Internal tools</td></tr></table>
+          <p class="muted" style="font-size:12px;margin:8px 0 0">Violation reports (iodef) go to security@contoso-shop.com.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 07 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab;
+  const P = 'contoso-shop-prod';
+  const ORIGIN = 'contoso-shop.com.';
+  const FILE = 'contoso-shop.zone';
+  const LEGACY_NS = ['ns1.oldhost-dns.net', 'ns2.oldhost-dns.net'];
+  const LETTERS = ['a', 'c', 'e'];
+  const EXTERNAL = { 'ghs.googlehosted.com.': '142.250.115.121', 'smtp.google.com.': '142.250.115.27' };
+  const EXPECTED = [
+    { n: 'contoso-shop.com.', t: 'A', d: ['34.120.10.20'] },
+    { n: 'www.contoso-shop.com.', t: 'CNAME', d: ['contoso-shop.com.'] },
+    { n: 'shop-lb.contoso-shop.com.', t: 'A', d: ['34.120.10.20'] },
+    { n: 'api.contoso-shop.com.', t: 'A', d: ['34.120.10.21'] },
+    { n: 'contoso-shop.com.', t: 'MX', d: ['1 smtp.google.com.'] },
+    { n: 'mail.contoso-shop.com.', t: 'CNAME', d: ['ghs.googlehosted.com.'] },
+    { n: '_dmarc.contoso-shop.com.', t: 'TXT', d: ['v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-shop.com'] }
+  ];
+  const GOOD_SPF = 'v=spf1 include:_spf.google.com include:spf.mailwave.example ~all';
+
+  const HEADER = `; Exported from OldHost DNS on 2026-11-15
+$ORIGIN contoso-shop.com.
+$TTL 3600
+@        IN  SOA    ns1.oldhost-dns.net. hostmaster.contoso-shop.com. (
+                    2026111501 ; serial
+                    7200       ; refresh
+                    3600       ; retry
+                    1209600    ; expire
+                    300 )      ; negative-cache TTL
+@        IN  NS     ns1.oldhost-dns.net.
+@        IN  NS     ns2.oldhost-dns.net.
+`;
+  function legacyFile(v) {
+    return HEADER +
+      (v === 0 ? '@        IN  CNAME  shop-lb.contoso-shop.com.\n' : '@        IN  A      34.120.10.20\n') +
+      'shop-lb  IN  A      34.120.10.20\n' +
+      'www      IN  CNAME  contoso-shop.com\n' +
+      'api      300 IN A   34.120.10.21\n' +
+      (v === 1 ? '@        IN  MX     1 142.250.115.27\n' : '@        IN  MX     1 smtp.google.com.\n') +
+      'mail     IN  CNAME  ghs.googlehosted.com.\n' +
+      (v === 2 ? 'mail     IN  A      216.239.32.21\n' : '') +
+      `@        IN  TXT    "${GOOD_SPF}"\n` +
+      '_dmarc   IN  TXT    "v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-shop.com"\n';
+  }
+  const FIXED_FILE = HEADER +
+    '@        IN  A      34.120.10.20\nshop-lb  IN  A      34.120.10.20\nwww      IN  CNAME  contoso-shop.com.\napi      300 IN A   34.120.10.21\n@        IN  MX     1 smtp.google.com.\nmail     IN  CNAME  ghs.googlehosted.com.\n' +
+    `@        IN  TXT    "${GOOD_SPF}"\n_dmarc   IN  TXT    "v=DMARC1; p=quarantine; rua=mailto:dmarc@contoso-shop.com"\n`;
+
+  const hex = n => Array.from({ length: n }, () => '0123456789ABCDEF'[Math.floor(Math.random() * 16)]).join('');
+  const b64 = n => Array.from({ length: n }, () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[Math.floor(Math.random() * 64)]).join('');
+
+  // Legacy provider serves the correct records (the export file is what's broken).
+  const LEGACY_RRS = EXPECTED.map(e => ({ name: e.n, type: e.t, ttl: e.n.startsWith('api') ? 300 : 3600, rrdatas: e.d.slice() }))
+    .concat([{ name: ORIGIN, type: 'TXT', ttl: 3600, rrdatas: [GOOD_SPF] }, { name: ORIGIN, type: 'NS', ttl: 3600, rrdatas: LEGACY_NS.map(n => n + '.') }]);
+
+  function createState(v) {
+    return { v, file: legacyFile(v), letter: LETTERS[v], zone: null, registrar: { ns: LEGACY_NS.slice(), ds: [] }, flags: {} };
+  }
+  const cloudNs = st => [1, 2, 3, 4].map(i => `ns-cloud-${st.letter}${i}.googledomains.com`);
+  const normName = n => String(n).trim().toLowerCase().replace(/\.$/, '');
+
+  // ---------- zone file parsing
+  function parseZone(text) {
+    let origin = ORIGIN, ttl = 3600, last = null;
+    const errors = [], records = [];
+    const lines = text.split('\n');
+    const logical = [];
+    for (let i = 0; i < lines.length; i++) {
+      let s = lines[i]; let out = ''; let q = false;
+      for (const c of s) { if (c === '"') q = !q; if (c === ';' && !q) break; out += c; }
+      if (/\(/.test(out) && !/\)/.test(out)) {
+        let j = i; let acc = out.replace('(', ' ');
+        while (++j < lines.length) { let l2 = lines[j].split(';')[0]; acc += ' ' + l2.replace(')', ' '); if (/\)/.test(lines[j].split(';')[0])) break; }
+        logical.push({ line: i + 1, text: acc, indent: /^\s/.test(lines[i]) }); i = j; continue;
+      }
+      if (out.trim()) logical.push({ line: i + 1, text: out.replace(/[()]/g, ' '), indent: /^\s/.test(out) });
+    }
+    const fq = n => (n === '@' ? origin : n.endsWith('.') ? n.toLowerCase() : (n + '.' + origin).toLowerCase());
+    for (const L of logical) {
+      const toks = L.text.match(/"[^"]*"|\S+/g) || [];
+      if (toks[0] === '$ORIGIN') { origin = toks[1].endsWith('.') ? toks[1] : toks[1] + '.'; continue; }
+      if (toks[0] === '$TTL') { ttl = parseInt(toks[1], 10) || 3600; continue; }
+      let name;
+      if (L.indent) name = last; else { name = fq(toks.shift()); last = name; }
+      let rttl = ttl;
+      for (let k = 0; k < 2 && toks.length; k++) { if (/^\d+$/.test(toks[0])) rttl = parseInt(toks.shift(), 10); else if (/^(IN|CH|HS)$/i.test(toks[0])) toks.shift(); }
+      const type = (toks.shift() || '').toUpperCase();
+      const rd = toks;
+      const err = msg => errors.push({ line: L.line, msg });
+      let data;
+      switch (type) {
+        case 'A': if (!net.isIp(rd[0])) { err(`A record for ${name} has an invalid IPv4 address '${rd[0]}'.`); continue; } data = rd[0]; break;
+        case 'AAAA': data = rd[0]; break;
+        case 'CNAME': case 'NS': data = fq(rd[0]); break;
+        case 'MX': if (!/^\d+$/.test(rd[0] || '')) { err(`MX record for ${name} is missing its preference.`); continue; } if (net.isIp(rd[1])) { err(`MX record for ${name} points to an IP address (${rd[1]}). MX exchange must be a host name.`); continue; } data = `${rd[0]} ${fq(rd[1])}`; break;
+        case 'TXT': data = rd.map(t => t.replace(/^"|"$/g, '')).join(''); break;
+        case 'SOA': data = rd.join(' '); break;
+        case 'CAA': case 'SRV': data = rd.join(' '); break;
+        default: err(`Unsupported or malformed record type '${type || '(none)'}'.`); continue;
+      }
+      records.push({ name, type, ttl: rttl, data, line: L.line });
+    }
+    records.forEach(r => {
+      if (r.type === 'CNAME' && r.name === origin) errors.push({ line: r.line, msg: `CNAME record at the zone apex (${r.name}) is not allowed: it would conflict with the SOA and NS records.` });
+      if (r.type === 'CNAME' && records.some(o => o !== r && o.name === r.name && o.type !== 'CNAME' && r.name !== origin)) errors.push({ line: r.line, msg: `${r.name} has a CNAME and other records. A CNAME can't coexist with any other data at the same name.` });
+    });
+    errors.sort((a, b) => a.line - b.line);
+    return { records, errors };
+  }
+
+  // ---------- Cloud DNS zone
+  function rrset(st, name, type) { return st.zone && st.zone.rrsets.find(r => r.name === name && r.type === type); }
+  function newZone(st, desc) {
+    return { name: null, dnsName: ORIGIN, description: desc, dnssec: false, keys: [], rrsets: [
+      { name: ORIGIN, type: 'NS', ttl: 21600, rrdatas: cloudNs(st).map(n => n + '.') },
+      { name: ORIGIN, type: 'SOA', ttl: 21600, rrdatas: [`${cloudNs(st)[0]}. cloud-dns-hostmaster.google.com. 1 21600 3600 259200 300`] }
+    ] };
+  }
+  function genKeys() {
+    return [
+      { id: '0', keyTag: 10000 + Math.floor(Math.random() * 55000), type: 'keySigning', algorithm: 'rsasha256', keyLength: 2048, digest: hex(64), pub: b64(64) },
+      { id: '1', keyTag: 10000 + Math.floor(Math.random() * 55000), type: 'zoneSigning', algorithm: 'rsasha256', keyLength: 1024, digest: null, pub: b64(64) }
+    ];
+  }
+  const ksk = st => st.zone && st.zone.dnssec && st.zone.keys.find(k => k.type === 'keySigning');
+  const dsMatches = (d, k) => k && +d.keyTag === k.keyTag && +d.alg === 8 && +d.dtype === 2 && d.digest.replace(/\s/g, '').toUpperCase() === k.digest;
+  function validateRecord(st, name, type, rrdatas, cmd) {
+    if (type === 'CNAME' && name === ORIGIN) throw CmdError(`ERROR: (${cmd}) HTTPError 400: The resource record set 'entity.change.additions[${name}][CNAME]' is invalid because a CNAME record can't be created at the zone apex.`);
+    const others = st.zone.rrsets.filter(r => r.name === name && r.type !== type && !(r.name === ORIGIN && ['NS', 'SOA'].includes(r.type)));
+    if (type === 'CNAME' && others.length) throw CmdError(`ERROR: (${cmd}) HTTPError 400: The resource record set 'entity.change.additions[${name}][CNAME]' is invalid because a CNAME can't coexist with other records (${others.map(o => o.type).join(', ')}).`);
+    if (type !== 'CNAME' && st.zone.rrsets.some(r => r.name === name && r.type === 'CNAME')) throw CmdError(`ERROR: (${cmd}) HTTPError 400: The resource record set 'entity.change.additions[${name}][${type}]' is invalid because ${name} already has a CNAME.`);
+    rrdatas.forEach(d => {
+      if (type === 'A' && !net.isIp(d)) throw CmdError(`ERROR: (${cmd}) HTTPError 400: Invalid value for 'entity.change.additions[0].rrdata[0]': '${d}'`);
+      if (['CNAME', 'NS'].includes(type) && !d.endsWith('.')) throw CmdError(`ERROR: (${cmd}) HTTPError 400: Invalid value for 'entity.change.additions[0].rrdata[0]': '${d}'. Domain names in rrdata must be fully qualified (end with a dot).`);
+      if (type === 'CAA' && !/^\d{1,3} (issue|issuewild|iodef) "[^"]+"$/.test(d)) throw CmdError(`ERROR: (${cmd}) HTTPError 400: Invalid value for 'entity.change.additions[0].rrdata[0]': '${d}'. CAA data is <flags> <tag> "<value>", e.g. 0 issue "pki.goog".`);
+      if (type === 'MX') { const p = d.split(/\s+/); if (p.length !== 2 || !/^\d+$/.test(p[0]) || net.isIp(p[1]) || !p[1].endsWith('.')) throw CmdError(`ERROR: (${cmd}) HTTPError 400: Invalid value for 'entity.change.additions[0].rrdata[0]': '${d}'. MX data is "<preference> <fully.qualified.host.>".`); }
+    });
+  }
+
+  // ---------- resolution
+  function delegation(st) {
+    const ns = [...new Set(st.registrar.ns.map(normName))].sort();
+    const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+    if (eq(ns, LEGACY_NS.slice().sort())) return 'legacy';
+    if (eq(ns, cloudNs(st).slice().sort())) return 'cloud';
+    if (ns.length && ns.every(n => LEGACY_NS.includes(n) || cloudNs(st).includes(n))) return 'mixed';
+    return 'unknown';
+  }
+  function authAnswer(st, src, qname, qtype) {
+    const rrs = src === 'legacy' ? LEGACY_RRS : (st.zone ? st.zone.rrsets : null);
+    if (!rrs) return { rcode: 'REFUSED', answers: [] };
+    const answers = []; let name = qname;
+    for (let guard = 0; guard < 8; guard++) {
+      const cname = rrs.find(r => r.name === name && r.type === 'CNAME');
+      if (cname && qtype !== 'CNAME') {
+        answers.push({ name, ttl: cname.ttl, type: 'CNAME', data: cname.rrdatas[0] });
+        name = cname.rrdatas[0];
+        if (!name.endsWith(ORIGIN)) { if (EXTERNAL[name] && qtype === 'A') answers.push({ name, ttl: 300, type: 'A', data: EXTERNAL[name], external: true }); return { rcode: 'NOERROR', answers }; }
+        continue;
+      }
+      const hit = rrs.filter(r => r.name === name && (r.type === qtype || qtype === 'ANY'));
+      hit.forEach(r => r.rrdatas.forEach(d => answers.push({ name: r.name, ttl: r.ttl, type: r.type, data: r.type === 'TXT' ? `"${d}"` : d })));
+      if (!hit.length && !rrs.some(r => r.name === name) && name.endsWith(ORIGIN)) return { rcode: 'NXDOMAIN', answers };
+      return { rcode: 'NOERROR', answers };
+    }
+    return { rcode: 'SERVFAIL', answers };
+  }
+  function publicResolve(st, qname, qtype) {
+    const del = delegation(st);
+    if (del === 'unknown') return { rcode: 'SERVFAIL', ede: '22 (No Reachable Authority)', answers: [] };
+    const src = del === 'legacy' ? 'legacy' : 'cloud';
+    let secure = false;
+    if (st.registrar.ds.length) {
+      const k = src === 'cloud' ? ksk(st) : null;
+      if (!k) return { rcode: 'SERVFAIL', ede: src === 'legacy' ? '10 (RRSIGs Missing): the parent publishes a DS, but the zone served by these name servers is not signed' : '9 (DNSKEY Missing): DS at the parent but the zone is not signed', answers: [] };
+      if (!st.registrar.ds.some(d => dsMatches(d, k))) return { rcode: 'SERVFAIL', ede: '9 (DNSKEY Missing): no DNSKEY matches the DS record at the parent', answers: [] };
+      secure = true;
+    }
+    const r = authAnswer(st, src, qname, qtype);
+    if (r.rcode === 'REFUSED') return { rcode: 'SERVFAIL', ede: '22 (No Reachable Authority): the delegated name servers do not serve this zone', answers: [] };
+    return Object.assign(r, { ad: secure });
+  }
+  function criticalOk(st) {
+    const a = publicResolve(st, ORIGIN, 'A'); const w = publicResolve(st, 'www.' + ORIGIN, 'A'); const mx = publicResolve(st, ORIGIN, 'MX');
+    const hasA = r => r.rcode === 'NOERROR' && r.answers.some(x => x.type === 'A' && x.data === '34.120.10.20');
+    return hasA(a) && hasA(w) && mx.rcode === 'NOERROR' && mx.answers.some(x => x.type === 'MX' && x.data.toLowerCase() === '1 smtp.google.com.');
+  }
+  function caaStatus(st) {
+    if (!st.zone) return 'The Cloud DNS zone doesn\'t exist yet.';
+    const r = rrset(st, ORIGIN, 'CAA');
+    if (!r) return 'No CAA records at the apex, so any public CA may issue certificates for the domain.';
+    const d = r.rrdatas.map(x => x.toLowerCase().replace(/\s+/g, ' '));
+    const issue = d.filter(x => / issue /.test(x)).map(x => x.split('"')[1]);
+    const miss = ['pki.goog', 'letsencrypt.org'].filter(ca => !issue.includes(ca));
+    if (miss.length) return `CAA doesn't authorize ${miss.join(' and ')}${miss.includes('pki.goog') ? ' (the load balancer\'s Google-managed certificate would fail to renew)' : ''}.`;
+    const extra = issue.filter(ca => !['pki.goog', 'letsencrypt.org'].includes(ca));
+    if (extra.length) return `CAA also authorizes ${extra.join(', ')}, which the policy doesn't allow.`;
+    if (!d.some(x => / iodef "mailto:security@contoso-shop\.com"/.test(x))) return 'Add an iodef record so CAs can report refused requests to security@contoso-shop.com.';
+    return true;
+  }
+  function recordsStatus(st) {
+    if (!st.zone) return { ok: 0, total: EXPECTED.length };
+    const ok = EXPECTED.filter(e => { const r = rrset(st, e.n, e.t); return r && r.rrdatas.length === e.d.length && e.d.every(d => r.rrdatas.some(x => x.toLowerCase() === d.toLowerCase())); }).length;
+    return { ok, total: EXPECTED.length };
+  }
+
+  // ---------- dig
+  function dig(st, lab, toks) {
+    let server = null, name = null, type = 'A'; const opts = new Set();
+    toks.forEach(t => { if (t.startsWith('@')) server = t.slice(1).toLowerCase().replace(/\.$/, ''); else if (t.startsWith('+')) opts.add(t.slice(1).toLowerCase()); else if (/^(A|AAAA|MX|TXT|CNAME|NS|SOA|DS|DNSKEY|ANY|CAA)$/i.test(t) && name) type = t.toUpperCase(); else if (!name) name = t; else if (/^(A|AAAA|MX|TXT|CNAME|NS|SOA|DS|DNSKEY|ANY|CAA)$/i.test(t)) type = t.toUpperCase(); });
+    if (!name) throw CmdError('Usage: dig [@server] <name> [type] [+short] [+dnssec] [+trace]');
+    const qname = name.toLowerCase().endsWith('.') ? name.toLowerCase() : name.toLowerCase() + '.';
+    const short = opts.has('short'), dnssec = opts.has('dnssec');
+    let res, srvLabel, aa = false, recursive = true;
+    const isCloudNs = server && /^ns-cloud-[a-e][1-4]\.googledomains\.com$/.test(server);
+    if (opts.has('trace')) return { text: trace(st, qname, type) };
+    if (!server || ['8.8.8.8', '1.1.1.1', '8.8.4.4', '169.254.169.254'].includes(server)) {
+      srvLabel = `${server || '169.254.169.254'}#53(${server || '169.254.169.254'}) (UDP)`;
+      if (type === 'DS') { res = { rcode: 'NOERROR', answers: st.registrar.ds.map(d => ({ name: ORIGIN, ttl: 86400, type: 'DS', data: `${d.keyTag} ${d.alg} ${d.dtype} ${d.digest}` })) }; }
+      else if (type === 'DNSKEY') { const del = delegation(st); res = del === 'cloud' && st.zone && st.zone.dnssec ? { rcode: 'NOERROR', answers: st.zone.keys.map(k => ({ name: ORIGIN, ttl: 300, type: 'DNSKEY', data: `${k.type === 'keySigning' ? 257 : 256} 3 8 ${k.pub}...` })) } : publicResolve(st, ORIGIN, 'DNSKEY'); }
+      else res = publicResolve(st, qname, type);
+      if (qname === ORIGIN && res.ad) lab.flag('adSeen');
+    } else if (isCloudNs || LEGACY_NS.includes(server)) {
+      recursive = false; aa = true;
+      const ip = isCloudNs ? '216.239.' + (32 + 'acegikmo'.indexOf(server[9]) % 4) + '.10' + server[10] : (server.startsWith('ns1') ? '198.51.100.53' : '198.51.100.54');
+      srvLabel = `${ip}#53(${server}) (UDP)`;
+      if (isCloudNs && !cloudNs(st).includes(server)) res = { rcode: 'REFUSED', answers: [] };
+      else res = authAnswer(st, isCloudNs ? 'cloud' : 'legacy', qname, type);
+      if (res.rcode === 'REFUSED') aa = false;
+      if (isCloudNs && res.rcode === 'NOERROR' && qname === 'www.' + ORIGIN) lab.flag('verifiedCloud');
+    } else {
+      return { text: `;; communications error to ${server}#53: timed out\n;; communications error to ${server}#53: timed out\n;; no servers could be reached`, cls: 'err' };
+    }
+    const signedZone = st.zone && st.zone.dnssec && (aa ? isCloudNs : delegation(st) !== 'legacy');
+    const zsk = st.zone && st.zone.keys.find(k => k.type === 'zoneSigning');
+    const lines = res.answers.filter(x => !x.external || recursive).map(x => `${x.name.padEnd(24)}${String(x.ttl).padEnd(8)}IN\t${x.type}\t${x.data}`);
+    if (dnssec && signedZone && zsk && res.answers.length) {
+      const types = [...new Set(res.answers.filter(x => !x.external).map(x => x.type + '|' + x.name))];
+      types.forEach(tn => { const [t, n] = tn.split('|'); lines.push(`${n.padEnd(24)}${'300'.padEnd(8)}IN\tRRSIG\t${t} 8 ${n.split('.').length - 1} 300 20261211000000 20261119000000 ${zsk.keyTag} ${ORIGIN} ${b64(43)}`); });
+    }
+    if (short) return { text: res.answers.filter(x => !x.external || recursive).map(x => x.data).join('\n') || (res.rcode !== 'NOERROR' ? `;; ${res.rcode}` : ''), cls: res.rcode === 'SERVFAIL' ? 'err' : '' };
+    const flags = ['qr', recursive ? 'rd' : '', aa ? 'aa' : '', recursive ? 'ra' : '', res.ad ? 'ad' : ''].filter(Boolean).join(' ');
+    const out = [`; <<>> DiG 9.18.28 <<>> ${toks.join(' ')}`, ';; global options: +cmd', ';; Got answer:',
+      `;; ->>HEADER<<- opcode: QUERY, status: ${res.rcode}, id: ${10000 + Math.floor(Math.random() * 55000)}`,
+      `;; flags: ${flags}; QUERY: 1, ANSWER: ${lines.length}, AUTHORITY: 0, ADDITIONAL: 1`, '', ';; OPT PSEUDOSECTION:', `; EDNS: version: 0, flags:${dnssec ? ' do' : ''}; udp: 1232`];
+    if (res.ede) out.push(`; EDE: ${res.ede}`);
+    out.push('', ';; QUESTION SECTION:', `;${qname.padEnd(23)}\tIN\t${type}`);
+    if (lines.length) out.push('', ';; ANSWER SECTION:', ...lines);
+    out.push('', `;; Query time: ${aa ? 8 : 23} msec`, `;; SERVER: ${srvLabel}`, ';; WHEN: Fri Nov 20 17:45:02 CST 2026', `;; MSG SIZE  rcvd: ${60 + lines.length * 32}`);
+    return { text: out.join('\n'), cls: res.rcode === 'SERVFAIL' ? 'warn' : '' };
+  }
+  function trace(st, qname, type) {
+    const del = delegation(st); const nsList = st.registrar.ns.map(n => normName(n) + '.');
+    const out = ['.\t\t\t518400\tIN\tNS\ta.root-servers.net.', '.\t\t\t518400\tIN\tNS\tb.root-servers.net.', ';; Received 239 bytes from 169.254.169.254#53(169.254.169.254) in 1 ms', '',
+      'com.\t\t\t172800\tIN\tNS\ta.gtld-servers.net.', 'com.\t\t\t172800\tIN\tNS\tb.gtld-servers.net.', ';; Received 1170 bytes from 198.41.0.4#53(a.root-servers.net) in 12 ms', ''];
+    nsList.forEach(n => out.push(`${ORIGIN}\t172800\tIN\tNS\t${n}`));
+    st.registrar.ds.forEach(d => out.push(`${ORIGIN}\t86400\tIN\tDS\t${d.keyTag} ${d.alg} ${d.dtype} ${d.digest}`));
+    out.push(`;; Received ${300 + nsList.length * 30} bytes from 192.5.6.30#53(a.gtld-servers.net) in 20 ms`, '');
+    const src = del === 'legacy' ? 'legacy' : 'cloud';
+    if (del === 'unknown') { out.push(`;; no response from ${nsList[0] || '(none)'}: lame delegation`); return out.join('\n'); }
+    const r = authAnswer(st, src, qname, type);
+    if (r.rcode === 'REFUSED') { out.push(`;; ${nsList[0]} refused the query (it does not serve ${ORIGIN})`); return out.join('\n'); }
+    r.answers.filter(x => !x.external).forEach(x => out.push(`${x.name}\t${x.ttl}\tIN\t${x.type}\t${x.data}`));
+    if (!r.answers.length) out.push(`;; ${r.rcode}`);
+    out.push(`;; Received 95 bytes from ${src === 'legacy' ? '198.51.100.53' : '216.239.32.106'}#53(${nsList[0]}) in 8 ms`);
+    return out.join('\n');
+  }
+
+  // ---------- commands
+  const commands = lab => {
+    const S = () => lab.state;
+    const needZone = (cmd, z) => { const st = S(); if (!st.zone || st.zone.name !== z) throw CmdError(`ERROR: (${cmd}) HTTPError 404: The 'parameters.managedZone' resource named '${z}' does not exist.`); return st.zone; };
+    const rrRows = z => z.rrsets.slice().sort((a, b) => a.name.split('.').reverse().join('.').localeCompare(b.name.split('.').reverse().join('.')) || a.type.localeCompare(b.type)).map(r => ({ NAME: r.name, TYPE: r.type, TTL: String(r.ttl), DATA: r.rrdatas.map(d => (r.type === 'TXT' ? `"${d}"` : d)).join(',') }));
+    const rrParams = { NAME: { posOnly: true, required: true }, zone: { required: true }, type: { required: true, type: 'enum', values: ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA'] }, ttl: { type: 'int' }, rrdatas: { type: 'list', desc: 'Comma-separated record data' } };
+    const fqName = n => { n = n.toLowerCase(); if (!n.endsWith('.')) n += '.'; return n; };
+    const cleanTxt = d => d.replace(/^"|"$/g, '');
+    return {
+      ls: { raw: true, desc: 'List files', run: () => FILE + '  README.txt' },
+      cat: { raw: true, desc: 'Print a file', usage: 'cat <file>', run: a => { const f = a._pos[0]; if (f === FILE) return S().file; if (f === 'README.txt') return 'Edit contoso-shop.zone in the editor panel below the terminal (nano/vim open it there too).'; throw CmdError(`cat: ${f || ''}: No such file or directory`); } },
+      nano: { raw: true, aliases: ['vim', 'vi', 'edit'], desc: 'Open the zone file in the editor panel', run: a => { if (a._pos[0] && a._pos[0] !== FILE) throw CmdError(`${a._pos[0]}: only ${FILE} can be edited in this simulation.`); const ed = document.getElementById('zone-editor'); ed.focus(); ed.scrollIntoView({ block: 'nearest' }); return { text: `Opened ${FILE} in the editor panel. Changes save automatically.`, cls: 'muted' }; } },
+      'gcloud config list': { desc: 'Show the active configuration', run: () => `[core]\naccount = ruben@contoso-partner.com\nproject = ${P}\n\nYour active configuration is: [default]` },
+      'gcloud dns managed-zones create': {
+        desc: 'Create a Cloud DNS managed zone', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, 'dns-name': { required: true, desc: 'e.g. contoso-shop.com.' }, description: { required: true }, 'dnssec-state': { type: 'enum', values: ['on', 'off', 'transfer'] }, visibility: { type: 'enum', values: ['public', 'private'] } },
+        run: a => {
+          const st = S(); const cmd = 'gcloud.dns.managed-zones.create';
+          if (st.zone) throw CmdError(`ERROR: (${cmd}) HTTPError 409: The resource 'entity.managedZone' named '${st.zone.name}' already exists (only one zone is needed in this lab).`);
+          if (a.visibility === 'private') throw CmdError(`ERROR: (${cmd}) A private zone isn't visible on the internet. This migration needs a public zone.`);
+          if (fqName(a['dns-name']) !== ORIGIN) throw CmdError(`ERROR: (${cmd}) The DNS name '${a['dns-name']}' doesn't match the domain in the change request (contoso-shop.com.).`);
+          if (!/^[a-z]([-a-z0-9]*[a-z0-9])?$/.test(a.NAME)) throw CmdError(`ERROR: (${cmd}) HTTPError 400: Invalid value for 'entity.managedZone.name': '${a.NAME}'`);
+          st.zone = newZone(st, a.description); st.zone.name = a.NAME;
+          if (a['dnssec-state'] === 'on') { st.zone.dnssec = true; st.zone.keys = genKeys(); }
+          return { text: `Created [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${a.NAME}].` };
+        }
+      },
+      'gcloud dns managed-zones list': { desc: 'List managed zones', run: () => { const z = S().zone; return z ? { text: Lab.util.renderTable([{ NAME: z.name, DNS_NAME: z.dnsName, DESCRIPTION: z.description, VISIBILITY: 'public' }], null, null, 'gcloud') } : { text: 'Listed 0 items.' }; } },
+      'gcloud dns managed-zones describe': {
+        desc: 'Show a managed zone (name servers, DNSSEC state)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true } },
+        run: a => { const z = needZone('gcloud.dns.managed-zones.describe', a.NAME); return { text: Lab.util.toYaml({ creationTime: '2026-11-20T23:31:07.000Z', description: z.description, dnsName: z.dnsName, dnssecConfig: z.dnssec ? { defaultKeySpecs: [{ algorithm: 'rsasha256', keyLength: 2048, keyType: 'keySigning' }, { algorithm: 'rsasha256', keyLength: 1024, keyType: 'zoneSigning' }], nonExistence: 'nsec3', state: 'on' } : { state: 'off' }, kind: 'dns#managedZone', name: z.name, nameServers: cloudNs(S()).map(n => n + '.'), visibility: 'public' }) }; }
+      },
+      'gcloud dns managed-zones update': {
+        desc: 'Change a managed zone (e.g. --dnssec-state=on)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, 'dnssec-state': { type: 'enum', values: ['on', 'off', 'transfer'] }, description: {} },
+        run: a => {
+          const z = needZone('gcloud.dns.managed-zones.update', a.NAME);
+          if (a.description) z.description = a.description;
+          if (a['dnssec-state'] === 'on' && !z.dnssec) { z.dnssec = true; z.keys = genKeys(); }
+          if (a['dnssec-state'] === 'off' && z.dnssec) { z.dnssec = false; z.keys = []; }
+          if (a['dnssec-state'] === 'transfer') throw CmdError('ERROR: (gcloud.dns.managed-zones.update) "transfer" is for moving an already-signed zone. OldHost never signed contoso-shop.com.');
+          return { text: `Updated [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${z.name}].` };
+        }
+      },
+      'gcloud dns dns-keys list': {
+        desc: 'List a zone\'s DNSSEC keys', params: { zone: { required: true } },
+        run: a => { const z = needZone('gcloud.dns.dns-keys.list', a.zone); if (!z.keys.length) return { text: 'Listed 0 items.' }; return { text: Lab.util.renderTable(z.keys.map(k => ({ ID: k.id, KEY_TAG: String(k.keyTag), TYPE: k.type, ALGORITHM: k.algorithm.toUpperCase(), IS_ACTIVE: 'True', DESCRIPTION: '' })), null, null, 'gcloud') }; }
+      },
+      'gcloud dns dns-keys describe': {
+        desc: 'Show a DNSSEC key (use --format="value(ds_record())" for the DS record)', positional: ['ID'], params: { ID: { posOnly: true, required: true }, zone: { required: true } },
+        run: a => {
+          const z = needZone('gcloud.dns.dns-keys.describe', a.zone);
+          const k = z.keys.find(x => x.id === a.ID); if (!k) throw CmdError(`ERROR: (gcloud.dns.dns-keys.describe) HTTPError 404: The 'parameters.dnsKeyId' resource named '${a.ID}' does not exist.`);
+          const fmt = a._g.format || '';
+          if (/ds_record/.test(fmt)) { if (k.type !== 'keySigning') return { text: '' }; return { text: `${k.keyTag} 8 2 ${k.digest}` }; }
+          return { text: Lab.util.toYaml({ algorithm: k.algorithm, creationTime: '2026-11-20T23:40:12.000Z', digests: k.digest ? [{ digest: k.digest, type: 'sha256' }] : undefined, id: k.id, isActive: true, keyLength: k.keyLength, keyTag: k.keyTag, kind: 'dns#dnsKey', publicKey: k.pub + '…', type: k.type }) };
+        }
+      },
+      'gcloud dns record-sets import': {
+        desc: 'Import records from a file into a zone', positional: ['FILE'],
+        params: { FILE: { posOnly: true, required: true }, zone: { required: true }, 'zone-file-format': { type: 'switch', desc: 'The file is a BIND zone file (not YAML)' }, 'delete-all-existing': { type: 'switch' }, 'replace-origin-ns': { type: 'switch' } },
+        run: a => {
+          const st = S(); const cmd = 'gcloud.dns.record-sets.import';
+          if (a.FILE !== FILE) throw CmdError(`ERROR: (${cmd}) Unable to read file [${a.FILE}]: [Errno 2] No such file or directory: '${a.FILE}'`);
+          const z = needZone(cmd, a.zone);
+          if (!a['zone-file-format']) throw CmdError(`ERROR: (${cmd}) Unable to parse records-file [${a.FILE}]: it isn't valid YAML. If this is a BIND zone file, add --zone-file-format.`);
+          const { records, errors } = parseZone(st.file);
+          if (errors.length) throw CmdError(`ERROR: (${cmd}) Invalid zone file. Import aborted; no changes were made.\n` + errors.map(e => `  line ${e.line}: ${e.msg}`).join('\n'));
+          const toAdd = {};
+          records.forEach(r => { if (r.name === ORIGIN && ['SOA', 'NS'].includes(r.type)) return; const k = r.name + '|' + r.type; (toAdd[k] = toAdd[k] || { name: r.name, type: r.type, ttl: r.ttl, rrdatas: [] }).rrdatas.push(r.data); });
+          const existing = z.rrsets.filter(r => !(r.name === ORIGIN && ['SOA', 'NS'].includes(r.type)));
+          if (existing.length && !a['delete-all-existing']) { const clash = Object.values(toAdd).find(n => existing.some(e => e.name === n.name && e.type === n.type)); if (clash) throw CmdError(`ERROR: (${cmd}) HTTPError 409: The resource 'entity.change.additions[${clash.name}][${clash.type}]' named '${clash.name} (${clash.type})' already exists. Use --delete-all-existing to replace the zone's records.`); }
+          if (a['delete-all-existing']) z.rrsets = z.rrsets.filter(r => r.name === ORIGIN && ['SOA', 'NS'].includes(r.type));
+          Object.values(toAdd).forEach(n => z.rrsets.push(n));
+          return { text: `Imported record-sets from [${a.FILE}] into managed-zone [${z.name}].\n(The file's SOA and apex NS records were skipped: Cloud DNS manages those.)\nCreated [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${z.name}/changes/${z.rrsets.length}].\nID  START_TIME                STATUS\n${z.rrsets.length}   2026-11-20T23:44:01.112Z  done` };
+        }
+      },
+      'gcloud dns record-sets list': {
+        desc: 'List a zone\'s records', params: { zone: { required: true }, name: {}, type: {} },
+        run: a => { const z = needZone('gcloud.dns.record-sets.list', a.zone); let rows = rrRows(z); if (a.name) rows = rows.filter(r => r.NAME === fqName(a.name)); if (a.type) rows = rows.filter(r => r.TYPE === a.type.toUpperCase()); return { text: Lab.util.renderTable(rows, null, null, 'gcloud') || 'Listed 0 items.' }; }
+      },
+      'gcloud dns record-sets create': {
+        desc: 'Create a record set', positional: ['NAME'], params: rrParams,
+        run: a => {
+          const st = S(); const cmd = 'gcloud.dns.record-sets.create'; const z = needZone(cmd, a.zone); const name = fqName(a.NAME);
+          if (!name.endsWith(ORIGIN)) throw CmdError(`ERROR: (${cmd}) HTTPError 400: The resource record set name '${name}' is not within the zone '${ORIGIN}'.`);
+          if (!a.rrdatas) throw CmdError(`ERROR: (${cmd}) argument --rrdatas: Must be specified.`);
+          if (rrset(st, name, a.type)) throw CmdError(`ERROR: (${cmd}) HTTPError 409: The resource 'entity.change.additions[${name}][${a.type}]' already exists. Use record-sets update.`);
+          const data = a.type === 'TXT' ? a.rrdatas.map(cleanTxt) : a.rrdatas;
+          validateRecord(st, name, a.type, data, cmd);
+          z.rrsets.push({ name, type: a.type, ttl: a.ttl || 300, rrdatas: data });
+          return { text: `Created [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${z.name}/rrsets/${name}/${a.type}].\n` + Lab.util.renderTable([{ NAME: name, TYPE: a.type, TTL: String(a.ttl || 300), DATA: data.join(',') }], null, null, 'gcloud') };
+        }
+      },
+      'gcloud dns record-sets update': {
+        desc: 'Replace a record set\'s data', positional: ['NAME'], params: rrParams,
+        run: a => {
+          const st = S(); const cmd = 'gcloud.dns.record-sets.update'; const z = needZone(cmd, a.zone); const name = fqName(a.NAME);
+          const r = rrset(st, name, a.type); if (!r) throw CmdError(`ERROR: (${cmd}) HTTPError 404: The 'entity.change.deletions[${name}][${a.type}]' resource named '${name} (${a.type})' does not exist.`);
+          if (!a.rrdatas) throw CmdError(`ERROR: (${cmd}) argument --rrdatas: Must be specified.`);
+          const data = a.type === 'TXT' ? a.rrdatas.map(cleanTxt) : a.rrdatas;
+          validateRecord(st, name, a.type, data, cmd);
+          r.rrdatas = data; if (a.ttl) r.ttl = a.ttl;
+          return { text: `Updated [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${z.name}/rrsets/${name}/${a.type}].` };
+        }
+      },
+      'gcloud dns record-sets delete': {
+        desc: 'Delete a record set', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, zone: { required: true }, type: { required: true } },
+        run: a => {
+          const st = S(); const cmd = 'gcloud.dns.record-sets.delete'; const z = needZone(cmd, a.zone); const name = fqName(a.NAME); const t = a.type.toUpperCase();
+          if (name === ORIGIN && ['SOA', 'NS'].includes(t)) throw CmdError(`ERROR: (${cmd}) HTTPError 400: The zone's apex ${t} record can't be deleted.`);
+          const i = z.rrsets.findIndex(r => r.name === name && r.type === t); if (i < 0) throw CmdError(`ERROR: (${cmd}) HTTPError 404: The resource record set '${name} (${t})' does not exist.`);
+          z.rrsets.splice(i, 1);
+          return { text: `Deleted [https://dns.googleapis.com/dns/v1/projects/${P}/managedZones/${z.name}/rrsets/${name}/${t}].` };
+        }
+      },
+      dig: { raw: true, desc: 'Query DNS (default: a validating public resolver)', usage: 'dig [@server] <name> [type] [+short] [+dnssec] [+trace]', run: a => dig(S(), lab, a._pos) },
+      whois: { raw: true, desc: 'Show registrar delegation for the domain', run: a => { const st = S(); return `Domain Name: CONTOSO-SHOP.COM\nRegistrar: Example Registrar, LLC\n${st.registrar.ns.map(n => 'Name Server: ' + normName(n).toUpperCase()).join('\n')}\nDNSSEC: ${st.registrar.ds.length ? 'signedDelegation' : 'unsigned'}`; } }
+    };
+  };
+
+  // ---------- registrar panel + editor wiring
+  let lab; const $ = s => document.querySelector(s);
+  const S = () => lab.state;
+  $('#zone-editor').addEventListener('input', e => { S().file = e.target.value; lab.touch(); });
+  $('#reg-ns-save').addEventListener('click', () => {
+    const ns = $('#reg-ns').value.split(/[\n,]+/).map(normName).filter(Boolean);
+    const msg = $('#reg-ns-msg');
+    if (ns.length < 2) { msg.textContent = 'At least two name servers are required.'; msg.className = 'inline-msg err'; return; }
+    if (ns.some(n => !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(n))) { msg.textContent = 'Invalid host name.'; msg.className = 'inline-msg err'; return; }
+    S().registrar.ns = ns; msg.textContent = 'Saved. The .com zone now delegates to these servers.'; msg.className = 'inline-msg ok';
+    lab.touch(); lab.refresh();
+  });
+  $('#ds-add').addEventListener('click', () => {
+    const d = { keyTag: $('#ds-keytag').value.trim(), alg: $('#ds-alg').value, dtype: $('#ds-dtype').value, digest: $('#ds-digest').value.trim().replace(/\s/g, '').toUpperCase() };
+    const msg = $('#ds-msg');
+    if (!/^\d{1,5}$/.test(d.keyTag)) { msg.textContent = 'Key tag must be a number.'; msg.className = 'inline-msg err'; return; }
+    if (!/^[0-9A-F]+$/.test(d.digest) || d.digest.length !== (d.dtype === '2' ? 64 : 40)) { msg.textContent = `Digest must be ${d.dtype === '2' ? 64 : 40} hex characters for this digest type.`; msg.className = 'inline-msg err'; return; }
+    S().registrar.ds.push(d); msg.textContent = 'DS record published at the .com parent.'; msg.className = 'inline-msg ok';
+    ['#ds-keytag', '#ds-digest'].forEach(s => { $(s).value = ''; });
+    lab.touch(); lab.refresh();
+  });
+  $('#ds-list').addEventListener('click', e => { const b = e.target.closest('button[data-rm-ds]'); if (!b) return; S().registrar.ds.splice(+b.dataset.rmDs, 1); lab.touch(); lab.refresh(); });
+
+  function render(st) {
+    $('#ds-list').innerHTML = st.registrar.ds.length ? st.registrar.ds.map((d, i) => `<div class="row" style="gap:6px;margin-bottom:4px"><span style="overflow-wrap:anywhere;flex:1">${d.keyTag} ${d.alg} ${d.dtype} ${d.digest.slice(0, 16)}…</span><button type="button" class="ghost sm" data-rm-ds="${i}">Remove</button></div>`).join('') : '<span class="muted">No DS records (domain is unsigned at the parent).</span>';
+    const del = delegation(st); const k = ksk(st); const ds = st.registrar.ds;
+    const res = publicResolve(st, ORIGIN, 'A');
+    let link, linkColor, zoneColor, zoneSub;
+    if (!ds.length) { link = 'no DS · insecure'; linkColor = '#94a3b8'; }
+    else if (res.ad) { link = `DS ${ds.find(d => dsMatches(d, k)).keyTag} ✓ matches KSK`; linkColor = '#047857'; }
+    else { link = 'DS published · BOGUS'; linkColor = '#b91c1c'; }
+    const served = del === 'legacy' ? 'OldHost (unsigned)' : del === 'cloud' ? (st.zone ? `Cloud DNS${st.zone.dnssec ? ' · signed (KSK ' + k.keyTag + ')' : ' · unsigned'}` : 'Cloud DNS · zone missing') : del === 'mixed' ? 'mixed OldHost + Cloud DNS' : 'unreachable servers';
+    zoneColor = res.rcode !== 'NOERROR' ? ['#fee2e2', '#b91c1c'] : res.ad ? ['#d1fae5', '#047857'] : ['#f1f5f9', '#94a3b8'];
+    zoneSub = served;
+    const box = (x, label, sub, c) => `<rect x="${x}" y="14" width="200" height="58" rx="6" fill="${c[0]}" stroke="${c[1]}"/><text x="${x + 100}" y="38" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">${label}</text><text x="${x + 100}" y="57" text-anchor="middle" font-size="10" fill="#475569">${Lab.util.esc(sub)}</text>`;
+    const green = ['#d1fae5', '#047857'];
+    document.getElementById('trust').innerHTML = `<svg viewBox="0 0 760 120" role="img" aria-label="DNSSEC chain of trust">
+      ${box(0, 'Root  ( . )', 'signed · trust anchor', green)}
+      <line x1="202" y1="43" x2="276" y2="43" stroke="#047857" stroke-width="2"/><text x="239" y="34" text-anchor="middle" font-size="10" fill="#047857">DS ✓</text>
+      ${box(278, '.com', 'signed · delegates via registrar', green)}
+      <line x1="480" y1="43" x2="556" y2="43" stroke="${linkColor}" stroke-width="2" ${ds.length ? '' : 'stroke-dasharray="4 4"'}/><text x="518" y="34" text-anchor="middle" font-size="10" fill="${linkColor}">${link.split(' · ')[0]}</text><text x="518" y="62" text-anchor="middle" font-size="10" fill="${linkColor}">${link.split(' · ')[1] || ''}</text>
+      ${box(558, 'contoso-shop.com', zoneSub.length > 34 ? zoneSub.slice(0, 33) + '…' : zoneSub, zoneColor)}
+      <text x="0" y="100" font-size="11" fill="#64748b">Public answer for contoso-shop.com A: ${res.rcode}${res.ad ? ' · AD (validated)' : ''}${res.rcode === 'NOERROR' && res.answers.length ? ' · ' + res.answers.filter(a => a.type === 'A').map(a => a.data).join(', ') : ''} · delegation: ${del}${st.flags.outage ? ' · ⚠ an outage occurred' : ''}</text>
+    </svg>`;
+  }
+  function onReset(st) {
+    $('#zone-editor').value = st.file;
+    $('#reg-ns').value = st.registrar.ns.join('\n');
+    ['#reg-ns-msg', '#ds-msg'].forEach(s => { $(s).textContent = ''; });
+    ['#ds-keytag', '#ds-digest'].forEach(s => { $(s).value = ''; });
+  }
+  function update(st) {
+    if (!criticalOk(st) && !st.flags.outage) { st.flags.outage = true; st.flags.outageWhy = delegation(st); }
+    if (delegation(st) === 'cloud') st.flags.cutover = true;
+  }
+
+  lab = Lab({
+    id: 'cloud-dns-lab', dialect: 'bash', variants: 3, termTitle: 'Cloud Shell — contoso-shop-prod',
+    prompt: `ruben@cloudshell:~ (${P})$ `,
+    banner: `Welcome to Cloud Shell! Type "help" to get started.\nYour Cloud Platform project in this session is set to ${P}.\nFiles in your home directory: ${FILE}  README.txt\n`,
+    createState, commands, render, onReset, update,
+    objectives: [
+      { text: 'Create a public Cloud DNS managed zone for <code>contoso-shop.com.</code>',
+        check: st => !!st.zone || 'No managed zone yet.',
+        hints: ['Managed zones are created with <code>gcloud dns managed-zones create</code>.', 'It needs a name, the DNS name (with a trailing dot) and a description.', '<code>gcloud dns managed-zones create shop-zone --dns-name=contoso-shop.com. --description="Contoso Shop"</code>'] },
+      { text: 'Import the legacy records, fixing the export\'s mistakes, so every record in the brief exists correctly in Cloud DNS.',
+        check: st => { const r = recordsStatus(st); return r.ok === r.total || (st.zone ? `${r.ok} of ${r.total} required records match the brief.` : 'Create the zone first.'); },
+        hints: ['<code>cat</code> the zone file, then import it with the BIND-format flag. The import reports what\'s invalid.', 'Watch for a CNAME at the apex, an MX pointing to an IP, a name with both a CNAME and other records, and relative names missing their trailing dot (www!). That last one imports silently, so compare with <code>dig @' + 'ns-cloud-…</code>.', 'Fix the file in the editor (apex → <code>A 34.120.10.20</code>, <code>www CNAME contoso-shop.com.</code> with the dot, MX → <code>1 smtp.google.com.</code>, remove the extra <code>mail A</code>), then <code>gcloud dns record-sets import contoso-shop.zone --zone=shop-zone --zone-file-format --delete-all-existing</code>.'] },
+      { text: 'Add CAA records so only the approved certificate authorities can issue certificates for the domain.',
+        check: st => caaStatus(st),
+        hints: ['CAA records live at the apex and list which CAs may issue certificates.', 'One record per approved CA (<code>0 issue "…"</code>) plus an <code>iodef</code> record for violation reports. Check the certificate policy panel for the values.', '<code>gcloud dns record-sets create contoso-shop.com. --zone=shop-zone --type=CAA --ttl=3600 --rrdatas=\'0 issue "pki.goog"\',\'0 issue "letsencrypt.org"\',\'0 iodef "mailto:security@contoso-shop.com"\'</code>'] },
+      { text: 'Cut the registrar over to the Cloud DNS name servers without the domain ever failing to resolve.',
+        check: st => {
+          if (st.flags.outage) return `The site or mail stopped resolving at some point (${st.flags.outageWhy === 'legacy' ? 'DNSSEC broke validation' : 'the delegated servers didn\'t serve correct records'}). Reset the lab to try the cutover again.`;
+          return delegation(st) === 'cloud' || 'The registrar still delegates to OldHost (or a mix).';
+        },
+        hints: ['Before changing the registrar, ask Cloud DNS directly: <code>dig @&lt;one of the zone\'s name servers&gt; www.contoso-shop.com</code>.', 'Find the zone\'s assigned name servers with <code>gcloud dns managed-zones describe shop-zone</code>. All four go at the registrar, replacing OldHost\'s.', 'When every record answers correctly from Cloud DNS, paste the four <code>ns-cloud-…googledomains.com</code> servers into the registrar panel and save.'] },
+      { text: 'Enable DNSSEC on the zone and publish the matching DS record at the registrar.',
+        check: st => {
+          if (!st.zone || !st.zone.dnssec) return 'DNSSEC isn\'t enabled on the Cloud DNS zone.';
+          if (!st.registrar.ds.length) return 'No DS record at the registrar, so the chain of trust stops at .com.';
+          return st.registrar.ds.some(d => dsMatches(d, ksk(st))) || 'The DS record at the registrar doesn\'t match the zone\'s key-signing key.';
+        },
+        hints: ['Sign the zone first, then tell the parent. Never publish a DS for servers that don\'t serve a signed zone.', 'The DS record comes from the zone\'s key-signing key (KSK): key tag, algorithm 8, digest type 2, digest.', '<code>gcloud dns managed-zones update shop-zone --dnssec-state=on</code>, then <code>gcloud dns dns-keys describe 0 --zone=shop-zone --format="value(ds_record())"</code>, and copy its four fields into the registrar\'s DS form.'] },
+      { text: 'Confirm a validating resolver returns the AD flag for contoso-shop.com.',
+        check: st => (st.flags.adSeen && publicResolve(st, ORIGIN, 'A').ad) || 'No validated (AD) answer observed yet.',
+        hints: ['Use a recursive resolver, not the authoritative servers.', 'Plain <code>dig</code> queries the validating resolver. Look for <code>ad</code> in the flags line.', '<code>dig +dnssec contoso-shop.com</code>'] }
+    ],
+    solution(st) {
+      const ns = cloudNs(st).join('\n');
+      return [
+        { cmd: `cat ${FILE}`, note: 'Read the export first. The apex, www, MX and mail lines are where the export tool cuts corners.' },
+        { cmd: 'gcloud dns managed-zones create shop-zone --dns-name=contoso-shop.com. --description="Contoso Shop (migrated from OldHost)"', note: 'Create the public zone. It gets four name servers, but nothing points at them yet, so this changes nothing live.' },
+        { cmd: `gcloud dns record-sets import ${FILE} --zone=shop-zone --zone-file-format`, note: 'Try the import as-is to see what Cloud DNS rejects.' },
+        { note: 'Fix the file: apex A instead of a CNAME, the trailing dot on www (otherwise it becomes www → contoso-shop.com.contoso-shop.com.), MX to a host name, and no A next to the mail CNAME.', run: api => api.fill('#zone-editor', FIXED_FILE, { instant: true }) },
+        { cmd: `gcloud dns record-sets import ${FILE} --zone=shop-zone --zone-file-format --delete-all-existing`, note: 'Import the corrected file.' },
+        { cmd: `gcloud dns record-sets create contoso-shop.com. --zone=shop-zone --type=CAA --ttl=3600 --rrdatas='0 issue "pki.goog"','0 issue "letsencrypt.org"','0 iodef "mailto:security@contoso-shop.com"'`, note: 'CAA: only Google Trust Services (used by the load balancer\'s managed certificate) and Let\'s Encrypt may issue certificates.' },
+        { cmd: 'gcloud dns managed-zones describe shop-zone', note: 'Note the four assigned name servers.' },
+        { cmd: `dig @${cloudNs(st)[0]} www.contoso-shop.com`, note: 'Verify against Cloud DNS directly, before the cutover: www resolves through the apex to 34.120.10.20.' },
+        { cmd: `dig @${cloudNs(st)[0]} contoso-shop.com MX +short` },
+        { note: 'Records match, so cut over: replace OldHost\'s name servers with all four Cloud DNS servers at the registrar.', run: async api => { await api.fill('#reg-ns', ns, { instant: true }); await api.click('#reg-ns-save'); } },
+        { cmd: 'gcloud dns managed-zones update shop-zone --dnssec-state=on', note: 'Only now sign the zone: the registrar points at servers that serve it.' },
+        { cmd: 'gcloud dns dns-keys describe 0 --zone=shop-zone --format="value(ds_record())"', note: 'Read the DS record from the key-signing key: key tag, algorithm 8 (RSASHA256), digest type 2 (SHA-256), digest.' },
+        { note: 'Publish the DS at the registrar. This completes the chain of trust from .com down to the zone.', run: async api => { const k = ksk(api.state); await api.fill('#ds-keytag', String(k.keyTag)); await api.fill('#ds-alg', '8'); await api.fill('#ds-dtype', '2'); await api.fill('#ds-digest', k.digest, { instant: true }); await api.click('#ds-add'); } },
+        { cmd: 'dig +dnssec contoso-shop.com', note: 'A validating resolver now returns the answer with the AD flag: signed, delegated and validated.' }
+      ];
+    },
+    debrief: [
+      { title: 'Zone exports lie', text: 'A CNAME at the apex, an MX pointing at an IP, or a CNAME sharing a name with other records are invalid DNS that some hosts tolerate. Cloud DNS rejects them, and that\'s a feature.' },
+      { title: 'The silent killer is the missing dot', text: '<code>www CNAME contoso-shop.com</code> without a trailing dot is relative, so it really means <code>contoso-shop.com.contoso-shop.com.</code>. It imports without error and breaks www. Only verification catches it.' },
+      { title: 'CAA limits who can issue certificates', text: 'Without CAA any public CA may issue for your domain. Listing only the CAs you use (here pki.goog for the load balancer\'s managed certificate) blocks mis-issuance. Forgetting your own CA breaks renewals.' },
+      { title: 'Verify before you delegate', text: 'Querying the new authoritative servers directly (<code>dig @ns-cloud-…</code>) proves the zone is right while the old provider still serves the domain. The registrar change is then a non-event.' },
+      { title: 'DNSSEC order of operations', text: 'Sign the zone on the servers the parent points to, <em>then</em> publish the DS. A DS for an unsigned or mismatched zone makes every validating resolver return SERVFAIL. That\'s a full outage caused by a security feature.' },
+      { title: 'The AD flag is the proof', text: 'It means a resolver validated the whole chain: root → .com (DS) → your DNSKEY → signed records. That\'s the line I\'d put in the change record to close it.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

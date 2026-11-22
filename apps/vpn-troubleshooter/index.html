@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Fix a remote user's VPN access — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 05</div>
+    <h1>Lab: Fix a remote user's VPN access</h1>
+    <p>The VPN client says "Connected", but the intranet won't load. You have an admin command prompt on the user's laptop. Find the fault with real Windows tooling and fix it properly.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~8 min</span><span class="pill">Windows command prompt</span><span class="pill">3 randomized faults</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the structured triage I ran as a First Line Engineer at Atos and Webhelp and as an escalation point at TCS: gather evidence, split DNS from routing, fix the root cause, verify.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Ticket INC0048213</h3>
+          <p style="font-size:14px">Maria Torres (Finance) is working from home. The GlobalConnect VPN client shows <strong>Connected</strong>, but she can't open the intranet (<code>intranet.contoso.local</code>) or the finance share (<code>\\fs01.contoso.local\finance</code>). Public websites load fine.</p>
+          <p class="muted" style="font-size:13px;margin:0">You're in a remote admin session on her laptop.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Network runbook</h3>
+          <dl class="facts">
+            <dt>VPN client pool</dt><dd>10.200.0.0/24</dd>
+            <dt>Tunnel gateway</dt><dd>10.200.0.1</dd>
+            <dt>Corporate range</dt><dd>10.10.0.0/16 (split tunnel: only this goes through the VPN)</dd>
+            <dt>Internal DNS</dt><dd>10.10.0.10, 10.10.0.11 (pushed by the VPN via DHCP)</dd>
+            <dt>intranet</dt><dd>intranet.contoso.local = 10.10.1.25</dd>
+            <dt>file server</dt><dd>fs01.contoso.local = 10.10.2.40</dd>
+            <dt>Split-tunnel route</dt><dd>Created by the deployment script as a persistent static route</dd>
+          </dl>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 05 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab;
+
+  const VARIANTS = [
+    { dnsBad: true, routeBad: false },
+    { dnsBad: false, routeBad: true },
+    { dnsBad: true, routeBad: true }
+  ];
+  const INTERNAL = {
+    'dc01.contoso.local': '10.10.0.10', 'dc02.contoso.local': '10.10.0.11',
+    'intranet.contoso.local': '10.10.1.25', 'fs01.contoso.local': '10.10.2.40'
+  };
+  const PUBLIC = { 'www.google.com': '142.250.72.196', 'login.microsoftonline.com': '20.190.151.68', 'contoso.com': '104.18.32.10', 'www.contoso.com': '104.18.32.10' };
+  const HOSTS_UP = new Set(['10.10.0.10', '10.10.0.11', '10.10.1.25', '10.10.2.40', '10.200.0.1']);
+  const SERVER_NAMES = { '8.8.8.8': 'dns.google', '10.10.0.10': 'dc01.contoso.local', '10.10.0.11': 'dc02.contoso.local', '192.168.1.1': 'UnKnown', '1.1.1.1': 'one.one.one.one' };
+  const INTERNAL_DNS = ['10.10.0.10', '10.10.0.11'];
+
+  // ---------- network model
+  const lenOf = r => net.maskToLen(r.mask);
+  function lookupRoute(st, ip) {
+    let best = null;
+    st.routes.forEach(r => {
+      const len = lenOf(r); if (len === null) return;
+      if (net.contains(`${r.net}/${len}`, ip) && (!best || len > lenOf(best) || (len === lenOf(best) && r.metric < best.metric))) best = r;
+    });
+    return best;
+  }
+  function viaVpn(r) { return r && r.iface === '10.200.0.57'; }
+  function reachable(st, ip) {
+    if (ip === '127.0.0.1') return { ok: true, ms: 0 };
+    const r = lookupRoute(st, ip); if (!r) return { ok: false };
+    if (viaVpn(r)) return HOSTS_UP.has(ip) ? { ok: true, ms: 36 + Math.floor(Math.random() * 6) } : { ok: false };
+    if (ip.startsWith('192.168.1.')) return ip === '192.168.1.1' ? { ok: true, ms: 2 } : { ok: false };
+    if (ip.startsWith('10.') || ip.startsWith('172.16.') || ip.startsWith('192.168.')) return { ok: false };
+    return { ok: true, ms: 15 + Math.floor(Math.random() * 6) };
+  }
+  // Ask one DNS server. Returns {timeout} | {nx} | {ip}
+  function askServer(st, server, name) {
+    if (!reachable(st, server).ok) return { timeout: true };
+    name = name.toLowerCase().replace(/\.$/, '');
+    if (INTERNAL_DNS.includes(server) && INTERNAL[name]) return { ip: INTERNAL[name] };
+    if (PUBLIC[name]) return { ip: PUBLIC[name] };
+    return { nx: true };
+  }
+  function serverList(st) { return st.adapters.vpn.dns.concat(st.adapters.wifi.dns); }
+  // Client resolver (uses cache) — what ping/tracert use
+  function resolve(st, name) {
+    const key = name.toLowerCase().replace(/\.$/, '');
+    if (net.isIp(key)) return { ip: key };
+    const c = st.cache[key];
+    if (c) return c.neg ? { nx: true, cached: true } : { ip: c.ip, cached: true };
+    for (const s of serverList(st)) {
+      const r = askServer(st, s, key);
+      if (r.timeout) continue;
+      if (r.ip) { st.cache[key] = { ip: r.ip }; return r; }
+      st.cache[key] = { neg: true }; return { nx: true };
+    }
+    return { nx: true };
+  }
+  const dnsOk = st => INTERNAL_DNS.includes(st.adapters.vpn.dns[0]);
+  function routeState(st) {
+    const targets = ['10.10.1.25', '10.10.2.40', '10.10.0.10', '10.10.0.11'];
+    const routes = targets.map(ip => lookupRoute(st, ip));
+    const works = routes.every(r => viaVpn(r) && r.gw === '10.200.0.1');
+    const persistent = works && routes.every(r => r.persistent);
+    return { works, persistent };
+  }
+
+  // ---------- output helpers
+  function ipconfigAll(st) {
+    const a = st.adapters;
+    const dnsLines = list => list.map((d, i) => (i === 0 ? d : ' '.repeat(39) + d)).join('\n');
+    const block = (title, x) => `${title}:
+
+   Connection-specific DNS Suffix  . : ${x.suffix}
+   Description . . . . . . . . . . . : ${x.desc}
+   Physical Address. . . . . . . . . : ${x.mac}
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+   IPv4 Address. . . . . . . . . . . : ${x.ip}(Preferred)
+   Subnet Mask . . . . . . . . . . . : ${x.mask}
+   Default Gateway . . . . . . . . . : ${x.gw}
+   DNS Servers . . . . . . . . . . . : ${dnsLines(x.dns)}
+   NetBIOS over Tcpip. . . . . . . . : Enabled`;
+    return `Windows IP Configuration
+
+   Host Name . . . . . . . . . . . . : CTSO-LT-0417
+   Primary Dns Suffix  . . . . . . . :
+   Node Type . . . . . . . . . . . . : Hybrid
+   IP Routing Enabled. . . . . . . . : No
+   WINS Proxy Enabled. . . . . . . . : No
+   DNS Suffix Search List. . . . . . : contoso.local
+                                       home
+
+${block('Unknown adapter VPN', a.vpn)}
+
+${block('Wireless LAN adapter Wi-Fi', a.wifi)}`;
+  }
+  function ipconfigShort(st) {
+    const b = (t, x) => `${t}:
+
+   Connection-specific DNS Suffix  . : ${x.suffix}
+   IPv4 Address. . . . . . . . . . . : ${x.ip}
+   Subnet Mask . . . . . . . . . . . : ${x.mask}
+   Default Gateway . . . . . . . . . : ${x.gw}`;
+    return `Windows IP Configuration\n\n${b('Unknown adapter VPN', st.adapters.vpn)}\n\n${b('Wireless LAN adapter Wi-Fi', st.adapters.wifi)}`;
+  }
+  function routePrint(st) {
+    const sorted = st.routes.slice().sort((x, y) => net.ipToInt(x.net) - net.ipToInt(y.net));
+    const row = r => `${r.net.padStart(17)}${r.mask.padStart(17)}${r.gw.padStart(17)}${r.iface.padStart(17)}${String(r.metric).padStart(7)}`;
+    const pers = st.routes.filter(r => r.persistent);
+    const line = '='.repeat(75);
+    return `${line}
+Interface List
+ 14...00 ff 2b 11 9a 03 ......GlobalConnect Virtual Ethernet Adapter
+  9...3c 21 9c 4a 77 10 ......Intel(R) Wi-Fi 6E AX211 160MHz
+  1...........................Software Loopback Interface 1
+${line}
+
+IPv4 Route Table
+${line}
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+${sorted.map(row).join('\n')}
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+${line}
+Persistent Routes:
+${pers.length ? '  Network Address          Netmask  Gateway Address  Metric\n' + pers.map(r => `${r.net.padStart(17)}${r.mask.padStart(17)}${r.gw.padStart(17)}${String(r.metric).padStart(8)}`).join('\n') : '  None'}
+${line}`;
+  }
+
+  function doPing(st, lab, target, count) {
+    const r = resolve(st, target);
+    if (r.nx) return { text: `Ping request could not find host ${target}. Please check the name and try again.`, cls: 'err' };
+    const ip = r.ip; const isName = !net.isIp(target);
+    const head = `Pinging ${isName ? target + ' [' + ip + ']' : ip} with 32 bytes of data:`;
+    const res = reachable(st, ip);
+    const lines = [];
+    for (let i = 0; i < count; i++) lines.push(res.ok ? `Reply from ${ip}: bytes=32 time=${res.ms + (i % 3)}ms TTL=${viaVpn(lookupRoute(st, ip)) ? 126 : 117}` : 'Request timed out.');
+    const recv = res.ok ? count : 0;
+    if (ip.startsWith('10.10.')) lab.flag('testedIp');
+    const tname = target.toLowerCase().replace(/\.$/, '');
+    if (res.ok && tname === 'intranet.contoso.local') lab.flag('verified');
+    if (res.ok && tname === 'fs01.contoso.local') lab.flag('fs01');
+    return { text: `${head}\n${lines.join('\n')}\n\nPing statistics for ${ip}:\n    Packets: Sent = ${count}, Received = ${recv}, Lost = ${count - recv} (${Math.round((count - recv) / count * 100)}% loss),` + (res.ok ? `\nApproximate round trip times in milli-seconds:\n    Minimum = ${res.ms}ms, Maximum = ${res.ms + 2}ms, Average = ${res.ms + 1}ms` : ''), cls: res.ok ? '' : 'warn' };
+  }
+
+  function normNetsh(toks) {
+    return toks.map(t => ({ int: 'interface', ipv4: 'ip', dnsservers: 'dns', dnsserver: 'dns', sh: 'show' }[t.toLowerCase()] || t));
+  }
+
+  const commands = lab => ({
+    ipconfig: {
+      raw: true, desc: 'Show adapter configuration (/all, /flushdns, /displaydns, /registerdns, /renew)',
+      usage: 'ipconfig [/all | /flushdns | /displaydns | /registerdns | /release | /renew]',
+      run: a => {
+        const st = lab.state; const sw = (a._pos[0] || '').toLowerCase();
+        if (!sw) return { text: ipconfigShort(st) };
+        if (sw === '/all') { lab.flag('ipconfigAll'); return { text: ipconfigAll(st) }; }
+        if (sw === '/flushdns') { st.cache = {}; return { text: 'Windows IP Configuration\n\nSuccessfully flushed the DNS Resolver Cache.' }; }
+        if (sw === '/displaydns') {
+          const keys = Object.keys(st.cache);
+          if (!keys.length) return { text: 'Windows IP Configuration\n\n    (the DNS resolver cache is empty)' };
+          return { text: 'Windows IP Configuration\n\n' + keys.map(k => {
+            const c = st.cache[k];
+            return c.neg ? `    ${k}\n    ----------------------------------------\n    Name does not exist.\n` :
+              `    ${k}\n    ----------------------------------------\n    Record Name . . . . . : ${k}\n    Record Type . . . . . : 1\n    Time To Live  . . . . : 1162\n    Data Length . . . . . : 4\n    Section . . . . . . . : Answer\n    A (Host) Record . . . : ${c.ip}\n`;
+          }).join('\n') };
+        }
+        if (sw === '/registerdns') return { text: 'Windows IP Configuration\n\nRegistration of the DNS resource records for all adapters of this computer has been initiated. Any errors will be reported in the Event Viewer in 15 minutes.' };
+        if (sw === '/release' || sw === '/renew') return { text: `Windows IP Configuration\n\n${sw === '/renew' ? 'Renewed DHCP lease for Wi-Fi.' : 'Released DHCP lease for Wi-Fi.'} (The VPN adapter is managed by the GlobalConnect client and was not changed.)\n\n` + ipconfigShort(st) };
+        throw CmdError('Error: unrecognized or incomplete command line.\n\nUSAGE:\n    ipconfig [/all | /flushdns | /displaydns | /registerdns | /release | /renew]');
+      }
+    },
+    nslookup: {
+      raw: true, desc: 'Query a DNS server directly (bypasses the client cache)', usage: 'nslookup <name> [server]',
+      run: a => {
+        const st = lab.state; const name = a._pos[0];
+        if (!name) throw CmdError('Interactive nslookup isn\'t supported in this simulation. Usage: nslookup <name> [server]');
+        const server = a._pos[1] || serverList(st)[0];
+        if (!net.isIp(server)) throw CmdError(`*** Can't find server address for '${server}': use an IP address in this simulation.`);
+        const sname = SERVER_NAMES[server] || 'UnKnown';
+        const n = name.toLowerCase().replace(/\.$/, '');
+        if (n.endsWith('contoso.local')) lab.flag('testedDns');
+        const r = askServer(st, server, n);
+        if (r.timeout) return { text: `DNS request timed out.\n    timeout was 2 seconds.\nServer:  UnKnown\nAddress:  ${server}\n\nDNS request timed out.\n    timeout was 2 seconds.\n*** Request to UnKnown timed-out`, cls: 'warn' };
+        if (r.nx) return { text: `Server:  ${sname}\nAddress:  ${server}\n\n*** ${sname} can't find ${name}: Non-existent domain`, cls: 'warn' };
+        return { text: `Server:  ${sname}\nAddress:  ${server}\n\n${INTERNAL_DNS.includes(server) ? '' : 'Non-authoritative answer:\n'}Name:    ${n}\nAddress:  ${r.ip}` };
+      }
+    },
+    ping: {
+      raw: true, desc: 'Test reachability (resolves names through the client cache)', usage: 'ping [-n count] <host>',
+      run: a => {
+        const p = a._pos.slice(); let count = 4; let target = null;
+        for (let i = 0; i < p.length; i++) {
+          const t = p[i].toLowerCase();
+          if (t === '-n' || t === '/n') { count = Math.max(1, Math.min(10, parseInt(p[++i], 10) || 4)); }
+          else if (t === '-t') { count = 6; }
+          else if (t.startsWith('-')) continue;
+          else target = p[i];
+        }
+        if (!target) throw CmdError('Usage: ping [-n count] target_name');
+        return doPing(lab.state, lab, target, count);
+      }
+    },
+    tracert: {
+      raw: true, desc: 'Trace the path to a host', usage: 'tracert [-d] <host>',
+      run: a => {
+        const st = lab.state; const target = a._pos.filter(t => !t.startsWith('-'))[0];
+        if (!target) throw CmdError('Usage: tracert [-d] target_name');
+        const r = resolve(st, target);
+        if (r.nx) return { text: `Unable to resolve target system name ${target}.`, cls: 'err' };
+        const ip = r.ip; const route = lookupRoute(st, ip); const ok = reachable(st, ip).ok;
+        const hops = [];
+        if (viaVpn(route)) { hops.push(`  1    37 ms    36 ms    38 ms  10.200.0.1`); hops.push(ok ? `  2    39 ms    38 ms    40 ms  ${ip}` : `  2     *        *        *     Request timed out.`); }
+        else {
+          hops.push(`  1     2 ms     1 ms     2 ms  192.168.1.1`);
+          hops.push(`  2     9 ms     8 ms     9 ms  100.64.0.1`);
+          if (ok) hops.push(`  3    17 ms    16 ms    17 ms  ${ip}`);
+          else { hops.push(`  3     *        *        *     Request timed out.`); hops.push(`  4     *        *        *     Request timed out.`); hops.push('  (trace truncated in this simulation — the packets left through your home router, not the tunnel)'); }
+        }
+        if (ip.startsWith('10.10.')) lab.flag('testedIp');
+        return { text: `Tracing route to ${net.isIp(target) ? ip : target + ' [' + ip + ']'}\nover a maximum of 30 hops:\n\n${hops.join('\n')}\n\nTrace complete.` };
+      }
+    },
+    route: {
+      raw: true, desc: 'Show or change the IPv4 route table', usage: 'route print | route [-p] add <net> mask <mask> <gateway> [metric N] | route delete <net>',
+      run: a => {
+        const st = lab.state; const p = a._pos.slice(); let persistent = false;
+        if (p[0] && p[0].toLowerCase() === '-p') { persistent = true; p.shift(); }
+        const verb = (p[0] || '').toLowerCase();
+        if (verb === 'print' || verb === '') return { text: routePrint(st) };
+        if (verb === 'add' || verb === 'change') {
+          const dest = p[1]; const mi = p.findIndex(x => x.toLowerCase() === 'mask');
+          const mask = mi > 0 ? p[mi + 1] : '255.255.255.255';
+          const gw = mi > 0 ? p[mi + 2] : p[2];
+          const mt = p.findIndex(x => x.toLowerCase() === 'metric'); const metric = mt > 0 ? parseInt(p[mt + 1], 10) || 1 : 1;
+          if (!dest || !gw || !net.isIp(dest) || !net.isIp(gw) || !net.isIp(mask)) throw CmdError('Route: bad gateway address ' + (gw || '') + '\n\nUsage: route [-p] ADD destination MASK netmask gateway [METRIC metric]');
+          const len = net.maskToLen(mask);
+          if (len === null) throw CmdError('The route addition failed: The specified mask parameter is invalid. (Destination & Mask) != Destination.');
+          if (!net.parseCidr(`${dest}/${len}`).exact) throw CmdError('The route addition failed: The specified mask parameter is invalid. (Destination & Mask) != Destination.');
+          let iface = null;
+          if (net.contains('10.200.0.0/24', gw)) iface = '10.200.0.57'; else if (net.contains('192.168.1.0/24', gw)) iface = '192.168.1.34';
+          if (!iface) throw CmdError('The route addition failed: Either the interface index is wrong or the gateway does not lie on the same network as the interface. Check the IP Address Table for the machine.');
+          const existing = st.routes.find(r => r.net === dest && r.mask === mask);
+          if (verb === 'add' && existing) throw CmdError('The route addition failed: The object already exists.');
+          if (verb === 'change') { if (!existing) throw CmdError('The route change failed: Element not found.'); Object.assign(existing, { gw, iface, metric }); return { text: ' OK!' }; }
+          st.routes.push({ net: dest, mask, gw, iface, metric, persistent });
+          return { text: ' OK!' };
+        }
+        if (verb === 'delete') {
+          const dest = p[1]; if (!dest) throw CmdError('Usage: route DELETE destination [MASK netmask]');
+          const mi = p.findIndex(x => x.toLowerCase() === 'mask'); const mask = mi > 0 ? p[mi + 1] : null;
+          const before = st.routes.length;
+          st.routes = st.routes.filter(r => !(r.net === dest && (!mask || r.mask === mask)));
+          if (st.routes.length === before) throw CmdError('The route deletion failed: Element not found.');
+          return { text: ' OK!' };
+        }
+        throw CmdError('Usage: route print | route [-p] add <net> mask <mask> <gateway> | route delete <net>');
+      }
+    },
+    netsh: {
+      raw: true, desc: 'Configure interfaces (netsh interface ip show config | set dns | add dns)',
+      usage: 'netsh interface ip show config\nnetsh interface ip set dns name="<adapter>" source=dhcp\nnetsh interface ip set dns name="<adapter>" static <address>\nnetsh interface ip add dns name="<adapter>" <address> index=2',
+      run: a => {
+        const st = lab.state; const t = normNetsh(a._pos); const low = t.map(x => x.toLowerCase());
+        if (low[0] !== 'interface' || low[1] !== 'ip') throw CmdError('The following command was not found: ' + a._pos.join(' ') + '.\nSupported here: netsh interface ip show config | set dns | add dns');
+        const verb = low[2], obj = low[3];
+        const kv = {}; const pos = [];
+        t.slice(4).forEach(x => { const i = x.indexOf('='); if (i > 0) kv[x.slice(0, i).toLowerCase()] = x.slice(i + 1); else pos.push(x); });
+        const adapterByName = n => Object.values(st.adapters).find(x => x.name.toLowerCase() === String(n || '').toLowerCase());
+        if (verb === 'show' && (obj === 'config' || obj === 'dns' || obj === 'dnsservers')) {
+          const list = kv.name ? [adapterByName(kv.name)].filter(Boolean) : Object.values(st.adapters);
+          if (!list.length) throw CmdError('The filename, directory name, or volume label syntax is incorrect.');
+          return { text: list.map(x => `\nConfiguration for interface "${x.name}"\n    DHCP enabled:                         Yes\n    IP Address:                           ${x.ip}\n    Subnet Prefix:                        ${x.mask}\n    Default Gateway:                      ${x.gw || ''}\n    ${x.dnsSource === 'dhcp' ? 'DNS servers configured through DHCP:' : 'Statically Configured DNS Servers:   '}  ${x.dns.join('\n                                          ')}`).join('\n') };
+        }
+        if ((verb === 'set' || verb === 'add') && obj === 'dns') {
+          const known = ['static', 'dhcp', 'primary', 'both', 'none'];
+          const name = kv.name || pos.find(x => !known.includes(x.toLowerCase()) && !net.isIp(x));
+          const ad = adapterByName(name);
+          if (!ad) throw CmdError('The filename, directory name, or volume label syntax is incorrect.\n(Use the adapter name shown by ipconfig, e.g. name="VPN".)');
+          const source = (kv.source || pos.find(x => ['static', 'dhcp'].includes(x.toLowerCase())) || '').toLowerCase();
+          const addr = kv.address || pos.find(x => net.isIp(x));
+          if (verb === 'add') {
+            if (!addr) throw CmdError('The syntax supplied for this command is not valid. Check help for the correct syntax.');
+            const idx = parseInt(kv.index, 10) || ad.dns.length + 1;
+            if (ad.dnsSource === 'dhcp') { ad.dnsSource = 'static'; ad.dns = []; }
+            ad.dns = ad.dns.filter(d => d !== addr); ad.dns.splice(Math.max(0, idx - 1), 0, addr);
+            return null;
+          }
+          if (source === 'dhcp') { ad.dns = ad.dhcpDns.slice(); ad.dnsSource = 'dhcp'; return null; }
+          if (source === 'static' || addr) {
+            if (!addr) throw CmdError('The syntax supplied for this command is not valid. Check help for the correct syntax.');
+            ad.dns = [addr]; ad.dnsSource = 'static'; return null;
+          }
+          throw CmdError('The syntax supplied for this command is not valid. Check help for the correct syntax.');
+        }
+        throw CmdError('The following command was not found: netsh ' + a._pos.join(' ') + '.');
+      }
+    },
+    hostname: { raw: true, desc: 'Show the computer name', run: () => 'CTSO-LT-0417' },
+    whoami: { raw: true, desc: 'Show the signed-in account', run: () => 'contoso\\adm-rdelagarza' }
+  });
+
+  Lab({
+    id: 'vpn-troubleshooter', dialect: 'cmd', variants: 3, termTitle: 'Administrator: Command Prompt — CTSO-LT-0417 (remote session)',
+    prompt: 'C:\\Windows\\system32>',
+    banner: 'Microsoft Windows [Version 10.0.22631.4460]\n(c) Microsoft Corporation. All rights reserved.\n\nRemote session established as CONTOSO\\adm-rdelagarza (local administrator).\nType "help" for the commands available in this simulation.\n',
+    createState(v) {
+      const V = VARIANTS[v];
+      return {
+        V,
+        adapters: {
+          wifi: { name: 'Wi-Fi', desc: 'Intel(R) Wi-Fi 6E AX211 160MHz', mac: '3C-21-9C-4A-77-10', ip: '192.168.1.34', mask: '255.255.255.0', gw: '192.168.1.1', dns: ['192.168.1.1'], dnsSource: 'dhcp', dhcpDns: ['192.168.1.1'], suffix: 'home' },
+          vpn: { name: 'VPN', desc: 'GlobalConnect Virtual Ethernet Adapter', mac: '00-FF-2B-11-9A-03', ip: '10.200.0.57', mask: '255.255.255.0', gw: '', dns: V.dnsBad ? ['8.8.8.8'] : INTERNAL_DNS.slice(), dnsSource: V.dnsBad ? 'static' : 'dhcp', dhcpDns: INTERNAL_DNS.slice(), suffix: 'contoso.local' }
+        },
+        routes: [
+          { net: '0.0.0.0', mask: '0.0.0.0', gw: '192.168.1.1', iface: '192.168.1.34', metric: 35, persistent: false },
+          { net: '10.10.0.0', mask: V.routeBad ? '255.255.255.0' : '255.255.0.0', gw: '10.200.0.1', iface: '10.200.0.57', metric: 1, persistent: true },
+          { net: '10.200.0.0', mask: '255.255.255.0', gw: 'On-link', iface: '10.200.0.57', metric: 1, persistent: false },
+          { net: '192.168.1.0', mask: '255.255.255.0', gw: 'On-link', iface: '192.168.1.34', metric: 291, persistent: false }
+        ],
+        cache: V.dnsBad ? { 'intranet.contoso.local': { neg: true } } : {},
+        flags: {}
+      };
+    },
+    commands,
+    objectives: [
+      { text: 'Collect the VPN adapter\'s full configuration, including its DNS servers.',
+        check: st => st.flags.ipconfigAll || 'You haven\'t looked at the per-adapter DNS servers yet.',
+        hints: ['Plain <code>ipconfig</code> doesn\'t list DNS servers.', 'There\'s a switch that prints everything for every adapter.', 'Run <code>ipconfig /all</code> and read the VPN adapter\'s DNS Servers line.'] },
+      { text: 'Isolate the fault: test name resolution and reachability-by-IP separately.',
+        check: st => (st.flags.testedDns && st.flags.testedIp) || (!st.flags.testedDns ? 'Test DNS on its own (resolve an internal name).' : 'Test the path to an internal IP address without involving DNS.'),
+        hints: ['Split the problem: can the laptop find the IP, and can it reach the IP?', '<code>nslookup</code> tests DNS; <code>ping</code> or <code>tracert</code> against a raw IP tests routing.', 'Try <code>nslookup intranet.contoso.local</code> and <code>ping 10.10.1.25</code>. If nslookup fails, try it again against a specific server: <code>nslookup intranet.contoso.local 10.10.0.10</code>.'] },
+      { text: 'Fix the root cause. The fix must survive a reboot or reconnect.',
+        check: st => {
+          const r = routeState(st);
+          if (dnsOk(st) && r.persistent) return true;
+          if (dnsOk(st) && r.works) return 'Traffic is routed correctly now, but your route won\'t survive a reboot.';
+          return 'The intranet still isn\'t reachable by name through the tunnel. Compare the laptop\'s settings with the runbook.';
+        },
+        hints: ['Compare what you found with the runbook: which DNS servers and which route should the VPN provide?', 'DNS settings are changed with <code>netsh interface ip set dns</code>. For routes, check <code>route print</code>: the mask decides what the route covers, and <code>-p</code> makes a route persistent.', 'DNS fix: <code>netsh interface ip set dns name="VPN" source=dhcp</code>. Route fix: <code>route delete 10.10.0.0</code> then <code>route -p add 10.10.0.0 mask 255.255.0.0 10.200.0.1</code>. Apply whichever matches what you found.'] },
+      { text: 'Verify from the user\'s point of view: <code>ping intranet.contoso.local</code> gets replies.',
+        check: st => st.flags.verified || 'No successful ping to intranet.contoso.local yet.',
+        hints: ['Windows caches failed lookups too, for several minutes.', '<code>nslookup</code> bypasses that cache; <code>ping</code> doesn\'t. ipconfig has a switch to clear it.', 'Run <code>ipconfig /flushdns</code>, then <code>ping intranet.contoso.local</code>.'] },
+      { text: 'Check the finance file server responds by name too.', optional: true,
+        check: st => st.flags.fs01 || 'fs01.contoso.local hasn\'t replied yet.',
+        hints: ['Same test as the intranet, different host.', 'The runbook lists the file server\'s FQDN.', '<code>ping fs01.contoso.local</code>'] }
+    ],
+    solution(st) {
+      const s = [
+        { cmd: 'ipconfig /all', note: 'Gather evidence first: /all shows which DNS servers each adapter is using.' },
+        { cmd: 'nslookup intranet.contoso.local', note: 'Test DNS on its own. nslookup asks the server directly and ignores the local cache.' },
+        { cmd: 'ping 10.10.1.25', note: 'Test the path to the intranet by IP, with DNS out of the picture.' }
+      ];
+      if (st.V.dnsBad) {
+        s.push({ cmd: 'nslookup intranet.contoso.local 10.10.0.10', note: 'The corporate DNS server knows the name, so the laptop is simply asking the wrong server (someone set 8.8.8.8 statically on the VPN adapter).' });
+        s.push({ cmd: 'netsh interface ip set dns name="VPN" source=dhcp', note: 'Hand DNS back to the VPN client (DHCP) instead of hard-coding another server. It persists and stays correct if the servers change.' });
+      }
+      if (st.V.routeBad) {
+        s.push({ cmd: 'route print', note: 'Reachability by IP failed, so check the route table: the split-tunnel route has a /24 mask and only covers 10.10.0.x.' });
+        s.push({ cmd: 'route delete 10.10.0.0', note: 'Remove the wrong route…' });
+        s.push({ cmd: 'route -p add 10.10.0.0 mask 255.255.0.0 10.200.0.1', note: '…and add the /16 split-tunnel route through the tunnel gateway. -p makes it persistent.' });
+      }
+      s.push({ cmd: 'ipconfig /flushdns', note: 'Clear the resolver cache: Windows remembers the failed lookup and would keep failing for several minutes.' });
+      s.push({ cmd: 'ping intranet.contoso.local', note: 'Verify as the user would experience it.' });
+      s.push({ cmd: 'ping fs01.contoso.local', note: 'And the finance file server.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Evidence before action', text: '<code>ipconfig /all</code> is the only built-in view that shows DNS servers per adapter. Most "VPN is broken" tickets are visible right there.' },
+      { title: 'Split DNS from routing', text: 'nslookup tests resolution and ping-by-IP tests the path. Together they tell you which half is broken in two commands, instead of guessing.' },
+      { title: 'nslookup ignores the cache, ping doesn\'t', text: 'That\'s why the intranet could resolve in nslookup and still fail in ping until <code>ipconfig /flushdns</code>. Windows caches negative answers for minutes.' },
+      { title: 'Masks decide coverage', text: '255.255.255.0 only covers 10.10.0.x. The intranet at 10.10.1.25 fell outside it and went to the home router instead of the tunnel.' },
+      { title: 'Fix it so it stays fixed', text: 'Returning DNS to <code>source=dhcp</code> lets the VPN stay in control, and <code>route -p</code> survives reboots. A static 10.10.0.10 would work today and break the day the DNS servers change.' },
+      { title: 'Ticket note I\'d write', text: '"VPN adapter had a static public DNS server and/or a /24 split-tunnel route. Restored DHCP DNS and the /16 persistent route, flushed the cache, confirmed intranet and fs01 by name. Root cause: manual change on the device; recommend locking network settings via Intune."' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

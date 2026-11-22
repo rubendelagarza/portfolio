@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Connect an on-prem data center with HA VPN and BGP — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 08</div>
+    <h1>Lab: Connect an on-prem data center with HA VPN and BGP</h1>
+    <p>Build a 99.99%-SLA HA VPN between Google Cloud and the Monterrey data center. Read the on-prem router config, match it exactly, steer traffic with BGP, then pull a tunnel and watch it fail over.</p>
+    <div class="lab-meta"><span class="pill">Advanced</span><span class="pill">~15 min</span><span class="pill">gcloud · BGP</span><span class="pill">3 randomized router configs</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> hybrid connectivity from on-premises to Google Cloud with HA VPN, with redundancy and failover through Cloud Router and BGP. The same Cloud Router and BGP model applies to Dedicated and Partner Interconnect.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div class="panel">
+          <div class="row space-between mb-8">
+            <h3 style="margin:0">Topology</h3>
+            <div class="row lab-gui"><button type="button" class="ghost sm" id="btn-fail0">Fail the tunnel on interface 0</button><button type="button" class="ghost sm" id="btn-restore">Restore</button></div>
+          </div>
+          <div class="diagram" id="topo"></div>
+          <div id="failmsg" class="inline-msg"></div>
+        </div>
+        <div class="panel">
+          <h3>On-prem router · mty-edge (read-only view)</h3>
+          <pre class="log" id="onprem"></pre>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Change request CHG-3107</h3>
+          <p style="font-size:14px">Connect the Monterrey data center to VPC <code>hybrid-vpc</code> (project <code>contoso-hybrid</code>, region <code>us-central1</code>) with HA VPN at the 99.99% SLA. On-prem must learn GCP's range as a single aggregate, and should use <strong>the tunnel on HA VPN interface 0</strong> as its primary path.</p>
+          <dl class="facts"><dt>GCP subnets</dt><dd>10.30.1.0/24, 10.30.2.0/24 (aggregate 10.30.0.0/16)</dd><dt>Test VM</dt><dd>gcp-vm-1 · 10.30.1.10 · us-central1-a</dd></dl>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>On-prem config (from the network team)</h3>
+          <pre class="ref" id="onprem-config"></pre>
+          <p class="muted" style="font-size:12px;margin:8px 0 0">The <code>&lt;gcp-ifN-ip&gt;</code> placeholders are filled in automatically once your HA VPN gateway exists.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 08 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/gcp-common.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab;
+  const G = GcpSim;
+  const P = 'contoso-hybrid', REGION = 'us-central1', ZONE = 'us-central1-a';
+  const SUBNETS = ['10.30.1.0/24', '10.30.2.0/24'], AGG = '10.30.0.0/16';
+  const CONFIGS = [
+    { onAsn: 65010, gcpAsn: 65020, ip: ['203.0.113.10', '203.0.113.11'], psk: ['Tun0-Mty!2026', 'Tun1-Mty!2026'], ll: [['169.254.10.1', '169.254.10.2'], ['169.254.20.1', '169.254.20.2']], prefix: '172.16.0.0/16', host: '172.16.5.10' },
+    { onAsn: 64700, gcpAsn: 64600, ip: ['198.51.100.20', '198.51.100.21'], psk: ['mty-a-7Hq2!', 'mty-b-9Kd4!'], ll: [['169.254.33.1', '169.254.33.2'], ['169.254.34.1', '169.254.34.2']], prefix: '172.20.0.0/16', host: '172.20.5.10' },
+    { onAsn: 65100, gcpAsn: 65201, ip: ['192.0.2.50', '192.0.2.51'], psk: ['Edge0#Mty', 'Edge1#Mty'], ll: [['169.254.0.5', '169.254.0.6'], ['169.254.0.9', '169.254.0.10']], prefix: '172.18.0.0/16', host: '172.18.5.10' }
+  ];
+  const isPrivateAsn = a => (a >= 64512 && a <= 65534) || (a >= 4200000000 && a <= 4294967294);
+
+  function createState(v) {
+    return { v, c: CONFIGS[v], vpnGateways: [], extGateways: [], routers: [], tunnels: [], fail0: false, flags: {} };
+  }
+  const find = (arr, n) => arr.find(x => x.name === n);
+  const regionArg = (a, cmd) => { if (!a.region) throw G.invalid(cmd, 'argument --region: Must be specified. (Default region isn\'t set in this Cloud Shell.)'); if (a.region !== REGION) throw G.invalid(cmd, `This change request is for ${REGION}.`); };
+
+  // ---------- model
+  function onpremIdx(st, t) { const ext = find(st.extGateways, t.ext); const ip = ext && ext.interfaces[t.peerIf]; return st.c.ip.indexOf(ip); }
+  function tunnelStatus(st, t) {
+    const idx = onpremIdx(st, t);
+    if (idx < 0) return { s: 'NO_INCOMING_PACKETS', d: 'No incoming packets from peer: that peer IP isn\'t one of mty-edge\'s interfaces.' };
+    if (t.iface !== idx) return { s: 'NO_INCOMING_PACKETS', d: `No incoming packets from peer: mty-edge's Tunnel${idx} expects HA VPN interface ${idx}, not ${t.iface}.` };
+    const dup = st.tunnels.find(o => o !== t && o.iface === t.iface && onpremIdx(st, o) === idx);
+    if (dup && st.tunnels.indexOf(dup) < st.tunnels.indexOf(t)) return { s: 'NO_INCOMING_PACKETS', d: `Duplicate of tunnel ${dup.name}: mty-edge already has an SA for this pair.` };
+    if (st.fail0 && t.iface === 0) return { s: 'NO_INCOMING_PACKETS', d: 'No incoming packets from peer (simulated failure of the interface-0 path).' };
+    if (t.ike !== 2) return { s: 'NEGOTIATION_FAILURE', d: 'Handshake failed: the peer only accepts IKEv2.' };
+    if (t.secret !== st.c.psk[idx]) return { s: 'AUTHORIZATION_ERROR', d: 'Peer authentication failed: the shared secret doesn\'t match.' };
+    return { s: 'ESTABLISHED', d: 'Tunnel is up and running.' };
+  }
+  function advertised(st, r) {
+    if (r.advMode !== 'CUSTOM') return SUBNETS.slice();
+    return (r.advGroups.includes('ALL_SUBNETS') ? SUBNETS.slice() : []).concat(r.advRanges);
+  }
+  function bgp(st, r, peer) {
+    const c = st.c;
+    const itf = r.interfaces.find(i => i.name === peer.iface);
+    const t = itf && find(st.tunnels, itf.tunnel);
+    if (!t) return { state: 'Idle', up: false, why: 'no linked tunnel' };
+    const ts = tunnelStatus(st, t);
+    if (ts.s !== 'ESTABLISHED') return { state: 'Idle', up: false, why: 'tunnel not established', t };
+    const idx = onpremIdx(st, t); const [g, o] = c.ll[idx];
+    if (itf.ip !== g || itf.mask !== 30) return { state: 'Active', up: false, t, idx, log: `BGP: TCP connection from ${itf.ip} on Tunnel${idx} refused: not a configured neighbor (neighbor is ${g})` };
+    if (peer.ip !== o) return { state: 'Connect', up: false, t, idx, log: `BGP: neighbor ${g} Active: no BGP OPEN received (GCP is trying to reach ${peer.ip}, but this router is ${o})` };
+    if (r.asn !== c.gcpAsn) return { state: 'Idle', up: false, t, idx, log: `%BGP-3-NOTIFICATION: sent to neighbor ${g} 2/2 (peer in wrong AS) 2 bytes ${r.asn.toString(16).toUpperCase().padStart(4, '0')}  (expected remote-as ${c.gcpAsn}, got ${r.asn})` };
+    if (peer.asn !== c.onAsn) return { state: 'Idle', up: false, t, idx, log: `%BGP-3-NOTIFICATION: received from neighbor ${g} 2/2 (peer in wrong AS) 2 bytes ${c.onAsn.toString(16).toUpperCase()}  (GCP expected AS ${peer.asn}; this router is AS ${c.onAsn})` };
+    return { state: 'Established', up: true, t, idx, log: `%BGP-5-ADJCHANGE: neighbor ${g} Up` };
+  }
+  function sessions(st) {
+    const out = [];
+    st.routers.forEach(r => r.peers.forEach(p => out.push(Object.assign({ r, p }, bgp(st, r, p)))));
+    return out;
+  }
+  function onpremView(st) {
+    const ss = sessions(st).filter(s => s.up);
+    const learned = ss.map(s => ({ s, routes: advertised(st, s.r), accepted: advertised(st, s.r).filter(x => x === AGG), med: s.p.priority }));
+    const cand = learned.filter(l => l.accepted.length);
+    let best = null, tie = false;
+    if (cand.length) { const min = Math.min(...cand.map(l => l.med)); const winners = cand.filter(l => l.med === min); best = winners[0]; tie = winners.length > 1; }
+    return { learned, cand, best, tie };
+  }
+  const gw = st => st.vpnGateways[0];
+  const extOk = st => st.extGateways.some(e => e.interfaces.length === 2 && st.c.ip.every(ip => e.interfaces.includes(ip)));
+  const tunnelsUp = st => [0, 1].every(i => st.tunnels.some(t => t.iface === i && tunnelStatus(st, t).s === 'ESTABLISHED'));
+  const bgpUp = st => [0, 1].every(i => sessions(st).some(s => s.up && s.t.iface === i));
+  const aggOnBoth = st => { const v = onpremView(st); return [0, 1].every(i => v.cand.some(l => l.s.t.iface === i)); };
+  function prefersIf0(st) {
+    const v = onpremView(st); if (!v.best || v.tie) return false;
+    const l0 = v.cand.find(l => l.s.t.iface === 0), l1 = v.cand.find(l => l.s.t.iface === 1);
+    return !!l0 && !!l1 && l0.med < l1.med;
+  }
+
+  // ---------- rendering helpers
+  const tunnelRow = t => { const gwObj = t._gw; return { NAME: t.name, REGION: REGION, GATEWAY: t.gw, VPN_INTERFACE: String(t.iface), PEER_ADDRESS: t._peerIp || '' }; };
+  function routerYaml(st, r) {
+    return Lab.util.toYaml({
+      bgp: { advertiseMode: r.advMode, advertisedGroups: r.advMode === 'CUSTOM' ? r.advGroups : undefined, advertisedIpRanges: r.advMode === 'CUSTOM' ? r.advRanges.map(x => ({ range: x })) : undefined, asn: r.asn, keepaliveInterval: 20 },
+      bgpPeers: r.peers.map(p => ({ advertisedRoutePriority: p.priority, interfaceName: p.iface, ipAddress: (r.interfaces.find(i => i.name === p.iface) || {}).ip, name: p.name, peerAsn: p.asn, peerIpAddress: p.ip })),
+      interfaces: r.interfaces.map(i => ({ ipRange: `${i.ip}/${i.mask}`, linkedVpnTunnel: G.url(P, `regions/${REGION}/vpnTunnels/${i.tunnel}`), name: i.name })),
+      name: r.name, network: G.url(P, 'global/networks/' + r.network), region: G.url(P, 'regions/' + REGION)
+    });
+  }
+
+  const commands = lab => {
+    const S = () => lab.state;
+    return {
+      'gcloud config list': { desc: 'Show the active configuration', run: () => `[core]\naccount = ruben@contoso-partner.com\nproject = ${P}\n\nYour active configuration is: [default]` },
+      'gcloud compute networks list': { desc: 'List VPC networks', run: () => G.table([{ NAME: 'hybrid-vpc', SUBNET_MODE: 'CUSTOM', BGP_ROUTING_MODE: 'GLOBAL' }]) },
+      'gcloud compute networks subnets list': { desc: 'List subnets', params: { network: {} }, run: () => G.table([{ NAME: 'prod-app', REGION, NETWORK: 'hybrid-vpc', RANGE: SUBNETS[0] }, { NAME: 'prod-data', REGION, NETWORK: 'hybrid-vpc', RANGE: SUBNETS[1] }]) },
+      'gcloud compute vpn-gateways create': {
+        desc: 'Create an HA VPN gateway (two interfaces)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, network: { required: true }, region: {}, 'stack-type': { type: 'enum', values: ['IPV4_ONLY', 'IPV4_IPV6'] } },
+        run: a => {
+          const cmd = 'gcloud compute vpn-gateways create'; regionArg(a, cmd);
+          if (a.network !== 'hybrid-vpc') throw G.notFound(cmd, P, 'global/networks/' + a.network);
+          if (find(S().vpnGateways, a.NAME)) throw G.exists(cmd, P, `regions/${REGION}/vpnGateways/${a.NAME}`);
+          if (S().vpnGateways.length) throw G.invalid(cmd, 'One HA VPN gateway is enough for this change request (it already has two interfaces).');
+          const g = { name: a.NAME, network: a.network, ips: [`35.242.${10 + Math.floor(Math.random() * 80)}.${2 + Math.floor(Math.random() * 120)}`, `35.220.${10 + Math.floor(Math.random() * 80)}.${2 + Math.floor(Math.random() * 120)}`] };
+          S().vpnGateways.push(g);
+          return { pre: `Creating VPN Gateway...⠼Created [${G.url(P, `regions/${REGION}/vpnGateways/${g.name}`)}].\nCreating VPN Gateway...done.`, objects: [{ NAME: g.name, INTERFACE0: g.ips[0], INTERFACE1: g.ips[1], NETWORK: g.network, REGION }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute vpn-gateways list': { desc: 'List HA VPN gateways', run: () => S().vpnGateways.length ? G.table(S().vpnGateways.map(g => ({ NAME: g.name, INTERFACE0: g.ips[0], INTERFACE1: g.ips[1], NETWORK: g.network, REGION }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute vpn-gateways describe': { desc: 'Show an HA VPN gateway', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {} }, run: a => { const g = find(S().vpnGateways, a.NAME); if (!g) throw G.notFound('gcloud compute vpn-gateways describe', P, `regions/${REGION}/vpnGateways/${a.NAME}`); return G.yaml({ kind: 'compute#vpnGateway', name: g.name, network: G.url(P, 'global/networks/' + g.network), stackType: 'IPV4_ONLY', vpnInterfaces: g.ips.map((ip, i) => ({ id: i, ipAddress: ip })) }); } },
+      'gcloud compute external-vpn-gateways create': {
+        desc: 'Describe the on-prem peer to Google Cloud', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, interfaces: { required: true, desc: 'e.g. 0=203.0.113.10,1=203.0.113.11' } },
+        run: a => {
+          const cmd = 'gcloud compute external-vpn-gateways create';
+          if (find(S().extGateways, a.NAME)) throw G.exists(cmd, P, 'global/externalVpnGateways/' + a.NAME);
+          const ifs = [];
+          a.interfaces.split(',').forEach(p => { const m = p.trim().match(/^(\d)=(.+)$/); if (!m || !net.isIp(m[2])) throw G.invalid(cmd, `Invalid value for [--interfaces]: '${p}'. Expected ID=IP_ADDRESS, e.g. 0=203.0.113.10.`); ifs[+m[1]] = m[2]; });
+          if (![1, 2, 4].includes(ifs.length) || ifs.some(x => !x)) throw G.invalid(cmd, 'Interfaces must be numbered from 0 and number 1, 2 or 4.');
+          const red = { 1: 'SINGLE_IP_INTERNALLY_REDUNDANT', 2: 'TWO_IPS_REDUNDANCY', 4: 'FOUR_IPS_REDUNDANCY' }[ifs.length];
+          S().extGateways.push({ name: a.NAME, interfaces: ifs, redundancy: red });
+          return { pre: `Created [${G.url(P, 'global/externalVpnGateways/' + a.NAME)}].`, objects: [{ NAME: a.NAME, REDUNDANCY_TYPE: red }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute external-vpn-gateways list': { desc: 'List external (peer) VPN gateways', run: () => S().extGateways.length ? G.table(S().extGateways.map(e => ({ NAME: e.name, REDUNDANCY_TYPE: e.redundancy, INTERFACES: e.interfaces.map((ip, i) => `${i}=${ip}`).join(',') }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute routers create': {
+        desc: 'Create a Cloud Router', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, network: { required: true }, region: {}, asn: { type: 'int', desc: 'Private ASN (64512–65534 or 4200000000–4294967294)' }, 'advertisement-mode': { type: 'enum', values: ['DEFAULT', 'CUSTOM'] }, 'set-advertisement-groups': { type: 'list' }, 'set-advertisement-ranges': { type: 'list' } },
+        run: a => {
+          const cmd = 'gcloud compute routers create'; regionArg(a, cmd);
+          if (a.network !== 'hybrid-vpc') throw G.notFound(cmd, P, 'global/networks/' + a.network);
+          if (find(S().routers, a.NAME)) throw G.exists(cmd, P, `regions/${REGION}/routers/${a.NAME}`);
+          const asn = a.asn === undefined ? 64512 : a.asn;
+          if (!isPrivateAsn(asn)) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.bgp.asn': '${asn}'. ASN must be a private ASN (64512–65534 or 4200000000–4294967294).`);
+          const r = { name: a.NAME, network: a.network, asn, advMode: 'DEFAULT', advGroups: [], advRanges: [], interfaces: [], peers: [] };
+          applyAdv(r, a, cmd);
+          S().routers.push(r);
+          return { pre: `Creating router [${r.name}]...done.`, objects: [{ NAME: r.name, REGION, NETWORK: r.network }], style: 'gcloud' };
+        }
+      },
+      'gcloud compute routers list': { desc: 'List Cloud Routers', run: () => S().routers.length ? G.table(S().routers.map(r => ({ NAME: r.name, REGION, NETWORK: r.network }))) : { text: 'Listed 0 items.' } },
+      'gcloud compute routers describe': { desc: 'Show a Cloud Router\'s config', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {} }, run: a => { const r = find(S().routers, a.NAME); if (!r) throw G.notFound('gcloud compute routers describe', P, `regions/${REGION}/routers/${a.NAME}`); return { text: routerYaml(S(), r) }; } },
+      'gcloud compute routers update': {
+        desc: 'Change ASN or route advertisements', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {}, asn: { type: 'int' }, 'advertisement-mode': { type: 'enum', values: ['DEFAULT', 'CUSTOM'] }, 'set-advertisement-groups': { type: 'list', desc: 'e.g. all_subnets' }, 'set-advertisement-ranges': { type: 'list', desc: 'e.g. 10.30.0.0/16' }, 'add-advertisement-ranges': { type: 'list' }, 'remove-advertisement-ranges': { type: 'list' } },
+        run: a => {
+          const cmd = 'gcloud compute routers update'; regionArg(a, cmd);
+          const r = find(S().routers, a.NAME); if (!r) throw G.notFound(cmd, P, `regions/${REGION}/routers/${a.NAME}`);
+          if (a.asn !== undefined) { if (!isPrivateAsn(a.asn)) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.bgp.asn': '${a.asn}'. ASN must be a private ASN.`); r.asn = a.asn; }
+          applyAdv(r, a, cmd);
+          return { text: `Updating router [${r.name}]...done.` };
+        }
+      },
+      'gcloud compute routers add-interface': {
+        desc: 'Add a BGP interface linked to a VPN tunnel', positional: ['ROUTER'],
+        params: { ROUTER: { posOnly: true, required: true }, 'interface-name': { required: true }, 'vpn-tunnel': { required: true }, 'ip-address': { required: true, desc: 'Cloud Router\'s link-local address' }, 'mask-length': { type: 'int', required: true }, region: {} },
+        run: a => {
+          const cmd = 'gcloud compute routers add-interface'; regionArg(a, cmd);
+          const r = find(S().routers, a.ROUTER); if (!r) throw G.notFound(cmd, P, `regions/${REGION}/routers/${a.ROUTER}`);
+          const t = find(S().tunnels, a['vpn-tunnel']); if (!t) throw G.notFound(cmd, P, `regions/${REGION}/vpnTunnels/${a['vpn-tunnel']}`);
+          if (t.router !== r.name) throw G.invalid(cmd, `Tunnel ${t.name} is attached to router ${t.router}, not ${r.name}.`);
+          if (r.interfaces.some(i => i.name === a['interface-name'])) throw G.invalid(cmd, `Interface ${a['interface-name']} already exists on router ${r.name}.`);
+          if (r.interfaces.some(i => i.tunnel === t.name)) throw G.invalid(cmd, `Tunnel ${t.name} already has a BGP interface on ${r.name}.`);
+          if (!net.isIp(a['ip-address']) || !net.contains('169.254.0.0/16', a['ip-address'])) throw G.invalid(cmd, `Invalid value for field 'resource.interfaces[0].ipRange': '${a['ip-address']}/${a['mask-length']}'. Must be a link-local address in 169.254.0.0/16.`);
+          if (a['mask-length'] !== 30) throw G.invalid(cmd, `Invalid value for field 'resource.interfaces[0].ipRange': '${a['ip-address']}/${a['mask-length']}'. HA VPN BGP sessions use a /30.`);
+          const base = net.parseCidr(a['ip-address'] + '/30').base, n = net.ipToInt(a['ip-address']);
+          if (n === base || n === base + 3) throw G.invalid(cmd, `Invalid value for field 'resource.interfaces[0].ipRange': '${a['ip-address']}/30'. That's the network or broadcast address of the /30.`);
+          r.interfaces.push({ name: a['interface-name'], tunnel: t.name, ip: a['ip-address'], mask: 30 });
+          return { text: `Updated [${G.url(P, `regions/${REGION}/routers/${r.name}`)}].` };
+        }
+      },
+      'gcloud compute routers add-bgp-peer': {
+        desc: 'Add a BGP peer on an interface', positional: ['ROUTER'],
+        params: { ROUTER: { posOnly: true, required: true }, 'peer-name': { required: true }, interface: { required: true }, 'peer-ip-address': { required: true }, 'peer-asn': { type: 'int', required: true }, 'advertised-route-priority': { type: 'int', desc: 'MED sent to the peer (default 100, lower is preferred)' }, region: {}, 'enable-bfd': { type: 'switch' } },
+        run: a => {
+          const cmd = 'gcloud compute routers add-bgp-peer'; regionArg(a, cmd);
+          const r = find(S().routers, a.ROUTER); if (!r) throw G.notFound(cmd, P, `regions/${REGION}/routers/${a.ROUTER}`);
+          const itf = r.interfaces.find(i => i.name === a.interface); if (!itf) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.bgpPeers[0].interfaceName': '${a.interface}'. No such interface on router ${r.name}.`);
+          if (r.peers.some(p => p.name === a['peer-name'])) throw G.invalid(cmd, `A BGP peer named ${a['peer-name']} already exists.`);
+          if (r.peers.some(p => p.iface === a.interface)) throw G.invalid(cmd, `Interface ${a.interface} already has a BGP peer.`);
+          if (!net.isIp(a['peer-ip-address']) || !net.sameSubnet(itf.ip, a['peer-ip-address'], 30) || itf.ip === a['peer-ip-address']) throw G.invalid(cmd, `Could not fetch resource:\n - Invalid value for field 'resource.bgpPeers[0].peerIpAddress': '${a['peer-ip-address']}'. It must be the other usable address in ${net.intToIp(net.parseCidr(itf.ip + '/30').base)}/30.`);
+          const pr = a['advertised-route-priority'] === undefined ? 100 : a['advertised-route-priority'];
+          if (pr < 0 || pr > 65535) throw G.invalid(cmd, 'advertised-route-priority must be between 0 and 65535.');
+          r.peers.push({ name: a['peer-name'], iface: a.interface, ip: a['peer-ip-address'], asn: a['peer-asn'], priority: pr });
+          return { text: `Creating peer [${a['peer-name']}] in router [${r.name}]...done.` };
+        }
+      },
+      'gcloud compute routers update-bgp-peer': {
+        desc: 'Change a BGP peer (e.g. advertised route priority)', positional: ['ROUTER'],
+        params: { ROUTER: { posOnly: true, required: true }, 'peer-name': { required: true }, 'advertised-route-priority': { type: 'int' }, 'peer-asn': { type: 'int' }, 'peer-ip-address': {}, region: {} },
+        run: a => {
+          const cmd = 'gcloud compute routers update-bgp-peer'; regionArg(a, cmd);
+          const r = find(S().routers, a.ROUTER); if (!r) throw G.notFound(cmd, P, `regions/${REGION}/routers/${a.ROUTER}`);
+          const p = r.peers.find(x => x.name === a['peer-name']); if (!p) throw G.invalid(cmd, `peer [${a['peer-name']}] not found in router [${r.name}].`);
+          if (a['advertised-route-priority'] !== undefined) p.priority = a['advertised-route-priority'];
+          if (a['peer-asn'] !== undefined) p.asn = a['peer-asn'];
+          if (a['peer-ip-address'] !== undefined) { const itf = r.interfaces.find(i => i.name === p.iface); if (!net.sameSubnet(itf.ip, a['peer-ip-address'], 30) || itf.ip === a['peer-ip-address']) throw G.invalid(cmd, `peerIpAddress must be in the interface's /30.`); p.ip = a['peer-ip-address']; }
+          return { text: `Updating peer [${p.name}] in router [${r.name}]...done.` };
+        }
+      },
+      'gcloud compute routers remove-bgp-peer': { desc: 'Remove a BGP peer', positional: ['ROUTER'], params: { ROUTER: { posOnly: true, required: true }, 'peer-name': { required: true }, region: {} }, run: a => { regionArg(a, 'gcloud compute routers remove-bgp-peer'); const r = find(S().routers, a.ROUTER); if (!r) throw G.notFound('gcloud compute routers remove-bgp-peer', P, `regions/${REGION}/routers/${a.ROUTER}`); r.peers = r.peers.filter(p => p.name !== a['peer-name']); return { text: `Updated [${G.url(P, `regions/${REGION}/routers/${r.name}`)}].` }; } },
+      'gcloud compute routers remove-interface': { desc: 'Remove a BGP interface', positional: ['ROUTER'], params: { ROUTER: { posOnly: true, required: true }, 'interface-name': { required: true }, region: {} }, run: a => { regionArg(a, 'gcloud compute routers remove-interface'); const r = find(S().routers, a.ROUTER); if (!r) throw G.notFound('gcloud compute routers remove-interface', P, `regions/${REGION}/routers/${a.ROUTER}`); if (r.peers.some(p => p.iface === a['interface-name'])) throw G.invalid('gcloud compute routers remove-interface', 'Remove the BGP peer on this interface first.'); r.interfaces = r.interfaces.filter(i => i.name !== a['interface-name']); return { text: `Updated [${G.url(P, `regions/${REGION}/routers/${r.name}`)}].` }; } },
+      'gcloud compute routers get-status': {
+        desc: 'Show BGP session state and learned routes', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {} },
+        run: a => {
+          regionArg(a, 'gcloud compute routers get-status');
+          const st = S(); const r = find(st.routers, a.NAME); if (!r) throw G.notFound('gcloud compute routers get-status', P, `regions/${REGION}/routers/${a.NAME}`);
+          const ss = r.peers.map(p => Object.assign({ p }, bgp(st, r, p)));
+          return { text: Lab.util.toYaml({
+            kind: 'compute#routerStatusResponse',
+            result: {
+              bestRoutes: ss.filter(s => s.up).map(s => ({ destRange: st.c.prefix, nextHopIp: s.p.ip, priority: 0, routeType: 'BGP' })),
+              bgpPeerStatus: ss.map(s => ({ advertisedRoutes: s.up ? advertised(st, r).map(x => ({ destRange: x, priority: s.p.priority })) : [], ipAddress: (r.interfaces.find(i => i.name === s.p.iface) || {}).ip, linkedVpnTunnel: s.t ? G.url(P, `regions/${REGION}/vpnTunnels/${s.t.name}`) : undefined, name: s.p.name, numLearnedRoutes: s.up ? 1 : 0, peerIpAddress: s.p.ip, state: s.state, status: s.up ? 'UP' : 'DOWN', uptime: s.up ? '4 minutes, 12 seconds' : undefined })),
+              network: G.url(P, 'global/networks/' + r.network)
+            }
+          }) };
+        }
+      },
+      'gcloud compute vpn-tunnels create': {
+        desc: 'Create an HA VPN tunnel', positional: ['NAME'],
+        params: { NAME: { posOnly: true, required: true }, region: {}, 'vpn-gateway': {}, interface: { type: 'int', desc: 'HA VPN gateway interface: 0 or 1' }, 'peer-external-gateway': {}, 'peer-external-gateway-interface': { type: 'int' }, 'peer-gcp-gateway': {}, 'peer-address': { desc: 'Classic VPN only' }, 'ike-version': { type: 'int', desc: '1 or 2 (default 2)' }, 'shared-secret': { required: true }, router: {} },
+        run: a => {
+          const st = S(); const cmd = 'gcloud compute vpn-tunnels create'; regionArg(a, cmd);
+          if (a['peer-address'] || a['target-vpn-gateway']) throw G.invalid(cmd, 'That creates a Classic VPN tunnel (99.9% SLA). This change request requires HA VPN: use --vpn-gateway, --interface and --peer-external-gateway.');
+          if (!a['vpn-gateway']) throw G.invalid(cmd, 'argument --vpn-gateway: Must be specified for HA VPN tunnels.');
+          if (a['peer-gcp-gateway']) throw G.invalid(cmd, 'The peer is an on-premises router: use --peer-external-gateway.');
+          if (!a['peer-external-gateway']) throw G.invalid(cmd, 'argument --peer-external-gateway: Must be specified.');
+          if (find(st.tunnels, a.NAME)) throw G.exists(cmd, P, `regions/${REGION}/vpnTunnels/${a.NAME}`);
+          const g = find(st.vpnGateways, a['vpn-gateway']); if (!g) throw G.notFound(cmd, P, `regions/${REGION}/vpnGateways/${a['vpn-gateway']}`);
+          if (![0, 1].includes(a.interface)) throw G.invalid(cmd, 'argument --interface: Must be specified as 0 or 1.');
+          const e = find(st.extGateways, a['peer-external-gateway']); if (!e) throw G.notFound(cmd, P, 'global/externalVpnGateways/' + a['peer-external-gateway']);
+          const pi = a['peer-external-gateway-interface'] === undefined ? 0 : a['peer-external-gateway-interface'];
+          if (!e.interfaces[pi]) throw G.invalid(cmd, `External VPN gateway ${e.name} has no interface ${pi}.`);
+          if (!a.router) throw G.invalid(cmd, 'argument --router: Must be specified. HA VPN tunnels use dynamic (BGP) routing through a Cloud Router.');
+          const r = find(st.routers, a.router); if (!r) throw G.notFound(cmd, P, `regions/${REGION}/routers/${a.router}`);
+          const ike = a['ike-version'] === undefined ? 2 : a['ike-version'];
+          if (![1, 2].includes(ike)) throw G.invalid(cmd, 'argument --ike-version: Must be 1 or 2.');
+          const t = { name: a.NAME, gw: g.name, iface: a.interface, ext: e.name, peerIf: pi, ike, secret: a['shared-secret'], router: r.name, _peerIp: e.interfaces[pi] };
+          st.tunnels.push(t);
+          return { pre: `Creating VPN tunnel...⠼Created [${G.url(P, `regions/${REGION}/vpnTunnels/${t.name}`)}].\nCreating VPN tunnel...done.`, objects: [tunnelRow(t)], style: 'gcloud' };
+        }
+      },
+      'gcloud compute vpn-tunnels list': { desc: 'List VPN tunnels', run: () => S().tunnels.length ? G.table(S().tunnels.map(tunnelRow)) : { text: 'Listed 0 items.' } },
+      'gcloud compute vpn-tunnels describe': {
+        desc: 'Show a tunnel\'s status', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {} },
+        run: a => {
+          regionArg(a, 'gcloud compute vpn-tunnels describe');
+          const st = S(); const t = find(st.tunnels, a.NAME); if (!t) throw G.notFound('gcloud compute vpn-tunnels describe', P, `regions/${REGION}/vpnTunnels/${a.NAME}`);
+          const s = tunnelStatus(st, t);
+          return G.yaml({ detailedStatus: s.d, ikeVersion: t.ike, kind: 'compute#vpnTunnel', name: t.name, peerExternalGateway: G.url(P, 'global/externalVpnGateways/' + t.ext), peerExternalGatewayInterface: t.peerIf, peerIp: t._peerIp, router: G.url(P, `regions/${REGION}/routers/${t.router}`), sharedSecret: '*************', status: s.s, vpnGateway: G.url(P, `regions/${REGION}/vpnGateways/${t.gw}`), vpnGatewayInterface: t.iface });
+        }
+      },
+      'gcloud compute vpn-tunnels delete': {
+        desc: 'Delete a tunnel', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, region: {} },
+        run: a => { regionArg(a, 'gcloud compute vpn-tunnels delete'); const st = S(); if (!find(st.tunnels, a.NAME)) throw G.notFound('gcloud compute vpn-tunnels delete', P, `regions/${REGION}/vpnTunnels/${a.NAME}`); if (st.routers.some(r => r.interfaces.some(i => i.tunnel === a.NAME))) throw G.invalid('gcloud compute vpn-tunnels delete', `Could not fetch resource:\n - The vpn_tunnel resource '${a.NAME}' is already being used by a Cloud Router interface. Remove the interface first.`); st.tunnels = st.tunnels.filter(t => t.name !== a.NAME); return { text: `Deleted [${G.url(P, `regions/${REGION}/vpnTunnels/${a.NAME}`)}].` }; }
+      },
+      'gcloud compute ssh': {
+        desc: 'Run a command on gcp-vm-1 (use --command)', positional: ['INSTANCE'], params: { INSTANCE: { posOnly: true, required: true }, zone: {}, command: {}, 'tunnel-through-iap': { type: 'switch' } },
+        run: a => {
+          const st = S();
+          if (a.INSTANCE.replace(/^.*@/, '') !== 'gcp-vm-1') throw G.notFound('gcloud compute ssh', P, `zones/${ZONE}/instances/${a.INSTANCE}`);
+          if (!a.command) throw CmdError('Interactive SSH sessions aren\'t available here. Example: gcloud compute ssh gcp-vm-1 --zone=us-central1-a --command="traceroute ' + st.c.host + '"');
+          const toks = Lab.util.tokenize(a.command); const tool = toks[0]; const dst = toks.filter(t => !t.startsWith('-') && !/^\d+$/.test(t))[1];
+          if (!['traceroute', 'ping', 'mtr'].includes(tool)) return { text: `bash: ${tool}: not available in this simulation (try traceroute or ping)`, cls: 'err' };
+          if (!dst) return { text: `${tool}: missing destination`, cls: 'err' };
+          const up = sessions(st).filter(s => s.up);
+          const reach = net.isIp(dst) && net.contains(st.c.prefix, dst) && up.length;
+          if (tool === 'ping') return reach ? { text: `PING ${dst} 56(84) bytes of data.\n64 bytes from ${dst}: icmp_seq=1 ttl=62 time=31.4 ms\n64 bytes from ${dst}: icmp_seq=2 ttl=62 time=30.9 ms\n64 bytes from ${dst}: icmp_seq=3 ttl=62 time=31.2 ms\n\n--- ${dst} ping statistics ---\n3 packets transmitted, 3 received, 0% packet loss` } : { text: `PING ${dst} 56(84) bytes of data.\n\n--- ${dst} ping statistics ---\n3 packets transmitted, 0 received, 100% packet loss`, cls: 'warn' };
+          if (!reach) return { text: `traceroute to ${dst} (${dst}), 30 hops max, 60 byte packets\n 1  * * *\n 2  * * *\n 3  * * *\n(no route to ${dst}: Cloud Router hasn't learned ${st.c.prefix} over BGP)`, cls: 'warn' };
+          const hop = up[Math.floor(Math.random() * up.length)];
+          if (net.contains(st.c.prefix, dst)) lab.flag('traced');
+          return { text: `traceroute to ${dst} (${dst}), 30 hops max, 60 byte packets\n 1  ${hop.p.ip} (${hop.p.ip})  30.812 ms  30.701 ms  30.655 ms   ← mty-edge via ${hop.t.name}\n 2  ${dst} (${dst})  31.204 ms  31.188 ms  31.097 ms${up.length > 1 ? '\n(GCP → on-prem uses ECMP across both tunnels: on-prem advertises equal MEDs)' : ''}` };
+        }
+      }
+    };
+  };
+  function applyAdv(r, a, cmd) {
+    if (a['advertisement-mode']) r.advMode = a['advertisement-mode'];
+    const setG = a['set-advertisement-groups'], setR = a['set-advertisement-ranges'], addR = a['add-advertisement-ranges'], remR = a['remove-advertisement-ranges'];
+    if ((setG || setR || addR || remR) && r.advMode !== 'CUSTOM') throw G.invalid(cmd, 'Custom advertisements require --advertisement-mode=CUSTOM.');
+    if (setG) { setG.forEach(x => { if (x.toUpperCase() !== 'ALL_SUBNETS') throw G.invalid(cmd, `Invalid value for [--set-advertisement-groups]: '${x}'. Valid choices: all_subnets.`); }); r.advGroups = setG.map(x => x.toUpperCase()); }
+    const chk = list => list.forEach(x => { if (!net.isCidr(x)) throw G.invalid(cmd, `Invalid IP range '${x}'.`); });
+    if (setR) { chk(setR); r.advRanges = setR.slice(); }
+    if (addR) { chk(addR); addR.forEach(x => { if (!r.advRanges.includes(x)) r.advRanges.push(x); }); }
+    if (remR) r.advRanges = r.advRanges.filter(x => !remR.includes(x));
+    if (r.advMode === 'DEFAULT') { r.advGroups = []; r.advRanges = []; }
+  }
+
+  // ---------- topology + on-prem view
+  const $ = s => document.querySelector(s);
+  let lab;
+  function render(st) {
+    const c = st.c; const g = gw(st);
+    $('#onprem-config').textContent = configText(st);
+    const W = 760, H = 250;
+    const gy = [95, 185];
+    const statusColor = s => s === 'ESTABLISHED' ? '#047857' : s ? '#b91c1c' : '#cbd5e1';
+    const ss = sessions(st); const view = onpremView(st);
+    let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="HA VPN topology">
+      <rect x="0" y="10" width="250" height="230" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+      <text x="14" y="32" font-size="12" font-weight="600" fill="#0f172a">Google Cloud · hybrid-vpc</text>
+      <text x="14" y="48" font-size="10" fill="#64748b">10.30.1.0/24 · 10.30.2.0/24 · us-central1</text>
+      <rect x="14" y="62" width="104" height="40" rx="5" fill="#fff" stroke="#94a3b8"/><text x="66" y="79" text-anchor="middle" font-size="11" font-weight="600">Cloud Router</text><text x="66" y="94" text-anchor="middle" font-size="9.5" fill="#475569">${st.routers[0] ? 'ASN ' + st.routers[0].asn : 'not created'}</text>
+      <rect x="138" y="62" width="104" height="160" rx="5" fill="#fff" stroke="${g ? '#1e3a8a' : '#cbd5e1'}"/><text x="190" y="78" text-anchor="middle" font-size="11" font-weight="600">HA VPN gw</text>
+      <rect x="510" y="10" width="250" height="230" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+      <text x="746" y="32" text-anchor="end" font-size="12" font-weight="600" fill="#0f172a">Monterrey DC · mty-edge</text>
+      <text x="746" y="48" text-anchor="end" font-size="10" fill="#64748b">AS ${c.onAsn} · ${c.prefix}</text>`;
+    [0, 1].forEach(i => {
+      svg += `<circle cx="242" cy="${gy[i]}" r="5" fill="${g ? '#1e3a8a' : '#cbd5e1'}"/><text x="232" y="${gy[i] + 4}" text-anchor="end" font-size="9.5" fill="#334155">if${i} ${g ? g.ips[i] : ''}</text>`;
+      svg += `<circle cx="518" cy="${gy[i]}" r="5" fill="#334155"/><text x="528" y="${gy[i] + 4}" font-size="9.5" fill="#334155">if${i} ${c.ip[i]}</text>`;
+    });
+    st.tunnels.forEach(t => {
+      const s = tunnelStatus(st, t); const idx = onpremIdx(st, t);
+      const y1 = gy[t.iface] || gy[0], y2 = idx >= 0 ? gy[idx] : (y1 + 30);
+      const sess = ss.find(x => x.t === t);
+      const bgpUpT = sess && sess.up;
+      const preferred = view.best && !view.tie && view.best.s.t === t;
+      const col = s.s !== 'ESTABLISHED' ? '#b91c1c' : bgpUpT ? '#047857' : '#b45309';
+      svg += `<line x1="247" y1="${y1}" x2="513" y2="${y2}" stroke="${col}" stroke-width="${preferred ? 4 : 2}" ${s.s !== 'ESTABLISHED' ? 'stroke-dasharray="6 5"' : ''}/>`;
+      const mx = 380, my = (y1 + y2) / 2 - 8;
+      svg += `<text x="${mx}" y="${my}" text-anchor="middle" font-size="10" font-weight="600" fill="${col}">${Lab.util.esc(t.name)} · ${s.s === 'ESTABLISHED' ? (bgpUpT ? 'BGP up' : 'BGP down') : s.s}</text>`;
+      if (preferred) svg += `<text x="${mx}" y="${my + 30}" text-anchor="middle" font-size="9.5" fill="#047857">on-prem → GCP primary (MED ${view.best.med})</text>`;
+    });
+    if (!st.tunnels.length) svg += `<text x="380" y="140" text-anchor="middle" font-size="11" fill="#94a3b8">no tunnels yet</text>`;
+    svg += `</svg>`;
+    $('#topo').innerHTML = svg;
+    $('#onprem').innerHTML = onpremText(st).map(([cls, t]) => `<span class="${cls}">${Lab.util.esc(t)}</span>`).join('\n');
+  }
+  function configText(st) {
+    const c = st.c; const g = gw(st);
+    const ip = i => (g ? g.ips[i] : `<gcp-if${i}-ip>`);
+    const mask = '255.255.255.252';
+    return `hostname mty-edge
+!
+crypto ikev2 keyring GCP-KEYRING
+ peer GCP-IF0
+  address ${ip(0)}
+  pre-shared-key ${c.psk[0]}
+ peer GCP-IF1
+  address ${ip(1)}
+  pre-shared-key ${c.psk[1]}
+!
+interface Tunnel0
+ description to GCP HA VPN interface 0
+ ip address ${c.ll[0][1]} ${mask}
+ tunnel source GigabitEthernet0/0/0   ! ${c.ip[0]}
+ tunnel destination ${ip(0)}
+!
+interface Tunnel1
+ description to GCP HA VPN interface 1
+ ip address ${c.ll[1][1]} ${mask}
+ tunnel source GigabitEthernet0/0/1   ! ${c.ip[1]}
+ tunnel destination ${ip(1)}
+!
+router bgp ${c.onAsn}
+ neighbor ${c.ll[0][0]} remote-as ${c.gcpAsn}
+ neighbor ${c.ll[1][0]} remote-as ${c.gcpAsn}
+ address-family ipv4
+  network ${c.prefix.split('/')[0]} mask 255.255.0.0
+  neighbor ${c.ll[0][0]} prefix-list GCP-IN in
+  neighbor ${c.ll[1][0]} prefix-list GCP-IN in
+!
+ip prefix-list GCP-IN seq 10 permit ${AGG}`;
+  }
+  function onpremText(st) {
+    const c = st.c; const L = []; const add = (t, cls) => L.push([cls || '', t]);
+    const ss = sessions(st); const view = onpremView(st);
+    add('mty-edge# show crypto ikev2 sa', 'hd');
+    [0, 1].forEach(i => { const t = st.tunnels.find(x => onpremIdx(st, x) === i && x.iface === i); const s = t && tunnelStatus(st, t); add(` Tunnel${i}  local ${c.ip[i]}  remote ${gw(st) ? gw(st).ips[i] : '(unset)'}  ${s ? (s.s === 'ESTABLISHED' ? 'READY' : 'DOWN (' + s.s + ')') : 'no SA'}`, s && s.s === 'ESTABLISHED' ? 'ok' : 'muted'); });
+    add('');
+    add('mty-edge# show ip bgp summary', 'hd');
+    add('Neighbor        V    AS     MsgRcvd MsgSent  Up/Down   State/PfxRcd');
+    [0, 1].forEach(i => {
+      const n = c.ll[i][0]; const s = ss.find(x => x.t && x.t.iface === i && x.idx === i);
+      const lrn = s && s.up ? view.learned.find(l => l.s.p === s.p) : null;
+      const state = s && s.up ? String(lrn ? lrn.accepted.length : 0) : s ? s.state : 'Idle';
+      add(`${n.padEnd(16)}4 ${String(c.gcpAsn).padEnd(10)}${s && s.up ? '    48      47  00:04:12  ' : '     0       0  never     '}${state}`, s && s.up ? 'ok' : 'muted');
+    });
+    add('');
+    add(`mty-edge# show ip bgp ${AGG}`, 'hd');
+    if (!view.cand.length) add(view.learned.length ? `% Network not in table (received ${[...new Set(view.learned.flatMap(l => l.routes))].join(', ')} — denied by prefix-list GCP-IN)` : '% Network not in table', 'warn');
+    else {
+      add(`BGP routing table entry for ${AGG}, ${view.cand.length} available path${view.cand.length > 1 ? 's' : ''}`);
+      view.cand.forEach(l => add(`  ${c.gcpAsn}  via ${c.ll[l.s.idx][0]} (Tunnel${l.s.idx})  MED ${l.med}${view.best === l ? (view.tie ? '  best (tie-break: oldest path)' : '  best') : ''}`, view.best === l ? 'ok' : ''));
+      if (view.tie) add('  ! equal MEDs: primary path is decided by tie-breakers, not by design', 'warn');
+    }
+    const logs = ss.filter(s => s.log).map(s => s.log);
+    if (logs.length) { add(''); add('mty-edge# show logging | include BGP', 'hd'); logs.forEach(l => add(l, /Up$/.test(l) ? 'ok' : 'err')); }
+    return L;
+  }
+
+  $('#btn-fail0').addEventListener('click', () => {
+    const st = lab.state; const ready = lab.results.slice(0, 5).every(r => r.ok);
+    st.fail0 = true; lab.touch();
+    lab.refresh();
+    const v = onpremView(st);
+    const msg = $('#failmsg');
+    if (ready && v.best && v.best.s.t.iface === 1) { st.flags.failoverTested = true; msg.textContent = 'Interface-0 path failed. BGP hold timer expired after ~60 s and on-prem moved 10.30.0.0/16 to the tunnel on interface 1. Enable BFD on both sides to cut this to under 5 s.'; msg.className = 'inline-msg ok'; }
+    else if (!ready) { msg.textContent = 'Interface-0 path failed, but the design isn\'t complete yet (finish objectives 1–5 first), so this doesn\'t count as a failover test.'; msg.className = 'inline-msg err'; }
+    else { msg.textContent = 'Interface-0 path failed and traffic did not fail over.'; msg.className = 'inline-msg err'; }
+    lab.refresh();
+  });
+  $('#btn-restore').addEventListener('click', () => { lab.state.fail0 = false; $('#failmsg').textContent = 'Path restored. Traffic returns to the interface-0 tunnel (lower MED).'; $('#failmsg').className = 'inline-msg'; lab.touch(); lab.refresh(); });
+
+  lab = Lab({
+    id: 'hybrid-vpn-lab', dialect: 'bash', variants: 3, termTitle: 'Cloud Shell — contoso-hybrid',
+    prompt: `ruben@cloudshell:~ (${P})$ `,
+    banner: `Welcome to Cloud Shell! Type "help" to get started.\nYour Cloud Platform project in this session is set to ${P}.\nNo default region is set: pass --region=${REGION} on regional commands.\n`,
+    createState, commands, render,
+    onReset: () => { $('#failmsg').textContent = ''; },
+    objectives: [
+      { text: 'Create the HA VPN gateway on <code>hybrid-vpc</code> and an external VPN gateway describing both of mty-edge\'s public interfaces.',
+        check: st => { if (!gw(st)) return 'No HA VPN gateway yet.'; return extOk(st) || 'The external VPN gateway must list both on-prem public IPs (two interfaces).'; },
+        hints: ['HA VPN has two resources here: Google\'s gateway and a description of the peer.', 'The peer\'s public IPs are in the config comments (tunnel source). Two IPs → a two-interface external gateway.', '<code>gcloud compute vpn-gateways create ha-gw --network=hybrid-vpc --region=us-central1</code> and <code>gcloud compute external-vpn-gateways create mty-edge --interfaces=0=&lt;if0 ip&gt;,1=&lt;if1 ip&gt;</code>'] },
+      { text: 'Bring up two tunnels, one per HA VPN interface, each matching the on-prem side (status ESTABLISHED).',
+        check: st => tunnelsUp(st) || (st.tunnels.length ? 'Not every interface has an ESTABLISHED tunnel. Check vpn-tunnels describe for the detailed status.' : 'No tunnels yet.'),
+        hints: ['Tunnels need a Cloud Router, so create one first (it also needs the right ASN, see objective 3).', 'Pair HA VPN interface 0 with mty-edge\'s Tunnel0 public IP, and interface 1 with Tunnel1. Each pair has its own pre-shared key, and the router speaks IKEv2.', '<code>gcloud compute vpn-tunnels create tun-0 --region=us-central1 --vpn-gateway=ha-gw --interface=0 --peer-external-gateway=mty-edge --peer-external-gateway-interface=0 --ike-version=2 --shared-secret=&lt;Tunnel0 key&gt; --router=cr-mty</code>, then the same for interface 1.'] },
+      { text: 'Establish BGP on both tunnels with the ASN and link-local addresses mty-edge expects.',
+        check: st => bgpUp(st) || 'Both BGP sessions aren\'t Established yet. The on-prem log shows why.',
+        hints: ['Read <code>router bgp</code> in the on-prem config: its <code>remote-as</code> is the ASN your Cloud Router must use.', 'Each tunnel gets a router interface (GCP\'s link-local IP, /30) and a peer (mty-edge\'s IP on that /30, peer ASN = mty-edge\'s AS). The neighbor statements give GCP\'s side.', '<code>gcloud compute routers create cr-mty --network=hybrid-vpc --region=us-central1 --asn=&lt;remote-as&gt;</code>; <code>gcloud compute routers add-interface cr-mty --interface-name=if-tun-0 --vpn-tunnel=tun-0 --ip-address=&lt;neighbor IP&gt; --mask-length=30 --region=us-central1</code>; <code>gcloud compute routers add-bgp-peer cr-mty --peer-name=bgp-tun-0 --interface=if-tun-0 --peer-ip-address=&lt;Tunnel0 IP&gt; --peer-asn=&lt;on-prem AS&gt; --region=us-central1</code>. Repeat for tunnel 1.'] },
+      { text: 'On-prem learns GCP\'s range as the single aggregate <code>10.30.0.0/16</code> over both sessions.',
+        check: st => aggOnBoth(st) || 'mty-edge hasn\'t accepted 10.30.0.0/16 on both sessions. Look at its prefix-list.',
+        hints: ['By default, Cloud Router advertises each subnet (/24s).', 'mty-edge\'s prefix-list only permits exactly 10.30.0.0/16. Switch the Cloud Router to custom advertisements.', '<code>gcloud compute routers update cr-mty --region=us-central1 --advertisement-mode=CUSTOM --set-advertisement-ranges=10.30.0.0/16</code>'] },
+      { text: 'Make on-prem → GCP traffic deterministically prefer the tunnel on HA VPN interface 0.',
+        check: st => prefersIf0(st) || (onpremView(st).tie ? 'Both paths have equal MEDs, so the choice comes down to tie-breakers.' : 'On-prem doesn\'t prefer the interface-0 tunnel.'),
+        hints: ['Cloud Router sends a MED with each route, and on-prem prefers the lowest MED.', 'MED comes from each BGP peer\'s advertised route priority (default 100).', '<code>gcloud compute routers update-bgp-peer cr-mty --peer-name=bgp-tun-1 --advertised-route-priority=200 --region=us-central1</code>'] },
+      { text: 'Prove the 99.99% design: fail the interface-0 path (button above the topology) and confirm on-prem moves to the other tunnel.',
+        check: st => st.flags.failoverTested || 'No successful failover test yet.',
+        hints: ['Finish objectives 1–5 first.', 'Use "Fail the tunnel on interface 0" and watch the topology and mty-edge\'s BGP table.', 'Click the button, then read the on-prem view: the best path should move to Tunnel1.'] },
+      { text: 'Confirm from <code>gcp-vm-1</code> that on-prem hosts are reachable through the tunnels.', optional: true,
+        check: st => st.flags.traced || 'No traceroute from gcp-vm-1 to an on-prem host yet.',
+        hints: ['Run a command on the VM with gcloud compute ssh.', 'Trace to a host inside the on-prem prefix.', '<code>gcloud compute ssh gcp-vm-1 --zone=us-central1-a --command="traceroute &lt;on-prem host&gt;"</code>'] }
+    ],
+    solution(st) {
+      const c = st.c; const R = '--region=us-central1';
+      return [
+        { cmd: `gcloud compute vpn-gateways create ha-gw --network=hybrid-vpc ${R}`, note: 'An HA VPN gateway gets two interfaces with two public IPs. That redundancy is what qualifies for the 99.99% SLA.' },
+        { cmd: `gcloud compute external-vpn-gateways create mty-edge --interfaces=0=${c.ip[0]},1=${c.ip[1]}`, note: 'Describe the peer: mty-edge has two public interfaces (from the tunnel source comments).' },
+        { cmd: `gcloud compute routers create cr-mty --network=hybrid-vpc ${R} --asn=${c.gcpAsn}`, note: `Cloud Router ASN must equal the "remote-as ${c.gcpAsn}" in mty-edge's config, and it must be a private ASN.` },
+        { cmd: `gcloud compute vpn-tunnels create tun-0 ${R} --vpn-gateway=ha-gw --interface=0 --peer-external-gateway=mty-edge --peer-external-gateway-interface=0 --ike-version=2 --shared-secret="${c.psk[0]}" --router=cr-mty`, note: 'Tunnel 0: GCP interface 0 ↔ mty-edge interface 0, IKEv2, Tunnel0\'s key.' },
+        { cmd: `gcloud compute vpn-tunnels create tun-1 ${R} --vpn-gateway=ha-gw --interface=1 --peer-external-gateway=mty-edge --peer-external-gateway-interface=1 --ike-version=2 --shared-secret="${c.psk[1]}" --router=cr-mty`, note: 'Tunnel 1 mirrors it on interface 1 with its own key.' },
+        { cmd: `gcloud compute routers add-interface cr-mty --interface-name=if-tun-0 --vpn-tunnel=tun-0 --ip-address=${c.ll[0][0]} --mask-length=30 ${R}`, note: `BGP over tun-0: GCP is ${c.ll[0][0]}/30, the neighbor address mty-edge expects.` },
+        { cmd: `gcloud compute routers add-bgp-peer cr-mty --peer-name=bgp-tun-0 --interface=if-tun-0 --peer-ip-address=${c.ll[0][1]} --peer-asn=${c.onAsn} ${R}` },
+        { cmd: `gcloud compute routers add-interface cr-mty --interface-name=if-tun-1 --vpn-tunnel=tun-1 --ip-address=${c.ll[1][0]} --mask-length=30 ${R}`, note: 'Same for tun-1 on its own /30.' },
+        { cmd: `gcloud compute routers add-bgp-peer cr-mty --peer-name=bgp-tun-1 --interface=if-tun-1 --peer-ip-address=${c.ll[1][1]} --peer-asn=${c.onAsn} ${R}` },
+        { cmd: `gcloud compute routers get-status cr-mty ${R}`, note: 'Both sessions are Established and GCP learned the on-prem prefix. But mty-edge drops our /24s (prefix-list).' },
+        { cmd: `gcloud compute routers update cr-mty ${R} --advertisement-mode=CUSTOM --set-advertisement-ranges=10.30.0.0/16`, note: 'Advertise the single aggregate mty-edge\'s prefix-list permits.' },
+        { cmd: `gcloud compute routers update-bgp-peer cr-mty --peer-name=bgp-tun-1 --advertised-route-priority=200 ${R}`, note: 'Raise the MED on the interface-1 session so on-prem deterministically prefers interface 0.' },
+        { cmd: `gcloud compute ssh gcp-vm-1 --zone=us-central1-a --command="traceroute ${c.host}"`, note: 'Data path check from a real VM.' },
+        { note: 'Failover test: fail the interface-0 path. The BGP hold timer expires and on-prem moves to tunnel 1.', run: api => api.click('#btn-fail0'), wait: 1200 },
+        { note: 'Restore: traffic returns to the primary (lower MED) path.', run: api => api.click('#btn-restore') }
+      ];
+    },
+    debrief: [
+      { title: 'Read the other side\'s config first', text: 'Every value GCP needs (peer IPs, keys, IKE version, both ASNs, link-local /30s, accepted prefixes) is already in the on-prem router\'s config. Hybrid outages are usually a mismatch, not a bug.' },
+      { title: 'Two interfaces, two tunnels, two sessions', text: 'HA VPN only qualifies for 99.99% when both gateway interfaces carry tunnels to a redundant peer with dynamic routing. One tunnel on an HA gateway is just a Classic VPN with extra steps.' },
+      { title: 'ASNs and /30s must mirror exactly', text: 'Cloud Router\'s ASN is the peer\'s <code>remote-as</code>, and each side\'s link-local IP is the other\'s neighbor address. The "peer in wrong AS" notification is BGP telling you exactly which side is off.' },
+      { title: 'Advertise what the peer accepts', text: 'Default mode sends every subnet. A strict prefix-list on-prem silently drops them. Custom advertisements with one aggregate keep on-prem routing tables small and stable.' },
+      { title: 'Engineer the primary path', text: 'Equal MEDs leave path selection to tie-breakers. Raising <code>advertised-route-priority</code> on the backup session makes failover behavior predictable and documentable. The same knob works on Dedicated and Partner Interconnect VLAN attachments.' },
+      { title: 'Test the failure, not just the success', text: 'Failing a path proves the design. Hold-timer convergence (~60 s) is often too slow for real workloads, so enabling BFD on both sides is the usual next step.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

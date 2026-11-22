@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Migrate Outlook accounts to Microsoft 365 — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 12</div>
+    <h1>Lab: Migrate Outlook accounts to Microsoft 365</h1>
+    <p>Move five mailboxes from the old IMAP host to Exchange Online with a migration batch, cut over at the right moment, then get Outlook on a user's PC onto Exchange Online with her archive and shared mailbox, without losing a thing.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~15 min</span><span class="pill">PowerShell (EXO) · Outlook · M365 admin center</span><span class="pill">3 randomized starting points</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the Microsoft 365 post-migration work I do at Perficient: migration endpoints and batches, reading migration errors, licensing prerequisites, cutover timing, and the Outlook side that generates most tickets (profiles, Autodiscover, PST imports, shared mailbox auto-mapping). Continues the Contoso Travel project from Lab 11, where mail DNS was moved to Microsoft 365.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Your admin workstation</strong> <span class="muted">· simulation</span></span><span class="muted">admin.rdg@contosotravel.onmicrosoft.com</span></div>
+          <div style="padding:12px 16px">
+            <div class="tabs"><button type="button" class="active" id="at-notepad" data-at="notepad">Notepad: users.csv</button><button type="button" id="at-admin" data-at="admin">Microsoft 365 admin center</button></div>
+            <div data-ap="notepad">
+              <div class="muted mono" style="font-size:12px;margin-bottom:4px">C:\Migration\users.csv</div>
+              <textarea id="nb-text" class="editor" style="min-height:140px" spellcheck="false" aria-label="users.csv contents"></textarea>
+              <div class="row mt-16" style="gap:10px"><button type="button" class="sm" id="nb-save">Save (Ctrl+S)</button><span class="inline-msg" id="nb-msg"></span></div>
+            </div>
+            <div data-ap="admin" hidden>
+              <h4 style="margin:0 0 8px;font-size:14px">Users › Active users</h4>
+              <table class="data" id="au-table" style="font-size:12px"><thead><tr><th>Display name</th><th>Username</th><th>Licenses</th><th>Usage location</th></tr></thead><tbody></tbody></table>
+              <div class="grid-2 mt-16" style="align-items:end">
+                <div class="field"><label for="au-user">Manage user</label><select id="au-user"></select></div>
+                <div class="field"><label for="au-loc">Usage location</label><select id="au-loc"><option value="">— Not set —</option><option>Mexico</option><option>United States</option><option>Spain</option></select></div>
+              </div>
+              <label class="row" style="gap:8px;color:var(--text);font-size:13px;margin:0 0 10px"><input type="checkbox" id="au-lic" /> Microsoft 365 Business Standard <span class="muted">(includes Exchange Online)</span></label>
+              <div class="row" style="gap:10px"><button type="button" class="sm" id="au-save">Save changes</button><span class="inline-msg" id="au-msg"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Maria Torres's PC</strong> <span class="muted">· remote assistance · Windows 11 · Outlook (classic)</span></span><span class="muted">CTSO-LT-0117</span></div>
+          <div style="padding:12px 16px">
+            <div class="tabs"><button type="button" class="active" id="pt-mail" data-pt="mail">Control Panel › Mail</button><button type="button" id="pt-ac" data-pt="ac">Test E-mail AutoConfiguration</button><button type="button" id="pt-reg" data-pt="reg">Registry Editor</button><button type="button" id="pt-ol" data-pt="ol">Outlook</button></div>
+            <div data-pp="mail">
+              <h4 style="margin:0 0 8px;font-size:14px">Mail profiles</h4>
+              <div id="mp-list"></div>
+              <div class="mock-section mt-16"><h4>Add a profile</h4>
+                <div class="row" style="gap:8px;align-items:flex-end"><div style="flex:1"><label for="mp-new-name">Profile name</label><input type="text" id="mp-new-name" placeholder="e.g. Exchange Online" /></div>
+                <div style="flex:1"><label for="mp-email">Email address</label><input type="text" id="mp-email" value="maria.torres@contoso-travel.com" /></div>
+                <button type="button" class="sm" id="mp-add">Add account</button></div>
+              </div>
+              <div class="mock-section"><h4>When starting Microsoft Outlook, use this profile</h4>
+                <div class="check-list">
+                  <label><input type="radio" name="mp-start" id="mp-prompt" value="prompt" /> Prompt for a profile to be used</label>
+                  <label class="row" style="gap:8px"><input type="radio" name="mp-start" id="mp-always" value="always" /> Always use this profile <select id="mp-default" style="width:auto"></select></label>
+                </div>
+              </div>
+              <div id="mp-msg" class="inline-msg"></div>
+            </div>
+            <div data-pp="ac" hidden>
+              <div class="row" style="gap:8px;align-items:flex-end"><div style="flex:1"><label for="ac-email">E-mail address</label><input type="text" id="ac-email" value="maria.torres@contoso-travel.com" /></div><label class="row" style="gap:6px;color:var(--text);font-size:13px;margin:0 0 8px"><input type="checkbox" id="ac-use" checked /> Use AutoDiscover</label><button type="button" class="sm" id="ac-test">Test</button></div>
+              <pre class="log mt-16" id="ac-out" style="min-height:90px">Results will appear here.</pre>
+            </div>
+            <div data-pp="reg" hidden>
+              <div class="mono" style="font-size:12px;margin-bottom:6px">Computer\HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Outlook\AutoDiscover</div>
+              <table class="data" id="reg-table" style="font-size:12px"><thead><tr><th>Name</th><th>Type</th><th>Data</th><th></th></tr></thead><tbody></tbody></table>
+            </div>
+            <div data-pp="ol" hidden>
+              <div class="row" style="gap:8px"><button type="button" class="sm" id="ol-open">Open Outlook</button><button type="button" class="ghost sm" id="ol-import" disabled>File › Open &amp; Export › Import/Export</button></div>
+              <div id="ol-pick" class="mt-16" hidden><label for="ol-profile">Choose profile</label><div class="row" style="gap:8px"><select id="ol-profile" style="width:auto"></select><button type="button" class="ghost sm" id="ol-pick-ok">OK</button></div></div>
+              <div id="ol-view" class="mt-16"></div>
+              <div id="imp-form" class="mock-section mt-16" hidden><h4>Import from another program or file › Outlook Data File (.pst)</h4>
+                <div class="field"><label>File to import</label><input type="text" readonly value="C:\Users\maria\Documents\Outlook Files\Archive 2019.pst" /></div>
+                <div class="field"><label for="imp-dest">Import items into</label><select id="imp-dest"></select></div>
+                <label class="row" style="gap:6px;color:var(--text);font-size:13px;margin:0 0 10px"><input type="checkbox" id="imp-dupes" checked /> Do not import duplicates</label>
+                <button type="button" class="sm" id="imp-run">Finish</button>
+              </div>
+              <div id="ol-msg" class="inline-msg"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <p style="font-size:14px">Mail DNS for <code>contoso-travel.com</code> now points to Microsoft 365. Five users still have their mail on the old host. Migrate them, then fix Maria's Outlook. You're connected to Exchange Online PowerShell.</p>
+          <dl class="facts">
+            <dt>Old host</dt><dd>imap.oldmail.example · IMAP over SSL on 993 (or STARTTLS on 143) · username = full email address</dd>
+            <dt>Users</dt><dd>maria.torres, luis.mendez, ana.gomez, jorge.perez, elena.hernandez (@contoso-travel.com)</dd>
+            <dt>CSV</dt><dd>C:\Migration\users.csv (from the old host's admin)</dd>
+            <dt>Maria</dt><dd>Keeps a 2019 archive in a local PST that must end up in her online archive. She also needs the Bookings shared mailbox.</dd>
+          </dl>
+          <p class="muted" style="font-size:12px;margin:8px 0 0" id="vnote"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Tips</h3>
+          <p class="muted" style="font-size:13px;margin:0">Type <code>help</code> for the cmdlets and <code>Get-Help &lt;cmdlet&gt;</code> for their parameters. Run multi-line examples one line at a time, or join them with <code>;</code>.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 12 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError } = Lab; const esc = Lab.util.esc;
+  const DOM = 'contoso-travel.com', HOST = 'imap.oldmail.example', CSV_PATH = 'C:\\Migration\\users.csv';
+  const SERVER = 'MN2PR12A004DC03.NAMPR12A004.PROD.OUTLOOK.COM';
+  const USERS = [['Maria Torres', 'maria.torres', 'Mt#Old2025', 4812], ['Luis Mendez', 'luis.mendez', 'Lm#Old2025', 2290], ['Ana Gomez', 'ana.gomez', 'Ag#Old2025', 6105], ['Jorge Perez', 'jorge.perez', 'Jp#Old2025', 3377], ['Elena Hernandez', 'elena.hernandez', 'Eh#Old2025', 1548]];
+  const JORGE_NEW = 'Jp#New2026';
+  const lc = s => String(s || '').toLowerCase().trim();
+  const csvText = v => {
+    const head = v === 0 ? 'Email,UserName,Password' : 'EmailAddress,UserName,Password';
+    return head + '\n' + USERS.map(([, a, pw]) => `${a}@${DOM},${v === 0 && a === 'jorge.perez' ? 'jperez' : a + '@' + DOM},${pw}`).join('\n') + '\n';
+  };
+
+  function createState(v) {
+    const users = USERS.map(([name, alias, pw, items]) => ({ name, alias, upn: `${alias}@${DOM}`, pw: alias === 'jorge.perez' && v === 2 ? JORGE_NEW : pw, items, licensed: !(v === 1 && alias === 'elena.hernandez'), loc: v === 1 && alias === 'elena.hernandez' ? '' : 'Mexico', archive: false }));
+    return {
+      v, users, endpoints: [], batches: [], files: { [lc(CSV_PATH)]: csvText(v) },
+      perms: v === 2 ? [{ user: 'Travel Agents', group: true, automap: false }] : [],
+      groups: { 'travel agents': ['maria.torres', 'luis.mendez', 'ana.gomez'] },
+      reg: v === 0 ? [{ name: 'PreferLocalXML', type: 'REG_DWORD', data: '0x00000001 (1)' }, { name: DOM, type: 'REG_SZ', data: 'C:\\Autodiscover\\contoso-travel.xml' }] : [],
+      profiles: [{ name: 'Outlook', accounts: [{ type: 'IMAP', email: `maria.torres@${DOM}`, server: HOST }], pst: ['Archive 2019'] }],
+      start: { mode: 'always', profile: 'Outlook' },
+      open: null, pst: null, flags: {}
+    };
+  }
+
+  // ---------- helpers
+  const findUser = (st, id) => st.users.find(u => [u.alias, u.upn, u.name].some(x => lc(x) === lc(id)));
+  const notFound = (cmd, id) => CmdError(`${cmd} : The operation couldn't be performed because object '${id}' couldn't be found on '${SERVER}'.`);
+  const confirmText = what => `\nConfirm\nAre you sure you want to perform this action?\n${what}\n[Y] Yes  [A] Yes to All  [N] No  [L] No to All  [?] Help (default is "Y"): Y   (auto-answered in this simulation; add -Confirm:$false to skip)`;
+  const confirmed = a => a._c.confirm === undefined || /^\$?true$/i.test(String(a._c.confirm)) || a._c.confirm === true;
+  const endpointOk = e => lc(e.server) === HOST && ((+e.port === 993 && e.security === 'Ssl') || (+e.port === 143 && e.security === 'Tls'));
+  function connErr(server, port, security) {
+    if (lc(server) !== HOST) return `The connection to the server '${server}' could not be completed. The remote name could not be resolved.`;
+    if (security === 'None') return `The server '${server}' requires an encrypted connection. Plain-text IMAP (Security None) is disabled on port ${port}.`;
+    if (!((+port === 993 && security === 'Ssl') || (+port === 143 && security === 'Tls'))) return `The connection to the server '${server}' could not be completed. ${+port === 993 ? 'Port 993 expects implicit SSL (-Security Ssl).' : +port === 143 ? 'Port 143 uses STARTTLS (-Security Tls).' : `Nothing is listening on port ${port}.`}`;
+    return null;
+  }
+  function parseCsv(text, cmd) {
+    const lines = String(text).replace(/\r/g, '').split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) throw CmdError(`${cmd} : The CSV file is empty.`);
+    const head = lines[0].split(',').map(h => lc(h));
+    const need = ['emailaddress', 'username', 'password'];
+    const miss = need.filter(n => !head.includes(n));
+    if (miss.length) throw CmdError(`${cmd} : The CSV file is missing the required column '${{ emailaddress: 'EmailAddress', username: 'UserName', password: 'Password' }[miss[0]]}'. Required columns for an IMAP migration: EmailAddress, UserName, Password.\n    + CategoryInfo          : InvalidArgument: (:) [${cmd}], MigrationCSVValidationException`);
+    const ix = Object.fromEntries(need.map(n => [n, head.indexOf(n)]));
+    return lines.slice(1).map((l, k) => { const c = l.split(','); const row = { email: lc(c[ix.emailaddress]), username: (c[ix.username] || '').trim(), password: (c[ix.password] || '').trim() }; if (!row.email.endsWith('@' + DOM)) throw CmdError(`${cmd} : Row ${k + 2}: '${c[ix.emailaddress]}' isn't in an accepted domain of this organization.`); return row; });
+  }
+  const bytesOf = (st, path) => { const t = st.files[lc(path)]; if (t === undefined) throw CmdError(`Exception calling "ReadAllBytes" with "1" argument(s): "Could not find file '${path}'."`); return { __bytes: true, path, text: t, toString() { return `System.Byte[] (${t.length} bytes)`; } }; };
+  // Sync one user from the batch row: decides the result the moment the user is (re)started.
+  function syncResult(st, row) {
+    const u = st.users.find(x => x.upn === row.email);
+    if (!u || !u.licensed) return { status: 'Failed', error: `Error: MigrationRecipientNotFoundException: A recipient wasn't found for "${row.email}" on the target. Create a recipient of the appropriate type for this migration on the target and try again.` };
+    if (lc(row.username) !== u.upn || row.password !== u.pw) return { status: 'Failed', error: `Error: ImapAuthenticationException: The IMAP server reported an error during LoginCommand: authentication failed for user '${row.username}'. The username or password for this account is incorrect, or IMAP access is disabled.` };
+    return { status: 'Synced', items: u.items };
+  }
+  function batchView(st, b) {
+    const users = b.rows.map(r => r.res);
+    const failed = users.filter(r => r.status === 'Failed').length;
+    let status = b.state;
+    if (b.state === 'Started') status = b.polls < 1 ? 'Syncing' : failed ? 'SyncedWithErrors' : 'Synced';
+    if (b.state === 'Completed') status = failed ? 'CompletedWithErrors' : 'Completed';
+    return { Identity: b.name, Status: status, Type: 'IMAP', TotalCount: b.rows.length, SyncedCount: users.filter(r => r.status === 'Synced' || r.status === 'Completed').length, FinalizedCount: users.filter(r => r.status === 'Completed').length, FailedCount: failed, SourceEndpoint: b.endpoint, CreationDateTime: '11/21/2026 10:20:31 AM' };
+  }
+  const userStatus = (b, r) => (b.state === 'Started' && b.polls < 1 ? 'Syncing' : r.res.status);
+  const latestRow = (st, upn) => { for (let i = st.batches.length - 1; i >= 0; i--) { const r = st.batches[i].rows.find(x => x.email === upn); if (r) return { b: st.batches[i], r }; } return null; };
+  const migrated = (st, upn) => { const x = latestRow(st, upn); return x && x.b.state !== 'Created' && (x.r.res.status === 'Synced' || x.r.res.status === 'Completed') ? x.r.res.status : null; };
+  const findBatch = (st, cmd, id) => { const b = st.batches.find(x => lc(x.name) === lc(id)); if (!b) throw CmdError(`${cmd} : The migration batch '${id}' couldn't be found.`); return b; };
+  const csvArg = (st, cmd, v) => { if (!v || !v.__bytes) throw CmdError(`${cmd} : Cannot process argument transformation on parameter 'CSVData'. Cannot convert value "${v === undefined ? '' : String(v).slice(0, 40)}" to type "System.Byte[]". Read the file as bytes, e.g. -CSVData ([System.IO.File]::ReadAllBytes("${CSV_PATH}")).`); return parseCsv(v.text, cmd); };
+  const mbxRows = st => st.users.filter(u => u.licensed).map(u => ({ Name: u.alias, Alias: u.alias, DisplayName: u.name, PrimarySmtpAddress: u.upn, RecipientTypeDetails: 'UserMailbox', ArchiveStatus: u.archive ? 'Active' : 'None' })).concat([{ Name: 'bookings', Alias: 'bookings', DisplayName: 'Bookings', PrimarySmtpAddress: 'bookings@' + DOM, RecipientTypeDetails: 'SharedMailbox', ArchiveStatus: 'None' }]);
+  const automapped = st => st.perms.some(p => !p.group && p.user === 'maria.torres' && p.automap);
+
+  const commands = lab => {
+    const S = () => lab.state;
+    return {
+      'Connect-ExchangeOnline': { desc: 'Connect to Exchange Online', params: { UserPrincipalName: {}, ShowBanner: { type: 'switch' } }, run: () => ({ text: 'Already connected to Exchange Online as admin.rdg@contosotravel.onmicrosoft.com.', cls: 'muted' }) },
+      'Get-Mailbox': { desc: 'List mailboxes (a user needs a license to have one)', positional: ['Identity'], params: { Identity: {}, ResultSize: {}, Archive: { type: 'switch' } },
+        run: a => { const st = S(); let rows = mbxRows(st); if (a.Identity) { rows = rows.filter(r => [r.Name, r.PrimarySmtpAddress, r.DisplayName].some(x => lc(x) === lc(a.Identity))); if (!rows.length) throw notFound('Get-Mailbox', a.Identity); } if (a.Archive) rows = rows.filter(r => r.ArchiveStatus === 'Active'); return { objects: rows, cols: ['Name', 'Alias', 'RecipientTypeDetails', 'ArchiveStatus'] }; } },
+      'Enable-Mailbox': { desc: 'Enable features on a mailbox, e.g. -Archive', positional: ['Identity'], params: { Identity: { required: true }, Archive: { type: 'switch' } },
+        run: a => { const st = S(); const u = findUser(st, a.Identity); if (!u || !u.licensed) throw notFound('Enable-Mailbox', a.Identity); if (!a.Archive) throw CmdError('Enable-Mailbox : This mailbox is already enabled. Use -Archive to enable the archive.'); u.archive = true; lab.touch(); return { objects: [{ Name: u.alias, Alias: u.alias, ArchiveStatus: 'Active', ArchiveName: 'In-Place Archive - ' + u.name }] }; } },
+      'Get-MailboxPermission': { desc: 'Show who has access to a mailbox', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => { const st = S(); if (!/^bookings(@|$)/i.test(a.Identity)) { const u = findUser(st, a.Identity); if (!u || !u.licensed) throw notFound('Get-MailboxPermission', a.Identity); return { objects: [{ Identity: u.alias, User: 'NT AUTHORITY\\SELF', AccessRights: '{FullAccess, ReadPermission}', IsInherited: false, Deny: false }] }; } return { objects: [{ Identity: 'bookings', User: 'NT AUTHORITY\\SELF', AccessRights: '{FullAccess, ReadPermission}', IsInherited: false, Deny: false }].concat(st.perms.map(p => ({ Identity: 'bookings', User: p.group ? p.user : p.user + '@' + DOM, AccessRights: '{FullAccess}', IsInherited: false, Deny: false }))) }; } },
+      'Add-MailboxPermission': { desc: 'Grant Full Access to a mailbox (-AutoMapping adds it to the user\'s Outlook)', positional: ['Identity'], params: { Identity: { required: true }, User: { required: true }, AccessRights: { type: 'enumlist', values: ['FullAccess', 'ReadPermission', 'ChangePermission', 'ChangeOwner', 'DeleteItem'], required: true }, InheritanceType: { type: 'enum', values: ['All', 'None', 'Children', 'Descendents', 'SelfAndChildren'] }, AutoMapping: { type: 'bool' } },
+        run: a => {
+          const st = S(); if (!/^bookings(@|$)/i.test(a.Identity)) { if (!findUser(st, a.Identity)) throw notFound('Add-MailboxPermission', a.Identity); return { text: 'Permission added. (Only the Bookings mailbox matters in this lab.)', cls: 'muted' }; }
+          const g = st.groups[lc(a.User)]; const u = g ? null : findUser(st, a.User);
+          if (!g && !u) throw notFound('Add-MailboxPermission', a.User);
+          if (!a.AccessRights.includes('FullAccess')) return { text: 'Permission added, but only FullAccess lets a user open the mailbox in Outlook.', cls: 'warn' };
+          const key = g ? Object.keys(st.groups).find(k => k === lc(a.User)) && 'Travel Agents' : u.alias;
+          st.perms = st.perms.filter(p => p.user !== key).concat([{ user: key, group: !!g, automap: !g && a.AutoMapping !== false }]); lab.touch();
+          return { objects: [{ Identity: 'bookings', User: g ? key : u.upn, AccessRights: '{FullAccess}', IsInherited: false, Deny: false }], post: g ? '\nNote: auto-mapping only applies to users granted access directly. Members of a group get access but Outlook won\'t add the mailbox automatically.' : '' };
+        } },
+      'Remove-MailboxPermission': { desc: 'Remove a mailbox permission', positional: ['Identity'], params: { Identity: { required: true }, User: { required: true }, AccessRights: { type: 'enumlist', values: ['FullAccess', 'ReadPermission'], required: true } },
+        run: a => { const st = S(); const u = findUser(st, a.User); const key = st.groups[lc(a.User)] ? 'Travel Agents' : u && u.alias; const before = st.perms.length; st.perms = st.perms.filter(p => p.user !== key); if (st.perms.length === before) throw CmdError(`Remove-MailboxPermission : Can't remove the access control entry on the object 'bookings' for account '${a.User}' because the ACE isn't present on the object.`); lab.touch(); return { pre: confirmed(a) ? confirmText(`Removing mailbox permission "bookings" for user "${a.User}" with access rights "FullAccess".`) : '', text: '' }; } },
+      'Get-DistributionGroupMember': { desc: 'List the members of a group', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => { const g = S().groups[lc(a.Identity)]; if (!g) throw notFound('Get-DistributionGroupMember', a.Identity); return { objects: g.map(x => ({ Name: x, RecipientType: 'UserMailbox', PrimarySmtpAddress: x + '@' + DOM })) }; } },
+      'Resolve-DnsName': { desc: 'DNS lookup, e.g. Resolve-DnsName contoso-travel.com -Type MX', positional: ['Name'], params: { Name: { required: true }, Type: { type: 'enum', values: ['A', 'MX', 'CNAME', 'TXT', 'SRV', 'NS'] }, Server: {} },
+        run: a => {
+          const st = S(); const n = lc(a.Name).replace(/\.$/, ''); const t = a.Type || 'A';
+          if (n === DOM && t === 'MX') { st.flags.mxChecked = true; lab.touch(); return { objects: [{ Name: DOM, Type: 'MX', TTL: 3600, Section: 'Answer', NameExchange: 'contosotravel-com.mail.protection.outlook.com', Preference: 0 }] }; }
+          if (n === 'autodiscover.' + DOM) return { objects: [{ Name: n, Type: 'CNAME', TTL: 3600, Section: 'Answer', NameHost: 'autodiscover.outlook.com' }] };
+          if (n === DOM && t === 'TXT') return { objects: [{ Name: DOM, Type: 'TXT', TTL: 3600, Strings: '{v=spf1 include:spf.protection.outlook.com include:spf.sendflow.example -all}' }] };
+          if (n === HOST) return { objects: [{ Name: HOST, Type: 'A', TTL: 300, Section: 'Answer', IPAddress: '198.51.100.40' }] };
+          if (n === DOM) return { objects: [{ Name: DOM, Type: 'A', TTL: 300, Section: 'Answer', IPAddress: '203.0.113.80' }] };
+          throw CmdError(`Resolve-DnsName : ${a.Name} : DNS name does not exist`);
+        } },
+      'Get-Content': { desc: 'Show a file (add -Encoding Byte or -AsByteStream to read it as bytes)', aliases: ['cat', 'type', 'gc'], positional: ['Path'], params: { Path: { required: true }, Encoding: { type: 'enum', values: ['Byte', 'UTF8', 'ASCII', 'Default'] }, AsByteStream: { type: 'switch' }, Raw: { type: 'switch' } },
+        run: a => { const st = S(); if (a.Encoding === 'Byte' || a.AsByteStream) { const b = bytesOf(st, a.Path); return { value: b, text: String(b) }; } const t = st.files[lc(a.Path)]; if (t === undefined) throw CmdError(`Get-Content : Cannot find path '${a.Path}' because it does not exist.`); return { text: t.trimEnd() }; } },
+      'Import-Csv': { desc: 'Read a CSV file as objects', positional: ['Path'], params: { Path: { required: true } },
+        run: a => { const t = S().files[lc(a.Path)]; if (t === undefined) throw CmdError(`Import-Csv : Could not find file '${a.Path}'.`); const lines = t.trim().split('\n'); const h = lines[0].split(','); return { objects: lines.slice(1).map(l => { const c = l.split(','); return Object.fromEntries(h.map((k, i) => [k, c[i] || ''])); }) }; } },
+      notepad: { raw: true, desc: 'Open a file in Notepad', run: () => { document.getElementById('at-notepad').click(); return { text: 'Opened C:\\Migration\\users.csv in Notepad (panel below).', cls: 'muted' }; } },
+      'Test-MigrationServerAvailability': { desc: 'Test the connection to the source mail server', params: { IMAP: { type: 'switch' }, RemoteServer: { required: true }, Port: { type: 'int', required: true }, Security: { type: 'enum', values: ['None', 'Ssl', 'Tls'] } },
+        run: a => { if (!a.IMAP) throw CmdError('Test-MigrationServerAvailability : Specify the migration type, e.g. -IMAP.'); const e = connErr(a.RemoteServer, a.Port, a.Security || 'None'); if (!e) { S().flags.tested = true; lab.touch(); } return { objects: [{ Result: e ? 'Failed' : 'Success', Message: e || '', ConnectionSettings: `IMAP ${a.RemoteServer}:${a.Port} (${a.Security || 'None'})`, SupportsCutover: false, ErrorDetail: e ? 'MigrationServerConnectionFailedException' : '' }] }; } },
+      'New-MigrationEndpoint': { desc: 'Create a migration endpoint (connection settings for the source server)', params: { IMAP: { type: 'switch' }, Name: { required: true }, RemoteServer: { required: true }, Port: { type: 'int', required: true }, Security: { type: 'enum', values: ['None', 'Ssl', 'Tls'] }, SkipVerification: { type: 'switch' } },
+        run: a => {
+          const st = S(); if (!a.IMAP) throw CmdError('New-MigrationEndpoint : Specify the endpoint type, e.g. -IMAP.');
+          if (st.endpoints.some(e => lc(e.name) === lc(a.Name))) throw CmdError(`New-MigrationEndpoint : A migration endpoint named '${a.Name}' already exists.`);
+          const e = { name: a.Name, server: a.RemoteServer, port: a.Port, security: a.Security || 'None' };
+          const err = connErr(e.server, e.port, e.security); if (err && !a.SkipVerification) throw CmdError(`New-MigrationEndpoint : ${err}\n    + CategoryInfo          : InvalidArgument: (:) [New-MigrationEndpoint], MigrationServerConnectionFailedException`);
+          st.endpoints.push(e); lab.touch();
+          return { objects: [{ Identity: e.name, EndpointType: 'IMAP', RemoteServer: e.server, Port: e.port, Security: e.security, MaxConcurrentMigrations: 20 }] };
+        } },
+      'Get-MigrationEndpoint': { desc: 'List migration endpoints', positional: ['Identity'], params: { Identity: {} }, run: a => ({ objects: S().endpoints.filter(e => !a.Identity || lc(e.name) === lc(a.Identity)).map(e => ({ Identity: e.name, EndpointType: 'IMAP', RemoteServer: e.server, Port: e.port, Security: e.security })) }) },
+      'Remove-MigrationEndpoint': { desc: 'Delete a migration endpoint', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => { const st = S(); if (st.batches.some(b => lc(b.endpoint) === lc(a.Identity) && b.state !== 'Completed')) throw CmdError(`Remove-MigrationEndpoint : The endpoint '${a.Identity}' is in use by a migration batch.`); const n = st.endpoints.length; st.endpoints = st.endpoints.filter(e => lc(e.name) !== lc(a.Identity)); if (n === st.endpoints.length) throw CmdError(`Remove-MigrationEndpoint : The migration endpoint '${a.Identity}' couldn't be found.`); lab.touch(); return { text: '' }; } },
+      'New-MigrationBatch': { desc: 'Create a migration batch from a CSV (-AutoStart starts it)', params: { Name: { required: true }, SourceEndpoint: { required: true }, CSVData: { type: 'any', required: true }, AutoStart: { type: 'switch' }, AutoComplete: { type: 'switch' }, NotificationEmails: {} },
+        run: a => {
+          const st = S(); const cmd = 'New-MigrationBatch';
+          if (st.batches.some(b => lc(b.name) === lc(a.Name))) throw CmdError(`${cmd} : A migration batch named '${a.Name}' already exists. Use a new name.`);
+          const ep = st.endpoints.find(e => lc(e.name) === lc(a.SourceEndpoint)); if (!ep) throw CmdError(`${cmd} : The migration endpoint '${a.SourceEndpoint}' couldn't be found. Create it with New-MigrationEndpoint.`);
+          const rows = csvArg(st, cmd, a.CSVData);
+          const busy = rows.find(r => st.batches.some(b => b.state !== 'Completed' && b.rows.some(x => x.email === r.email)));
+          if (busy) throw CmdError(`${cmd} : MigrationUserAlreadyExistsException: The user '${busy.email}' is already being migrated in another batch.`);
+          const b = { name: a.Name, endpoint: ep.name, state: a.AutoStart ? 'Started' : 'Created', polls: 0, rows: rows.map(r => Object.assign({}, r, { res: a.AutoStart ? syncResult(st, r) : { status: 'Queued' } })) };
+          st.batches.push(b); lab.touch();
+          return { objects: [batchView(st, b)], cols: ['Identity', 'Status', 'Type', 'TotalCount'], post: a.AutoComplete ? '\nWarning: -AutoComplete finalizes the batch as soon as it syncs. Complete it yourself after confirming the MX cutover.' : '' };
+        } },
+      'Get-MigrationBatch': { desc: 'Show migration batches and their status', positional: ['Identity'], params: { Identity: {} },
+        run: a => { const st = S(); const list = a.Identity ? [findBatch(st, 'Get-MigrationBatch', a.Identity)] : st.batches; const out = list.map(b => batchView(st, b)); list.forEach(b => { if (b.state === 'Started') b.polls++; }); lab.touch(); return { objects: out, cols: ['Identity', 'Status', 'Type', 'TotalCount', 'SyncedCount', 'FailedCount'] }; } },
+      'Get-MigrationUser': { desc: 'Show each user\'s migration status (-BatchId to filter)', positional: ['Identity'], params: { Identity: {}, BatchId: {} },
+        run: a => {
+          const st = S(); let pairs = st.batches.flatMap(b => b.rows.map(r => ({ b, r })));
+          if (a.BatchId) { findBatch(st, 'Get-MigrationUser', a.BatchId); pairs = pairs.filter(p => lc(p.b.name) === lc(a.BatchId)); }
+          if (a.Identity) { pairs = pairs.filter(p => p.r.email === lc(a.Identity)); if (!pairs.length) throw CmdError(`Get-MigrationUser : The migration user '${a.Identity}' couldn't be found.`); }
+          const out = pairs.map(({ b, r }) => ({ Identity: r.email, BatchId: b.name, Status: userStatus(b, r), ItemsSynced: userStatus(b, r) === 'Syncing' ? Math.round((r.res.items || 0) * 0.4) : r.res.items || 0, ItemsSkipped: 0, LastSuccessfulSyncTime: r.res.status === 'Synced' || r.res.status === 'Completed' ? '11/21/2026 10:34:12 AM' : '' }));
+          new Set(pairs.map(p => p.b)).forEach(b => { if (b.state === 'Started') b.polls++; }); lab.touch();
+          return { objects: out, cols: ['Identity', 'BatchId', 'Status', 'ItemsSynced'] };
+        } },
+      'Get-MigrationUserStatistics': { desc: 'Detailed status for one user (-IncludeReport shows the error)', positional: ['Identity'], params: { Identity: { required: true }, IncludeReport: { type: 'switch' } },
+        run: a => { const st = S(); const x = latestRow(st, lc(a.Identity)); if (!x) throw CmdError(`Get-MigrationUserStatistics : The migration user '${a.Identity}' couldn't be found.`); const s = userStatus(x.b, x.r); return { objects: [{ Identity: x.r.email, BatchId: x.b.name, Status: s, ItemsSynced: x.r.res.items || 0, ItemsSkipped: 0, Error: s === 'Failed' ? x.r.res.error : '', Report: a.IncludeReport ? (s === 'Failed' ? `11/21/2026 10:31:07 AM [EXO] Connected to source ${x.b.endpoint}.\n11/21/2026 10:31:09 AM [EXO] ${x.r.res.error}` : '11/21/2026 10:34:12 AM [EXO] Initial synchronization completed.') : '' }], cols: ['Identity', 'Status', 'ItemsSynced', 'Error'] }; } },
+      'Start-MigrationBatch': { desc: 'Start a batch, or retry its failed users', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => {
+          const st = S(); const b = findBatch(st, 'Start-MigrationBatch', a.Identity);
+          if (b.state === 'Completed') throw CmdError(`Start-MigrationBatch : The batch '${b.name}' is completed and can't be restarted. Create a new batch for any remaining users.`);
+          let n = 0; b.rows.forEach(r => { if (b.state !== 'Started' || r.res.status === 'Failed') { r.res = syncResult(st, r); n++; } });
+          b.state = 'Started'; b.polls = 0; lab.touch();
+          return { text: n ? `Started ${n} user(s) in batch '${b.name}'.` : `Batch '${b.name}' has no failed users to retry.`, cls: 'muted' };
+        } },
+      'Stop-MigrationBatch': { desc: 'Stop a running batch', positional: ['Identity'], params: { Identity: { required: true } }, run: a => { const b = findBatch(S(), 'Stop-MigrationBatch', a.Identity); if (b.state !== 'Started') throw CmdError(`Stop-MigrationBatch : The batch '${b.name}' isn't running.`); b.state = 'Stopped'; lab.touch(); return { text: '' }; } },
+      'Set-MigrationBatch': { desc: 'Update a batch, e.g. new -CSVData with corrected rows', positional: ['Identity'], params: { Identity: { required: true }, CSVData: { type: 'any' } },
+        run: a => {
+          const st = S(); const b = findBatch(st, 'Set-MigrationBatch', a.Identity);
+          if (b.state === 'Completed') throw CmdError(`Set-MigrationBatch : The batch '${b.name}' is completed and can't be changed.`);
+          if (a.CSVData === undefined) return { text: '' };
+          const rows = csvArg(st, 'Set-MigrationBatch', a.CSVData);
+          rows.forEach(r => { const old = b.rows.find(x => x.email === r.email); if (old) { old.username = r.username; old.password = r.password; } });
+          lab.touch(); return { text: `Updated the CSV data for batch '${b.name}'. Restart failed users with Start-MigrationBatch.`, cls: 'muted' };
+        } },
+      'Complete-MigrationBatch': { desc: 'Finalize a synced batch (do it after the MX cutover)', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => {
+          const st = S(); const b = findBatch(st, 'Complete-MigrationBatch', a.Identity); const v = batchView(st, b);
+          if (b.state === 'Completed') throw CmdError(`Complete-MigrationBatch : The batch '${b.name}' is already completed.`);
+          if (v.Status === 'Syncing' || b.state !== 'Started') throw CmdError(`Complete-MigrationBatch : The batch '${b.name}' can't be completed while its status is ${v.Status}. Wait until it's Synced.`);
+          b.state = 'Completed'; b.rows.forEach(r => { if (r.res.status === 'Synced') r.res.status = 'Completed'; }); lab.touch();
+          const failed = b.rows.filter(r => r.res.status === 'Failed').length;
+          return { pre: confirmed(a) ? confirmText(`Completing migration batch "${b.name}".`) : '', text: failed ? `Batch '${b.name}' completed with ${failed} failed user(s). Their mail wasn't migrated: create a new batch for them after fixing the cause.` : '', cls: failed ? 'warn' : '' };
+        } }
+    };
+  };
+
+  // ---------- GUI: admin workstation
+  let lab; const $ = s => document.querySelector(s); const $$ = s => [...document.querySelectorAll(s)]; const S = () => lab.state;
+  const tabset = (attr, panel) => $$(`[data-${attr}]`).forEach(b => b.addEventListener('click', () => { $$(`[data-${attr}]`).forEach(x => x.classList.toggle('active', x === b)); $$(`[data-${panel}]`).forEach(p => { p.hidden = p.dataset[panel] !== b.dataset[attr]; }); }));
+  tabset('at', 'ap'); tabset('pt', 'pp');
+  const msg = (id, t, c) => { $(id).textContent = t; $(id).className = 'inline-msg ' + (c || ''); };
+  $('#nb-save').addEventListener('click', () => { S().files[lc(CSV_PATH)] = $('#nb-text').value; msg('#nb-msg', 'Saved.', 'ok'); lab.touch(); });
+  $('#au-user').addEventListener('change', () => { const u = S().users.find(x => x.alias === $('#au-user').value); $('#au-loc').value = u.loc; $('#au-lic').checked = u.licensed; msg('#au-msg', ''); });
+  $('#au-save').addEventListener('click', () => {
+    const st = S(); const u = st.users.find(x => x.alias === $('#au-user').value); const loc = $('#au-loc').value, lic = $('#au-lic').checked;
+    if (lic && !loc) return msg('#au-msg', 'License can\'t be assigned: this user doesn\'t have a usage location. Set Usage location first.', 'err');
+    u.loc = loc; const added = lic && !u.licensed; u.licensed = lic;
+    msg('#au-msg', added ? `Saved. ${u.name} is licensed; the Exchange Online mailbox is being created (usually a few minutes; instant here).` : 'Saved.', 'ok'); lab.touch(); lab.refresh();
+  });
+
+  // ---------- GUI: Maria's PC
+  const staleXml = st => st.reg.some(r => r.name === 'PreferLocalXML') && st.reg.some(r => r.name === DOM);
+  const exo = p => p && p.accounts.some(a => a.type === 'Exchange');
+  const maria = st => st.users[0];
+  $('#mp-add').addEventListener('click', () => {
+    const st = S(); const name = $('#mp-new-name').value.trim(); const email = lc($('#mp-email').value);
+    if (!name) return msg('#mp-msg', 'Enter a profile name.', 'err');
+    if (st.profiles.some(p => lc(p.name) === lc(name))) return msg('#mp-msg', 'A profile with that name already exists.', 'err');
+    if (email !== maria(st).upn) return msg('#mp-msg', 'Use Maria\'s email address.', 'err');
+    let acct;
+    if (staleXml(st)) acct = { type: 'IMAP', email, server: HOST };
+    else if (!maria(st).licensed) return msg('#mp-msg', 'Something went wrong: Outlook couldn\'t find a mailbox for this address.', 'err');
+    else acct = { type: 'Exchange', email, server: 'outlook.office365.com' };
+    st.profiles.push({ name, accounts: [acct], pst: [] }); $('#mp-new-name').value = '';
+    msg('#mp-msg', acct.type === 'Exchange' ? `Profile "${name}" created: Microsoft Exchange (Exchange Online) account configured.` : `Profile "${name}" created, but Auto Account Setup configured an IMAP account on ${HOST}. Outlook found old settings: try Test E-mail AutoConfiguration.`, acct.type === 'Exchange' ? 'ok' : 'err');
+    lab.touch(); lab.refresh();
+  });
+  $('#mp-list').addEventListener('click', e => {
+    const st = S(); const rp = e.target.closest('[data-rmprof]'), ra = e.target.closest('[data-rmacct]');
+    if (rp) { const n = rp.dataset.rmprof; st.profiles = st.profiles.filter(p => p.name !== n); if (st.start.profile === n) st.start = { mode: 'prompt', profile: st.profiles[0] ? st.profiles[0].name : '' }; if (st.open === n) st.open = null; msg('#mp-msg', `Profile "${n}" removed. Its PST file stays on disk.`, ''); }
+    if (ra) { const [pn, i] = ra.dataset.rmacct.split('|'); const p = st.profiles.find(x => x.name === pn); p.accounts.splice(+i, 1); msg('#mp-msg', `Account removed from "${pn}".`, ''); }
+    if (rp || ra) { lab.touch(); lab.refresh(); }
+  });
+  const setStart = () => { const st = S(); st.start = { mode: $('#mp-always').checked ? 'always' : 'prompt', profile: $('#mp-default').value }; lab.touch(); lab.refresh(); };
+  ['#mp-always', '#mp-prompt', '#mp-default'].forEach(id => $(id).addEventListener('change', setStart));
+  $('#ac-test').addEventListener('click', () => {
+    const st = S(); const email = lc($('#ac-email').value); st.flags.acTested = true;
+    if (!$('#ac-use').checked) { $('#ac-out').textContent = 'Select at least one method (Use AutoDiscover).'; return; }
+    if (staleXml(st)) $('#ac-out').textContent = `Attempting URL C:\\Autodiscover\\contoso-travel.xml found through PreferLocalXML\nAutodiscover to C:\\Autodiscover\\contoso-travel.xml succeeded (0x00000000)\n\n<Protocol>\n  <Type>IMAP</Type>\n  <Server>${HOST}</Server>\n  <Port>993</Port>\n  <SSL>on</SSL>\n</Protocol>\n\nOutlook used a local XML file from the registry and never asked DNS. That file points to the old host.`;
+    else if (email !== maria(st).upn) $('#ac-out').textContent = 'Autodiscover failed: no mailbox found for this address.';
+    else $('#ac-out').textContent = `Attempting URL https://contoso-travel.com/autodiscover/autodiscover.xml found through SCP... failed (0x80072EE7)\nAttempting URL https://autodiscover.contoso-travel.com/autodiscover/autodiscover.xml\nRedirect to https://autodiscover-s.outlook.com/autodiscover/autodiscover.xml\nAutodiscover to https://autodiscover-s.outlook.com/autodiscover/autodiscover.xml succeeded (0x00000000)\n\n<Protocol>\n  <Type>mapiHttp</Type>\n  <Server>outlook.office365.com</Server>\n  <MailStore><ExternalUrl>https://outlook.office365.com/mapi/emsmdb/?MailboxId=…@contoso-travel.com</ExternalUrl></MailStore>\n</Protocol>`;
+    lab.touch();
+  });
+  $('#reg-table').addEventListener('click', e => { const b = e.target.closest('[data-rmval]'); if (!b) return; S().reg = S().reg.filter(r => r.name !== b.dataset.rmval); lab.touch(); lab.refresh(); });
+  function openOutlook(name) {
+    const st = S(); const p = st.profiles.find(x => x.name === name); if (!p) return;
+    st.open = p.name; $('#ol-pick').hidden = true; $('#imp-form').hidden = true; lab.touch(); lab.refresh();
+  }
+  $('#ol-open').addEventListener('click', () => {
+    const st = S(); if (!st.profiles.length) return msg('#ol-msg', 'No profiles: Outlook asks you to create one first (Control Panel › Mail).', 'err');
+    if (st.start.mode === 'always' && st.profiles.some(p => p.name === st.start.profile)) return openOutlook(st.start.profile);
+    $('#ol-profile').innerHTML = st.profiles.map(p => `<option>${esc(p.name)}</option>`).join(''); $('#ol-pick').hidden = false;
+  });
+  $('#ol-pick-ok').addEventListener('click', () => openOutlook($('#ol-profile').value));
+  const destinations = (st, p) => (exo(p) ? [`Mailbox - ${maria(st).name}`].concat(maria(st).archive ? [`Online Archive - ${maria(st).name}`] : []) : p.accounts.map(a => `${a.email} (${a.type})`));
+  $('#ol-import').addEventListener('click', () => { const st = S(); const p = st.profiles.find(x => x.name === st.open); $('#imp-dest').innerHTML = destinations(st, p).map(d => `<option>${esc(d)}</option>`).join(''); $('#imp-form').hidden = false; });
+  $('#imp-run').addEventListener('click', () => {
+    const st = S(); const d = $('#imp-dest').value; const p = st.profiles.find(x => x.name === st.open);
+    st.pst = /^Online Archive/.test(d) ? 'archive' : exo(p) ? 'mailbox' : 'imap'; $('#imp-form').hidden = true;
+    msg('#ol-msg', `Imported 1,904 items from Archive 2019.pst into ${d}.`, st.pst === 'archive' ? 'ok' : '');
+    lab.touch(); lab.refresh();
+  });
+
+  function render(st) {
+    // admin center
+    $('#au-table tbody').innerHTML = st.users.map(u => `<tr><td>${esc(u.name)}</td><td class="mono">${esc(u.upn)}</td><td>${u.licensed ? 'Microsoft 365 Business Standard' : '<span class="badge err">Unlicensed</span>'}</td><td>${esc(u.loc || '—')}</td></tr>`).join('');
+    // profiles
+    $('#mp-list').innerHTML = st.profiles.length ? st.profiles.map(p => `<div class="mock-section" style="margin-bottom:8px"><div class="row space-between"><b>${esc(p.name)}</b><button type="button" class="ghost sm" data-rmprof="${esc(p.name)}" id="mp-rm-${esc(p.name.replace(/\W+/g, '-'))}">Remove profile</button></div>
+      ${p.accounts.map((a, i) => `<div class="row space-between" style="font-size:13px;margin-top:6px"><span>${a.type === 'Exchange' ? 'Microsoft Exchange' : 'IMAP/SMTP'} · ${esc(a.email)} · <span class="mono">${esc(a.server)}</span></span><button type="button" class="ghost sm" data-rmacct="${esc(p.name)}|${i}">Remove account</button></div>`).join('') || '<div class="muted" style="font-size:13px">No accounts</div>'}
+      ${p.pst.map(f => `<div class="muted" style="font-size:12px;margin-top:4px">Data file: ${esc(f)}.pst</div>`).join('')}</div>`).join('') : '<p class="muted">No profiles.</p>';
+    $('#mp-default').innerHTML = st.profiles.map(p => `<option${p.name === st.start.profile ? ' selected' : ''}>${esc(p.name)}</option>`).join('');
+    $('#mp-always').checked = st.start.mode === 'always'; $('#mp-prompt').checked = st.start.mode !== 'always';
+    // registry
+    $('#reg-table tbody').innerHTML = '<tr><td>(Default)</td><td>REG_SZ</td><td class="muted">(value not set)</td><td></td></tr>' + st.reg.map((r, i) => `<tr><td>${esc(r.name)}</td><td>${r.type}</td><td class="mono">${esc(r.data)}</td><td><button type="button" class="ghost sm" data-rmval="${esc(r.name)}" id="reg-del-${i}">Delete</button></td></tr>`).join('');
+    // outlook
+    const p = st.profiles.find(x => x.name === st.open);
+    $('#ol-import').disabled = !p;
+    if (!p) { $('#ol-view').innerHTML = '<p class="muted" style="font-size:13px">Outlook is closed.</p>'; return; }
+    const m = maria(st); const mig = migrated(st, m.upn);
+    const folders = [];
+    if (exo(p)) {
+      folders.push(`📥 ${m.upn} · Inbox and folders: ${mig ? m.items.toLocaleString('en-US') + ' items' : '0 items (mailbox not migrated yet)'}`);
+      if (m.archive) folders.push(`🗄 Online Archive - ${m.name}: ${st.pst === 'archive' ? '1,904 items (Archive 2019)' : 'empty'}`);
+      if (automapped(st)) folders.push('👥 Bookings (shared mailbox, auto-mapped)');
+    } else p.accounts.forEach(a => folders.push(`📥 ${a.email} (IMAP, ${a.server})${a.server === HOST ? ': no new mail since the MX cutover' : ''}`));
+    p.pst.forEach(f => folders.push(`📁 ${f} (local PST)`));
+    $('#ol-view').innerHTML = `<div class="mock-section"><div class="row space-between" style="font-size:13px"><b>Outlook · profile "${esc(p.name)}"</b><span class="badge ${exo(p) ? 'ok' : 'warn'}">${exo(p) ? 'Connected to: Microsoft Exchange' : 'Connected to: ' + HOST}</span></div><ul style="font-size:13px;margin:8px 0 0;padding-left:18px">${folders.map(f => `<li>${esc(f)}</li>`).join('')}</ul></div>`;
+  }
+  function onReset(st) {
+    $('#nb-text').value = st.files[lc(CSV_PATH)]; msg('#nb-msg', ''); msg('#au-msg', ''); msg('#mp-msg', ''); msg('#ol-msg', '');
+    $('#au-user').innerHTML = st.users.map(u => `<option value="${u.alias}">${esc(u.name)}</option>`).join(''); $('#au-user').value = 'elena.hernandez'; const el = st.users.find(u => u.alias === 'elena.hernandez'); $('#au-loc').value = el.loc; $('#au-lic').checked = el.licensed;
+    $('#at-notepad').click(); $('#pt-mail').click(); $('#ac-out').textContent = 'Results will appear here.'; $('#imp-form').hidden = true; $('#ol-pick').hidden = true;
+    $('#vnote').textContent = st.v === 0 ? 'Note: the old host\'s admin exported the CSV by hand.' : st.v === 1 ? 'Note: Elena joined last week; HR created her account in a hurry.' : `Helpdesk note: Jorge reset his OldMail password yesterday. New password: ${JORGE_NEW}`;
+  }
+
+  // ---------- checks
+  const allUpns = st => st.users.map(u => u.upn);
+  const FIX_CSV = 'EmailAddress,UserName,Password\n' + USERS.map(([, a, pw]) => `${a}@${DOM},${a}@${DOM},${a === 'jorge.perez' ? '__JPW__' : pw}`).join('\n') + '\n';
+  lab = Lab({
+    id: 'outlook-migration-lab', dialect: 'ps', variants: 3, termTitle: 'Windows PowerShell — ExchangeOnlineManagement 3.6',
+    prompt: 'PS C:\\Migration> ',
+    banner: 'Windows PowerShell\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nConnected to Exchange Online as admin.rdg@contosotravel.onmicrosoft.com (tenant: contosotravel.onmicrosoft.com).\nType "help" for the cmdlets available in this simulation.\n',
+    createState, commands, render, onReset,
+    psValue: (expr, l) => { const m = expr.match(/^\[System\.IO\.File\]::ReadAllBytes\(\s*["']([^"']+)["']\s*\)$/i); return m ? bytesOf(l.state, m[1]) : undefined; },
+    objectives: [
+      { text: 'Prerequisites: all five users have an Exchange Online mailbox, and an IMAP migration endpoint for the old host passes verification.',
+        check: st => { const no = st.users.filter(u => !u.licensed); if (no.length) return `${no.map(u => u.name).join(', ')} ha${no.length > 1 ? 've' : 's'} no mailbox: no license.`; return st.endpoints.some(endpointOk) || 'There\'s no working IMAP migration endpoint for imap.oldmail.example yet.'; },
+        hints: ['Get-Mailbox shows who has a mailbox; the admin center shows licenses. Then describe the source server as a migration endpoint.', 'A mailbox needs a license, and a license needs a usage location. The old host uses IMAP over SSL on 993 (or STARTTLS on 143).', 'Fix any unlicensed user in the admin center (usage location, then license). Then <code>Test-MigrationServerAvailability -IMAP -RemoteServer imap.oldmail.example -Port 993 -Security Ssl</code> and <code>New-MigrationEndpoint -IMAP -Name OldMail -RemoteServer imap.oldmail.example -Port 993 -Security Ssl</code>'] },
+      { text: 'Start a migration batch for all five users from a valid CSV.',
+        check: st => { const inBatch = allUpns(st).filter(u => st.batches.some(b => b.state !== 'Created' && b.state !== 'Stopped' && b.rows.some(r => r.email === u))); return inBatch.length === 5 || (st.batches.length ? `${5 - inBatch.length} user(s) aren't in a started batch.` : 'No migration batch yet.'); },
+        hints: ['Look at the CSV (Get-Content), fix it in Notepad, then pass it to New-MigrationBatch as bytes.', 'IMAP batches need the columns EmailAddress, UserName, Password, and this old host expects the full email address as the username.', '<code>$csv = [System.IO.File]::ReadAllBytes("C:\\Migration\\users.csv")</code> then <code>New-MigrationBatch -Name Wave1 -SourceEndpoint OldMail -CSVData $csv -AutoStart</code>'] },
+      { text: 'Every user reaches Synced: read the failures and fix their cause.',
+        check: st => { const bad = allUpns(st).filter(u => !migrated(st, u)); return !bad.length || `Not synced yet: ${bad.join(', ')} (check Get-MigrationUser; it may still be syncing).`; },
+        hints: ['Get-MigrationUser shows each user; a batch needs a moment (run it again) to move from Syncing to its result.', 'Get-MigrationUserStatistics -IncludeReport shows the exact error: wrong credentials, a username format, or no mailbox on the target.', 'Fix the cause (CSV row, license), then <code>Set-MigrationBatch -Identity Wave1 -CSVData $csv</code> with the re-read file if the CSV changed, and <code>Start-MigrationBatch -Identity Wave1</code> to retry failed users.'] },
+      { text: 'Confirm the MX record points to Exchange Online, then complete the migration for every user.',
+        check: st => { const bad = allUpns(st).filter(u => migrated(st, u) !== 'Completed'); if (bad.length) return `Not completed: ${bad.join(', ')}.`; return st.flags.mxChecked || 'Completed, but you never confirmed the MX record (Resolve-DnsName contoso-travel.com -Type MX).'; },
+        hints: ['Completing stops the sync from the old host. Anything still arriving there afterwards is left behind.', 'Check the MX first. If you complete with failed users, they need a new batch.', '<code>Resolve-DnsName contoso-travel.com -Type MX</code>, then <code>Complete-MigrationBatch -Identity Wave1 -Confirm:$false</code> once Get-MigrationBatch shows Synced.'] },
+      { text: 'Maria\'s Outlook: a new Exchange Online profile that opens by default, and her Archive 2019 PST imported into her online archive.',
+        check: st => {
+          const def = st.start.mode === 'always' && st.profiles.find(p => p.name === st.start.profile);
+          const newExo = st.profiles.find(exo);
+          if (!newExo) return st.profiles.some(p => p.name !== 'Outlook') ? 'The new profile isn\'t connected to Exchange Online (it found the old IMAP host).' : 'No Exchange Online profile yet.';
+          if (!exo(def)) return 'Outlook doesn\'t open the Exchange Online profile by default (Always use this profile).';
+          if (!maria(st).archive) return 'Maria\'s online archive isn\'t enabled.';
+          return st.pst === 'archive' || (st.pst === 'mailbox' ? 'The PST went into her main mailbox. Import it into the Online Archive to keep the mailbox under quota.' : 'The Archive 2019 PST hasn\'t been imported into the online archive yet.');
+        },
+        hints: ['Create a new profile rather than repairing the old IMAP one. If Auto Account Setup finds the wrong server, find out why with Test E-mail AutoConfiguration.', 'A stale registry setting can make Outlook use a local Autodiscover file instead of DNS. The online archive must be enabled before Outlook can import into it.', 'Delete stale values under the AutoDiscover registry key, add a profile, set "Always use this profile" to it, run <code>Enable-Mailbox maria.torres -Archive</code>, then in Outlook use Import/Export into "Online Archive - Maria Torres".'] },
+      { text: 'The Bookings shared mailbox appears in Maria\'s Outlook automatically.',
+        check: st => automapped(st) || (st.perms.some(p => p.group) ? 'Access is granted through a group, which never auto-maps. Grant it to Maria directly.' : 'Maria has no Full Access to Bookings.'),
+        hints: ['Check who has access with Get-MailboxPermission bookings.', 'Outlook adds a shared mailbox automatically only for users granted Full Access directly, with AutoMapping on (the default).', '<code>Add-MailboxPermission -Identity bookings -User maria.torres -AccessRights FullAccess -InheritanceType All -AutoMapping $true</code>'] },
+      { text: 'Retire the old IMAP setup on Maria\'s PC so Outlook stops asking for the old password.', optional: true,
+        check: st => !st.profiles.some(p => p.accounts.some(a => a.type === 'IMAP' && a.server === HOST)) || 'A profile still holds the old IMAP account.',
+        hints: ['The old profile still points at the old host.', 'Remove the old profile, or the IMAP account inside it. The PST file stays on disk.', 'Control Panel › Mail: Remove profile on "Outlook".'] }
+    ],
+    solution(st) {
+      const s = []; const v = st.v;
+      s.push({ cmd: 'Get-Mailbox', note: 'Prerequisite: every user needs a mailbox, which comes with a license.' });
+      if (v === 1) s.push({ note: 'Elena has no mailbox: she is unlicensed and has no usage location, which a license requires. Fix both in the admin center.', run: api => api.click('#at-admin') }, { run: api => api.fill('#au-user', 'elena.hernandez') }, { run: api => api.fill('#au-loc', 'Mexico') }, { run: api => api.check('#au-lic', true) }, { run: api => api.click('#au-save') });
+      s.push({ cmd: 'Test-MigrationServerAvailability -IMAP -RemoteServer imap.oldmail.example -Port 993 -Security Ssl', note: 'Test the source first: IMAP over SSL on 993.' });
+      s.push({ cmd: 'New-MigrationEndpoint -IMAP -Name OldMail -RemoteServer imap.oldmail.example -Port 993 -Security Ssl' });
+      s.push({ cmd: 'Get-Content C:\\Migration\\users.csv', note: v === 0 ? 'The header says Email instead of EmailAddress, and Jorge\'s username lacks the domain. Fix both before creating the batch.' : 'The CSV looks right. Create the batch.' });
+      if (v === 0) s.push({ run: api => api.click('#at-notepad') }, { run: api => api.fill('#nb-text', FIX_CSV.replace('__JPW__', 'Jp#Old2025'), { instant: true }) }, { run: api => api.click('#nb-save') });
+      s.push({ cmd: '$csv = [System.IO.File]::ReadAllBytes("C:\\Migration\\users.csv")', note: 'The batch takes the CSV as bytes.' });
+      s.push({ cmd: 'New-MigrationBatch -Name Wave1 -SourceEndpoint OldMail -CSVData $csv -AutoStart' });
+      s.push({ cmd: 'Get-MigrationUser -BatchId Wave1', note: 'First it shows Syncing…' }, { cmd: 'Get-MigrationUser -BatchId Wave1', note: v === 2 ? '…then Jorge fails. Read why.' : '…then everyone is Synced.' });
+      if (v === 2) {
+        s.push({ cmd: 'Get-MigrationUserStatistics jorge.perez@contoso-travel.com -IncludeReport | Format-List Identity,Status,Error', note: 'Authentication failed: he changed his OldMail password yesterday (helpdesk note). Update his row in the CSV.' });
+        s.push({ run: api => api.click('#at-notepad') }, { run: api => api.fill('#nb-text', FIX_CSV.replace('__JPW__', JORGE_NEW), { instant: true }) }, { run: api => api.click('#nb-save') });
+        s.push({ cmd: '$csv = [System.IO.File]::ReadAllBytes("C:\\Migration\\users.csv")', note: 'Re-read the file: $csv still holds the old bytes.' }, { cmd: 'Set-MigrationBatch -Identity Wave1 -CSVData $csv' }, { cmd: 'Start-MigrationBatch -Identity Wave1', note: 'Retry the failed user.' }, { cmd: 'Get-MigrationUser -BatchId Wave1' }, { cmd: 'Get-MigrationUser -BatchId Wave1' });
+      }
+      s.push({ cmd: 'Resolve-DnsName contoso-travel.com -Type MX', note: 'Before completing: new mail must already be flowing to Exchange Online, or it lands on the old host after the last sync.' });
+      s.push({ cmd: 'Complete-MigrationBatch -Identity Wave1 -Confirm:$false' }, { cmd: 'Get-MigrationBatch Wave1' });
+      s.push({ cmd: 'Enable-Mailbox maria.torres -Archive', note: 'Maria\'s 2019 PST will go into an online archive, so enable it first.' });
+      if (v === 2) s.push({ cmd: 'Get-MailboxPermission bookings', note: 'Bookings is shared through the Travel Agents group, and group access never auto-maps.' });
+      s.push({ cmd: 'Add-MailboxPermission -Identity bookings -User maria.torres -AccessRights FullAccess -InheritanceType All -AutoMapping $true', note: 'Grant Maria Full Access directly, so Outlook adds Bookings automatically.' });
+      if (v === 0) {
+        s.push({ note: 'On Maria\'s PC: check where Autodiscover sends Outlook before building the profile.', run: api => api.click('#pt-ac') }, { run: api => api.click('#ac-test') });
+        s.push({ note: 'A stale PreferLocalXML setting makes Outlook use a local file pointing to the old host. Delete both values.', run: api => api.click('#pt-reg') }, { run: api => api.click('#reg-del-1') }, { run: api => api.click('#reg-del-0') });
+        s.push({ run: api => api.click('#pt-ac') }, { run: api => api.click('#ac-test'), note: 'Now Autodiscover goes through DNS to Exchange Online.' });
+      }
+      s.push({ note: 'Create a fresh Exchange Online profile instead of repairing the old IMAP one.', run: api => api.click('#pt-mail') }, { run: api => api.fill('#mp-new-name', 'Exchange Online') }, { run: api => api.click('#mp-add') });
+      s.push({ run: api => api.check('#mp-always', true), note: 'Make it the profile Outlook always opens.' }, { run: api => api.fill('#mp-default', 'Exchange Online') });
+      s.push({ note: 'Bonus: remove the old IMAP profile so nothing prompts for the old password. Its PST stays on disk.', run: api => api.click('#mp-rm-Outlook') });
+      s.push({ note: 'Open Outlook and import the PST into the online archive.', run: api => api.click('#pt-ol') }, { run: api => api.click('#ol-open') }, { run: api => api.click('#ol-import') }, { run: api => api.fill('#imp-dest', 'Online Archive - Maria Torres') }, { run: api => api.click('#imp-run') });
+      return s;
+    },
+    debrief: [
+      { title: 'A mailbox needs a license, a license needs a usage location', text: 'Migration batches fail with "recipient wasn\'t found" when the target has no mailbox. Licensing is the first migration prerequisite to check.' },
+      { title: 'IMAP migrations move mail only', text: 'Email folders come across; contacts and calendars don\'t, and passwords live in the CSV, so delete it afterwards. For Exchange or Google sources, cutover, staged, hybrid or Google Workspace migrations carry more.' },
+      { title: 'Read the migration error, not just the status', text: 'Get-MigrationUserStatistics -IncludeReport turns "Failed" into a cause: authentication, a username format, or a missing recipient. Fix it, update the batch with Set-MigrationBatch, and retry with Start-MigrationBatch.' },
+      { title: 'Complete after the MX cutover', text: 'Until completion, Exchange Online keeps syncing from the old host. Completing before mail flows to Microsoft 365 strands whatever still arrives at the old server.' },
+      { title: 'A new profile beats repairing the old one', text: 'Old IMAP profiles, cached files and local Autodiscover overrides (PreferLocalXML) keep Outlook pointed at the old host. Test E-mail AutoConfiguration shows exactly where Outlook is looking.' },
+      { title: 'PSTs go to the online archive; auto-mapping needs direct access', text: 'Importing old archives into the online archive keeps the primary mailbox small. Shared mailboxes auto-map only for users granted Full Access directly, never through a group.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

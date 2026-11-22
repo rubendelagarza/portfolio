@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Azure VNet, NSG and a Linux VM — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 10</div>
+    <h1>Lab: Azure VNet, NSG and a Linux VM</h1>
+    <p>Stand up a small web server in Azure with the CLI: resource group under subscription policy, a virtual network and subnet, a network security group that only opens what's needed, and an Ubuntu VM with SSH keys. Watch for the defaults <code>az vm create</code> adds behind your back.</p>
+    <div class="lab-meta"><span class="pill">Fundamentals+</span><span class="pill">~10 min</span><span class="pill">Azure CLI</span><span class="pill">3 randomized starting points</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> Azure Fundamentals in practice: resource groups and regions, tags and Azure Policy, VNets and subnets, NSG rule priority and default rules, subnet vs NIC NSGs, and VM authentication.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Azure portal: All resources</strong> <span class="muted">· read-only view</span></span><span class="muted" id="az-sub">Contoso Production</span></div>
+          <div style="padding:12px 16px">
+            <table class="data" id="az-res" style="font-size:12px"><thead><tr><th>Name</th><th>Type</th><th>Resource group</th><th>Location</th><th>Details</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <dl class="facts" id="wo"></dl>
+          <p class="muted" style="font-size:12px;margin:8px 0 0" id="vnote"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 10 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab; const esc = Lab.util.esc;
+  const SUB = '6f1c2b8e-3d4a-4c1e-9b2f-8a7d5e0c4f31';
+  const INET = '203.0.113.250';
+  const VARIANTS = [
+    { region: 'eastus2', cc: 'IT-4410', p: '10.50', admin: '203.0.113.77', pip: '20.96.41.118' },
+    { region: 'westeurope', cc: 'IT-5120', p: '10.60', admin: '198.51.100.14', pip: '51.124.77.203' },
+    { region: 'mexicocentral', cc: 'IT-3302', p: '172.20', admin: '192.0.2.45', pip: '158.23.96.41' }
+  ];
+  const RG = 'rg-web-prod', VNET = 'vnet-web', SNET = 'snet-web', NSG = 'nsg-web', VM = 'vm-web-01';
+  const SIZES = ['Standard_B1s', 'Standard_B1ms', 'Standard_B2s', 'Standard_B2ms', 'Standard_DS1_v2', 'Standard_D2s_v5'];
+  const IMAGES = { ubuntu2404: { os: 'Linux', urn: 'Canonical:ubuntu-24_04-lts:server:latest' }, ubuntu2204: { os: 'Linux', urn: 'Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest' }, debian11: { os: 'Linux', urn: 'Debian:debian-11:11-backports-gen2:latest' }, win2022datacenter: { os: 'Windows', urn: 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest' } };
+  const DEFAULT_RULES = [
+    { name: 'AllowVnetInBound', priority: 65000, direction: 'Inbound', access: 'Allow', protocol: '*', src: ['VirtualNetwork'], ports: ['*'], dflt: true },
+    { name: 'AllowAzureLoadBalancerInBound', priority: 65001, direction: 'Inbound', access: 'Allow', protocol: '*', src: ['AzureLoadBalancer'], ports: ['*'], dflt: true },
+    { name: 'DenyAllInBound', priority: 65500, direction: 'Inbound', access: 'Deny', protocol: '*', src: ['*'], ports: ['*'], dflt: true }
+  ];
+
+  function createState(v) {
+    const V = VARIANTS[v];
+    const st = { v, V, rgs: [{ name: 'NetworkWatcherRG', location: V.region, tags: {} }], vnets: [], nsgs: [], nics: [], pips: [], vms: [], sshKey: v === 0, flags: {} };
+    if (v === 1) st.rgs.push({ name: RG, location: 'northeurope', tags: { 'cost-center': V.cc } });
+    if (v === 2) {
+      st.rgs.push({ name: RG, location: V.region, tags: { 'cost-center': V.cc } });
+      st.nsgs.push({ name: NSG, rg: RG, location: V.region, rules: [{ name: 'Allow-All-Inbound', priority: 100, direction: 'Inbound', access: 'Allow', protocol: '*', src: ['*'], ports: ['*'], description: 'temp - testing (remove before go-live)' }] });
+    }
+    return st;
+  }
+
+  // ---------- helpers
+  const eq = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+  const findRg = (st, n) => st.rgs.find(r => eq(r.name, n));
+  const findVnet = (st, rg, n) => st.vnets.find(x => eq(x.rg, rg) && eq(x.name, n));
+  const findNsg = (st, rg, n) => st.nsgs.find(x => eq(x.rg, rg) && eq(x.name, n));
+  const findVm = (st, rg, n) => st.vms.find(x => eq(x.rg, rg) && eq(x.name, n));
+  const findNic = (st, rg, n) => st.nics.find(x => eq(x.rg, rg) && eq(x.name, n));
+  const J = o => JSON.stringify(o, null, 2);
+  const isTable = a => a._g && /^table$/i.test(a._g.output || a._g.o || '');
+  const tbl = rows => Lab.util.renderTable(rows, null, null, 'az');
+  const id = (rg, type, name) => `/subscriptions/${SUB}/resourceGroups/${rg}/providers/${type}/${name}`;
+  const rgErr = rg => CmdError(`(ResourceGroupNotFound) Resource group '${rg}' could not be found.\nCode: ResourceGroupNotFound\nMessage: Resource group '${rg}' could not be found.`);
+  const needRg = (st, n) => { const r = findRg(st, n); if (!r) throw rgErr(n); return r; };
+  const policyLoc = (st, loc, what) => { if (!eq(loc, st.V.region)) throw CmdError(`(RequestDisallowedByPolicy) Resource '${what}' was disallowed by policy. Policy identifiers: '[{"policyAssignment":{"name":"Allowed locations (production)"},"policyDefinition":{"name":"Allowed locations"}}]'.\nCode: RequestDisallowedByPolicy\nMessage: Only '${st.V.region}' is allowed in this subscription.`); };
+  const parseTags = list => { const t = {}; (list || []).forEach(x => { const i = x.indexOf('='); if (i < 0) t[x] = ''; else t[x.slice(0, i)] = x.slice(i + 1); }); return t; };
+  const isPrivate = ip => ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'].some(c => net.contains(c, ip));
+  const vnetOfNic = (st, nic) => st.vnets.find(x => eq(x.rg, nic.rg) && eq(x.name, nic.subnet.vnet));
+  function srcMatch(st, prefix, ip, vnet) {
+    if (prefix === '*' || prefix === 'Any') return true;
+    if (eq(prefix, 'Internet')) return !isPrivate(ip);
+    if (eq(prefix, 'VirtualNetwork')) return !!vnet && vnet.prefixes.some(c => net.contains(c, ip));
+    if (eq(prefix, 'AzureLoadBalancer')) return ip === '168.63.129.16';
+    if (net.isIp(prefix)) return prefix === ip;
+    return net.isCidr(prefix) && net.contains(prefix, ip);
+  }
+  const portMatch = (ports, p) => ports.some(r => r === '*' || (/^\d+-\d+$/.test(r) ? p >= +r.split('-')[0] && p <= +r.split('-')[1] : +r === p));
+  function evalNsg(st, nsg, ip, port, proto, vnet) {
+    const rules = nsg.rules.filter(r => r.direction === 'Inbound').concat(DEFAULT_RULES).sort((a, b) => a.priority - b.priority);
+    const r = rules.find(x => (x.protocol === '*' || eq(x.protocol, proto)) && x.src.some(s => srcMatch(st, s, ip, vnet)) && portMatch(x.ports, port));
+    return { allow: r.access === 'Allow', rule: r.name, nsg: nsg.name };
+  }
+  // Inbound: subnet NSG first, then NIC NSG; both must allow.
+  function effective(st, vm, ip, port, proto) {
+    proto = proto || 'Tcp'; const nic = st.nics.find(n => eq(n.name, vm.nic)); const vnet = vnetOfNic(st, nic);
+    const sn = vnet && vnet.subnets.find(s => eq(s.name, nic.subnet.name));
+    const layers = [];
+    if (sn && sn.nsg) layers.push(findNsg(st, vnet.rg, sn.nsg)); if (nic.nsg) layers.push(findNsg(st, nic.rg, nic.nsg));
+    if (!layers.length) return { allow: true, rule: '(no NSG)', nsg: '' };
+    for (const n of layers) { const r = evalNsg(st, n, ip, port, proto, vnet); if (!r.allow) return r; }
+    const last = evalNsg(st, layers[layers.length - 1], ip, port, proto, vnet); return last;
+  }
+  const ruleOut = (rg, nsg, r) => ({ access: r.access, description: r.description || null, destinationAddressPrefix: '*', destinationPortRange: r.ports.length === 1 ? r.ports[0] : undefined, destinationPortRanges: r.ports.length > 1 ? r.ports : [], direction: r.direction, id: id(rg, 'Microsoft.Network/networkSecurityGroups', nsg) + '/securityRules/' + r.name, name: r.name, priority: r.priority, protocol: r.protocol, provisioningState: 'Succeeded', resourceGroup: rg, sourceAddressPrefix: r.src.length === 1 ? r.src[0] : undefined, sourceAddressPrefixes: r.src.length > 1 ? r.src : [], sourcePortRange: '*', type: 'Microsoft.Network/networkSecurityGroups/securityRules' });
+  const ruleRow = r => ({ Name: r.name, ResourceGroup: r.rg || RG, Priority: String(r.priority), SourcePortRanges: '*', SourceAddressPrefixes: r.src.join(' '), SourceASG: 'None', Access: r.access, Protocol: r.protocol, Direction: r.direction, DestinationPortRanges: r.ports.join(' '), DestinationAddressPrefixes: '*', DestinationASG: 'None' });
+  const nsgOut = (st, n) => ({ id: id(n.rg, 'Microsoft.Network/networkSecurityGroups', n.name), location: n.location, name: n.name, provisioningState: 'Succeeded', resourceGroup: n.rg, securityRules: n.rules.map(r => ruleOut(n.rg, n.name, r)), defaultSecurityRules: '[…6 default rules: use "az network nsg rule list --include-default"]', subnets: st.vnets.flatMap(v => v.subnets.filter(s => eq(s.nsg, n.name)).map(s => ({ id: id(v.rg, 'Microsoft.Network/virtualNetworks', v.name) + '/subnets/' + s.name }))), networkInterfaces: st.nics.filter(x => eq(x.nsg, n.name)).map(x => ({ id: id(x.rg, 'Microsoft.Network/networkInterfaces', x.name) })), type: 'Microsoft.Network/networkSecurityGroups' });
+  const subnetOut = (v, s) => ({ addressPrefix: s.prefix, id: id(v.rg, 'Microsoft.Network/virtualNetworks', v.name) + '/subnets/' + s.name, name: s.name, networkSecurityGroup: s.nsg ? { id: id(v.rg, 'Microsoft.Network/networkSecurityGroups', s.nsg), resourceGroup: v.rg } : null, provisioningState: 'Succeeded', resourceGroup: v.rg, type: 'Microsoft.Network/virtualNetworks/subnets' });
+  const vnetOut = v => ({ newVNet: { addressSpace: { addressPrefixes: v.prefixes }, id: id(v.rg, 'Microsoft.Network/virtualNetworks', v.name), location: v.location, name: v.name, provisioningState: 'Succeeded', resourceGroup: v.rg, subnets: v.subnets.map(s => subnetOut(v, s)), type: 'Microsoft.Network/virtualNetworks' } });
+  function validPrefix(c, flag) { if (!net.isCidr(c)) throw CmdError(`(InvalidAddressPrefixFormat) Address prefix ${c} for resource ... is not formatted correctly. It should follow CIDR notation, for example 10.0.0.0/24.\nCode: InvalidAddressPrefixFormat (argument ${flag})`); if (!net.parseCidr(c).exact) throw CmdError(`(InvalidCIDRNotation) The address prefix ${c} in resource has an invalid CIDR notation. For the given prefix length, the address prefix should be ${net.intToIp(net.parseCidr(c).base)}/${net.parseCidr(c).len}.\nCode: InvalidCIDRNotation`); return c; }
+  function addSubnet(v, name, prefix) {
+    validPrefix(prefix, '--address-prefixes');
+    if (!v.prefixes.some(p => net.within(prefix, p))) throw CmdError(`(NetcfgSubnetRangeOutsideVnet) Subnet '${name}' is not valid because its IP address range is outside the IP address range of virtual network '${v.name}'.\nCode: NetcfgSubnetRangeOutsideVnet`);
+    const ov = v.subnets.find(s => net.within(prefix, s.prefix) || net.within(s.prefix, prefix));
+    if (ov) throw CmdError(`(NetcfgSubnetRangesOverlap) Subnet '${name}' is not valid because its IP address range overlaps with that of an existing subnet '${ov.name}' in virtual network '${v.name}'.\nCode: NetcfgSubnetRangesOverlap`);
+    const s = { name, prefix, nsg: null }; v.subnets.push(s); return s;
+  }
+  function delRg(st, n) { ['vnets', 'nsgs', 'nics', 'pips', 'vms'].forEach(k => { st[k] = st[k].filter(x => !eq(x.rg, n)); }); st.rgs = st.rgs.filter(r => !eq(r.name, n)); }
+
+  // ---------- commands
+  const G = { aliases: ['g'], desc: 'Resource group name', required: true };
+  function commands(lab) {
+    const S = () => lab.state;
+    return {
+      'az account show': { desc: 'Show the current subscription', run: () => J({ environmentName: 'AzureCloud', id: SUB, isDefault: true, name: 'Contoso Production', state: 'Enabled', tenantDefaultDomain: 'contoso.onmicrosoft.com', user: { name: 'ruben@contoso.com', type: 'user' } }) },
+      'az policy assignment list': { desc: 'List Azure Policy assignments on the subscription', run: a => { const st = S(); const rows = [{ Name: 'allowed-locations-prod', DisplayName: 'Allowed locations (production)', EnforcementMode: 'Default', Parameters: `listOfAllowedLocations=[${st.V.region}]` }, { Name: 'require-cost-center-rg', DisplayName: 'Require a tag on resource groups', EnforcementMode: 'Default', Parameters: 'tagName=cost-center' }]; return isTable(a) ? tbl(rows) : J(rows.map(r => ({ displayName: r.DisplayName, name: r.Name, enforcementMode: r.EnforcementMode, parameters: r.Parameters }))); } },
+      'az group create': { desc: 'Create (or update the tags of) a resource group', params: { name: { aliases: ['n', 'resource-group', 'g'], required: true }, location: { aliases: ['l'], required: true }, tags: { type: 'multi', desc: 'Space-separated key=value pairs' } },
+        run: a => {
+          const st = S(); const ex = findRg(st, a.name);
+          if (ex && !eq(ex.location, a.location)) throw CmdError(`(InvalidResourceGroupLocation) Invalid resource group location '${a.location}'. The Resource group already exists in location '${ex.location}'.\nCode: InvalidResourceGroupLocation`);
+          policyLoc(st, a.location, a.name);
+          const tags = a.tags ? parseTags(a.tags) : ex ? ex.tags : {};
+          if (!tags['cost-center']) throw CmdError(`(RequestDisallowedByPolicy) Resource '${a.name}' was disallowed by policy. Policy identifiers: '[{"policyAssignment":{"name":"Require a tag on resource groups"},"policyDefinition":{"name":"Require a tag on resource groups"}}]'.\nCode: RequestDisallowedByPolicy\nMessage: Tag 'cost-center' is required.`);
+          if (ex) ex.tags = tags; else st.rgs.push({ name: a.name, location: a.location.toLowerCase(), tags });
+          const r = findRg(st, a.name); return J({ id: `/subscriptions/${SUB}/resourceGroups/${r.name}`, location: r.location, managedBy: null, name: r.name, properties: { provisioningState: 'Succeeded' }, tags: r.tags, type: 'Microsoft.Resources/resourceGroups' });
+        } },
+      'az group update': { desc: 'Update a resource group (e.g. --tags)', params: { name: { aliases: ['n', 'resource-group', 'g'], required: true }, tags: { type: 'multi' } },
+        run: a => { const st = S(); const r = needRg(st, a.name); if (a.tags) { const t = parseTags(a.tags); if (!t['cost-center']) throw CmdError('(RequestDisallowedByPolicy) Tag \'cost-center\' is required on resource groups.'); r.tags = t; } return J({ id: `/subscriptions/${SUB}/resourceGroups/${r.name}`, location: r.location, name: r.name, properties: { provisioningState: 'Succeeded' }, tags: r.tags }); } },
+      'az group show': { desc: 'Show a resource group', params: { name: { aliases: ['n', 'resource-group', 'g'], required: true } }, run: a => { const r = needRg(S(), a.name); return J({ id: `/subscriptions/${SUB}/resourceGroups/${r.name}`, location: r.location, name: r.name, properties: { provisioningState: 'Succeeded' }, tags: r.tags }); } },
+      'az group list': { desc: 'List resource groups', run: a => { const rows = S().rgs.map(r => ({ Name: r.name, Location: r.location, Status: 'Succeeded', Tags: Object.entries(r.tags).map(([k, v]) => `${k}=${v}`).join(' ') })); return isTable(a) ? tbl(rows) : J(S().rgs.map(r => ({ location: r.location, name: r.name, tags: r.tags }))); } },
+      'az group delete': { desc: 'Delete a resource group and everything in it', params: { name: { aliases: ['n', 'resource-group', 'g'], required: true }, yes: { type: 'switch', aliases: ['y'] } },
+        run: a => { const st = S(); needRg(st, a.name); if (!a.yes && !(a._g && (a._g.yes || a._g.y))) throw CmdError('Are you sure you want to perform this operation? (y/n): \n(Interactive prompts aren\'t available here: add --yes.)'); delRg(st, a.name); return ''; } },
+      'az network vnet create': { desc: 'Create a virtual network (optionally with a first subnet)', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, location: { aliases: ['l'] }, 'address-prefixes': { type: 'multi' }, 'subnet-name': {}, 'subnet-prefixes': { type: 'multi' } },
+        run: a => {
+          const st = S(); const rg = needRg(st, a['resource-group']); const loc = a.location || rg.location; policyLoc(st, loc, a.name);
+          if (findVnet(st, rg.name, a.name)) throw CmdError(`A virtual network named '${a.name}' already exists in '${rg.name}'.`);
+          const prefixes = (a['address-prefixes'] || ['10.0.0.0/16']).map(p => validPrefix(p, '--address-prefixes'));
+          const v = { name: a.name, rg: rg.name, location: loc.toLowerCase(), prefixes, subnets: [] };
+          if (a['subnet-name']) addSubnet(v, a['subnet-name'], (a['subnet-prefixes'] || [prefixes[0].replace(/\.\d+\.\d+\/\d+$/, '.0.0/24')])[0]);
+          st.vnets.push(v); return J(vnetOut(v));
+        } },
+      'az network vnet list': { desc: 'List virtual networks', params: { 'resource-group': { aliases: ['g'] } }, run: a => { const vs = S().vnets.filter(v => !a['resource-group'] || eq(v.rg, a['resource-group'])); return isTable(a) ? tbl(vs.map(v => ({ Name: v.name, ResourceGroup: v.rg, Location: v.location, NumSubnets: String(v.subnets.length), Prefixes: v.prefixes.join(', ') }))) : J(vs.map(v => vnetOut(v).newVNet)); } },
+      'az network vnet subnet create': { desc: 'Create a subnet', params: { 'resource-group': G, 'vnet-name': { required: true }, name: { aliases: ['n'], required: true }, 'address-prefixes': { type: 'multi', required: true }, 'network-security-group': { aliases: ['nsg'] } },
+        run: a => { const st = S(); needRg(st, a['resource-group']); const v = findVnet(st, a['resource-group'], a['vnet-name']); if (!v) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Network/virtualNetworks/${a['vnet-name']}' under resource group '${a['resource-group']}' was not found.`); if (v.subnets.some(s => eq(s.name, a.name))) throw CmdError(`Subnet '${a.name}' already exists. Use "az network vnet subnet update".`); if (a['network-security-group'] && !findNsg(st, v.rg, a['network-security-group'])) throw CmdError(`(InvalidResourceReference) Resource ${id(v.rg, 'Microsoft.Network/networkSecurityGroups', a['network-security-group'])} referenced by resource ${a.name} was not found.`); const s = addSubnet(v, a.name, a['address-prefixes'][0]); s.nsg = a['network-security-group'] || null; return J(subnetOut(v, s)); } },
+      'az network vnet subnet update': { desc: 'Update a subnet (e.g. associate an NSG)', params: { 'resource-group': G, 'vnet-name': { required: true }, name: { aliases: ['n'], required: true }, 'network-security-group': { aliases: ['nsg'] }, remove: {} },
+        run: a => { const st = S(); needRg(st, a['resource-group']); const v = findVnet(st, a['resource-group'], a['vnet-name']); if (!v) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Network/virtualNetworks/${a['vnet-name']}' under resource group '${a['resource-group']}' was not found.`); const s = v.subnets.find(x => eq(x.name, a.name)); if (!s) throw CmdError(`(NotFound) Resource ${a.name} not found in virtual network ${v.name}.`);
+          if (a['network-security-group'] !== undefined) { if (a['network-security-group'] === '' || a['network-security-group'] === '""') s.nsg = null; else { const n = findNsg(st, v.rg, a['network-security-group']); if (!n) throw CmdError(`(InvalidResourceReference) Resource ${id(v.rg, 'Microsoft.Network/networkSecurityGroups', a['network-security-group'])} referenced by resource ${s.name} was not found.`); s.nsg = n.name; } }
+          if (a.remove && /networkSecurityGroup/i.test(a.remove)) s.nsg = null; lab.touch(); return J(subnetOut(v, s)); } },
+      'az network vnet subnet list': { desc: 'List subnets of a VNet', params: { 'resource-group': G, 'vnet-name': { required: true } }, run: a => { const v = findVnet(S(), a['resource-group'], a['vnet-name']); if (!v) throw CmdError('(ResourceNotFound) VNet not found.'); return isTable(a) ? tbl(v.subnets.map(s => ({ Name: s.name, AddressPrefix: s.prefix, NSG: s.nsg || 'None' }))) : J(v.subnets.map(s => subnetOut(v, s))); } },
+      'az network nsg create': { desc: 'Create a network security group', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, location: { aliases: ['l'] } },
+        run: a => { const st = S(); const rg = needRg(st, a['resource-group']); const loc = a.location || rg.location; policyLoc(st, loc, a.name); if (findNsg(st, rg.name, a.name)) throw CmdError(`An NSG named '${a.name}' already exists in '${rg.name}'.`); const n = { name: a.name, rg: rg.name, location: loc.toLowerCase(), rules: [] }; st.nsgs.push(n); return J({ NewNSG: nsgOut(st, n) }); } },
+      'az network nsg list': { desc: 'List NSGs', params: { 'resource-group': { aliases: ['g'] } }, run: a => { const st = S(); const ns = st.nsgs.filter(n => !a['resource-group'] || eq(n.rg, a['resource-group'])); return isTable(a) ? tbl(ns.map(n => ({ Name: n.name, ResourceGroup: n.rg, Location: n.location, Rules: String(n.rules.length) }))) : J(ns.map(n => nsgOut(st, n))); } },
+      'az network nsg show': { desc: 'Show an NSG', params: { 'resource-group': G, name: { aliases: ['n'], required: true } }, run: a => { const st = S(); const n = findNsg(st, a['resource-group'], a.name); if (!n) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Network/networkSecurityGroups/${a.name}' under resource group '${a['resource-group']}' was not found.`); return J(nsgOut(st, n)); } },
+      'az network nsg delete': { desc: 'Delete an NSG', params: { 'resource-group': G, name: { aliases: ['n'], required: true } },
+        run: a => { const st = S(); const n = findNsg(st, a['resource-group'], a.name); if (!n) throw CmdError(`(ResourceNotFound) NSG '${a.name}' was not found.`); const users = st.nics.filter(x => eq(x.nsg, n.name)).map(x => x.name).concat(st.vnets.flatMap(v => v.subnets.filter(s => eq(s.nsg, n.name)).map(s => v.name + '/' + s.name))); if (users.length) throw CmdError(`(InUseNetworkSecurityGroupCannotBeDeleted) Network security group ${id(n.rg, 'Microsoft.Network/networkSecurityGroups', n.name)} cannot be deleted because it is in use by the following resources: ${users.join(', ')}. In order to delete the Network security group, remove the association with the resource(s).\nCode: InUseNetworkSecurityGroupCannotBeDeleted`); st.nsgs = st.nsgs.filter(x => x !== n); return ''; } },
+      'az network nsg rule create': { desc: 'Add a security rule to an NSG', params: { 'resource-group': G, 'nsg-name': { required: true }, name: { aliases: ['n'], required: true }, priority: { type: 'int', required: true }, direction: { type: 'enum', values: ['Inbound', 'Outbound'] }, access: { type: 'enum', values: ['Allow', 'Deny'] }, protocol: { type: 'enum', values: ['Tcp', 'Udp', 'Icmp', 'Esp', 'Ah', '*'] }, 'source-address-prefixes': { type: 'multi' }, 'source-port-ranges': { type: 'multi' }, 'destination-address-prefixes': { type: 'multi' }, 'destination-port-ranges': { type: 'multi' }, description: {} },
+        run: a => {
+          const st = S(); needRg(st, a['resource-group']); const n = findNsg(st, a['resource-group'], a['nsg-name']); if (!n) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Network/networkSecurityGroups/${a['nsg-name']}' under resource group '${a['resource-group']}' was not found.`);
+          if (a.priority < 100 || a.priority > 4096) throw CmdError(`(SecurityRuleInvalidPriority) Security rule has invalid Priority. Value provided: ${a.priority} Allowed range 100-4096.\nCode: SecurityRuleInvalidPriority`);
+          const direction = a.direction || 'Inbound';
+          const clash = n.rules.find(r => r.priority === a.priority && r.direction === direction && !eq(r.name, a.name));
+          if (clash) throw CmdError(`(SecurityRuleConflict) Security rule ${a.name} conflicts with rule ${clash.name}. Rules cannot have the same Priority and Direction. To learn more, see aka.ms/nsgrules.\nCode: SecurityRuleConflict`);
+          const src = a['source-address-prefixes'] || ['*'];
+          src.forEach(s => { if (!(s === '*' || ['internet', 'virtualnetwork', 'azureloadbalancer'].includes(s.toLowerCase()) || net.isIp(s) || net.isCidr(s))) throw CmdError(`(SecurityRuleInvalidAddressPrefix) Security rule ${a.name} has invalid Address prefix. Value provided: ${s}\nCode: SecurityRuleInvalidAddressPrefix`); });
+          const ports = a['destination-port-ranges'] || ['80'];
+          ports.forEach(p => { if (!(p === '*' || /^\d{1,5}(-\d{1,5})?$/.test(p))) throw CmdError(`(SecurityRuleInvalidPortRange) Security rule ${a.name} has invalid Port range. Value provided: ${p}.\nCode: SecurityRuleInvalidPortRange`); });
+          const r = { name: a.name, priority: a.priority, direction, access: a.access || 'Allow', protocol: a.protocol || '*', src: src.map(s => (/^(internet|virtualnetwork|azureloadbalancer)$/i.test(s) ? { internet: 'Internet', virtualnetwork: 'VirtualNetwork', azureloadbalancer: 'AzureLoadBalancer' }[s.toLowerCase()] : s)), ports, description: a.description || null };
+          n.rules = n.rules.filter(x => !eq(x.name, a.name)).concat(r); lab.touch();
+          return J(ruleOut(n.rg, n.name, r)) + (!a['destination-port-ranges'] ? '\n(Note: --destination-port-ranges defaulted to 80.)' : '') + (!a['source-address-prefixes'] ? '\n(Note: --source-address-prefixes defaulted to * = any source.)' : '');
+        } },
+      'az network nsg rule list': { desc: 'List the rules of an NSG (--include-default for the built-in ones)', params: { 'resource-group': G, 'nsg-name': { required: true }, 'include-default': { type: 'switch' } },
+        run: a => { const st = S(); const n = findNsg(st, a['resource-group'], a['nsg-name']); if (!n) throw CmdError(`(ResourceNotFound) NSG '${a['nsg-name']}' not found.`); const rules = n.rules.concat(a['include-default'] ? DEFAULT_RULES : []).sort((x, y) => (x.direction === y.direction ? x.priority - y.priority : x.direction < y.direction ? -1 : 1)); return isTable(a) ? tbl(rules.map(ruleRow)) : J(rules.map(r => ruleOut(n.rg, n.name, r))); } },
+      'az network nsg rule delete': { desc: 'Delete a rule from an NSG', params: { 'resource-group': G, 'nsg-name': { required: true }, name: { aliases: ['n'], required: true } },
+        run: a => { const st = S(); const n = findNsg(st, a['resource-group'], a['nsg-name']); if (!n) throw CmdError(`(ResourceNotFound) NSG '${a['nsg-name']}' not found.`); if (DEFAULT_RULES.some(r => eq(r.name, a.name))) throw CmdError('Default security rules can\'t be deleted. Override them with a higher-priority (lower number) rule.'); n.rules = n.rules.filter(r => !eq(r.name, a.name)); lab.touch(); return ''; } },
+      'az vm create': { desc: 'Create a virtual machine', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, image: { required: true }, size: {}, location: { aliases: ['l'] }, 'vnet-name': {}, subnet: {}, 'admin-username': {}, 'admin-password': {}, 'authentication-type': { type: 'enum', values: ['ssh', 'password', 'all'] }, 'generate-ssh-keys': { type: 'switch' }, 'ssh-key-values': { type: 'multi' }, nsg: {}, 'nsg-rule': { type: 'enum', values: ['SSH', 'RDP', 'NONE'] }, 'public-ip-address': {}, 'public-ip-sku': { type: 'enum', values: ['Basic', 'Standard'] }, 'private-ip-address': {} },
+        run: a => {
+          const st = S(); const rg = needRg(st, a['resource-group']); const loc = (a.location || rg.location).toLowerCase(); policyLoc(st, loc, a.name);
+          if (findVm(st, rg.name, a.name)) throw CmdError(`A VM named '${a.name}' already exists in '${rg.name}'. (Use a new name or delete it first.)`);
+          const img = IMAGES[a.image.toLowerCase()] || Object.values(IMAGES).find(i => eq(i.urn, a.image)); if (!img) throw CmdError(`ERROR: Invalid image "${a.image}". Use a valid image URN, custom image name, custom image id, VHD blob URI, or pick an image from ['Ubuntu2404', 'Ubuntu2204', 'Debian11', 'Win2022Datacenter'] (simulation subset).`);
+          const size = a.size || 'Standard_DS1_v2'; const sz = SIZES.find(s => eq(s, size)); if (!sz) throw CmdError(`(InvalidParameter) The requested VM size '${size}' is not available in location '${loc}'. (Sizes in this simulation: ${SIZES.join(', ')})`);
+          const user = a['admin-username'] || 'ruben';
+          if (['admin', 'administrator', 'root', 'user', 'test'].includes(user.toLowerCase())) throw CmdError(`(InvalidParameter) The Admin Username specified is not allowed.\nTarget: adminUsername`);
+          let auth = a['authentication-type'] || (img.os === 'Windows' ? 'password' : a['admin-password'] ? (a['generate-ssh-keys'] || a['ssh-key-values'] ? 'all' : 'password') : 'ssh');
+          if (img.os === 'Windows' && !a['admin-password']) throw CmdError('ERROR: Please specify password by --admin-password (Windows VMs don\'t support SSH key authentication here).');
+          if (auth !== 'password' && img.os === 'Linux' && !a['ssh-key-values']) { if (a['generate-ssh-keys']) { if (!st.sshKey) st.sshKey = 'generated'; } else if (!st.sshKey) throw CmdError('ERROR: An RSA key file or key value must be supplied to SSH Key Value. You can use --generate-ssh-keys to let CLI generate one for you'); }
+          if (auth !== 'ssh' && !a['admin-password']) throw CmdError('ERROR: Please specify password in non-interactive mode.');
+          if (a['admin-password'] && (a['admin-password'].length < 12 || [/[a-z]/, /[A-Z]/, /\d/, /[^\w]/].filter(r => r.test(a['admin-password'])).length < 3)) throw CmdError('ERROR: The password length must be between 12 and 72. Password must have the 3 of the following: 1 lower case character, 1 upper case character, 1 number and 1 special character.');
+          let vnet, subnet; const out = [];
+          if (a.subnet || a['vnet-name']) {
+            vnet = findVnet(st, rg.name, a['vnet-name'] || ''); if (!vnet) throw CmdError(`ERROR: (ResourceNotFound) The Resource 'Microsoft.Network/virtualNetworks/${a['vnet-name'] || '(missing --vnet-name)'}' under resource group '${rg.name}' was not found.`);
+            subnet = vnet.subnets.find(s => eq(s.name, a.subnet || '')); if (!subnet) { if (!a.subnet && vnet.subnets.length === 1) subnet = vnet.subnets[0]; else throw CmdError(`ERROR: subnet '${a.subnet || ''}' not found in VNet '${vnet.name}'.`); }
+          } else {
+            vnet = findVnet(st, rg.name, a.name + 'VNET') || { name: a.name + 'VNET', rg: rg.name, location: loc, prefixes: ['10.0.0.0/16'], subnets: [{ name: a.name + 'Subnet', prefix: '10.0.0.0/24', nsg: null }] };
+            if (!st.vnets.includes(vnet)) { st.vnets.push(vnet); out.push(`(No --vnet-name/--subnet given: created a new VNet ${vnet.name} 10.0.0.0/16.)`); }
+            subnet = vnet.subnets[0];
+          }
+          let nicNsg = null;
+          if (a.nsg === undefined) {
+            nicNsg = a.name + 'NSG'; const rules = a['nsg-rule'] === 'NONE' ? [] : [{ name: img.os === 'Windows' || a['nsg-rule'] === 'RDP' ? 'rdp' : 'default-allow-ssh', priority: 1000, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', src: ['*'], ports: [img.os === 'Windows' || a['nsg-rule'] === 'RDP' ? '3389' : '22'] }];
+            st.nsgs.push({ name: nicNsg, rg: rg.name, location: loc, rules, auto: true });
+          } else if (a.nsg !== '' && a.nsg !== '""') { const n = findNsg(st, rg.name, a.nsg); if (!n) throw CmdError(`ERROR: NSG '${a.nsg}' not found in '${rg.name}'.`); nicNsg = n.name; }
+          const used = st.nics.filter(x => x.subnet.vnet === vnet.name && x.subnet.name === subnet.name).length;
+          const base = net.parseCidr(subnet.prefix).base; const privateIp = net.intToIp(base + 4 + used);
+          let pip = null; if (a['public-ip-address'] !== '' && a['public-ip-address'] !== '""') { pip = { name: a['public-ip-address'] || a.name + 'PublicIP', rg: rg.name, location: loc, ip: st.V.pip, sku: a['public-ip-sku'] || 'Standard' }; st.pips.push(pip); }
+          const nic = { name: a.name + 'VMNic', rg: rg.name, location: loc, subnet: { vnet: vnet.name, name: subnet.name }, nsg: nicNsg, privateIp, pip: pip && pip.name, vm: a.name }; st.nics.push(nic);
+          st.vms.push({ name: a.name, rg: rg.name, location: loc, image: a.image, os: img.os, size: sz, auth, user, nic: nic.name, power: 'VM running', nginx: false });
+          lab.touch();
+          return J({ fqdns: '', id: id(rg.name, 'Microsoft.Compute/virtualMachines', a.name), location: loc, macAddress: '7C-1E-52-4A-9F-02', powerState: 'VM running', privateIpAddress: privateIp, publicIpAddress: pip ? pip.ip : '', resourceGroup: rg.name, zones: '' })
+            + (st.sshKey === 'generated' && a['generate-ssh-keys'] ? '\nSSH key files \'/home/ruben/.ssh/id_rsa\' and \'/home/ruben/.ssh/id_rsa.pub\' have been generated under ~/.ssh to allow SSH access to the VM. If using machines without permanent storage, back up your keys to a safe location.' : '')
+            + (out.length ? '\n' + out.join('\n') : '');
+        } },
+      'az vm list': { desc: 'List VMs (-d adds IPs and power state)', params: { 'resource-group': { aliases: ['g'] }, 'show-details': { type: 'switch', aliases: ['d'] } }, run: a => { const st = S(); const vms = st.vms.filter(v => !a['resource-group'] || eq(v.rg, a['resource-group'])); const row = v => { const nic = st.nics.find(n => eq(n.name, v.nic)); const pip = nic && st.pips.find(p => eq(p.name, nic.pip)); return { Name: v.name, ResourceGroup: v.rg, PowerState: v.power, PublicIps: pip ? pip.ip : '', PrivateIps: nic.privateIp, Location: v.location, Size: v.size }; }; return isTable(a) ? tbl(vms.map(row)) : J(vms.map(v => Object.assign({ name: v.name, hardwareProfile: { vmSize: v.size }, osProfile: { adminUsername: v.user, linuxConfiguration: v.os === 'Linux' ? { disablePasswordAuthentication: v.auth === 'ssh' } : null }, storageProfile: { imageReference: v.image } }, a['show-details'] ? { powerState: row(v).PowerState, publicIps: row(v).PublicIps, privateIps: row(v).PrivateIps } : {}))); } },
+      'az vm show': { desc: 'Show a VM', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, 'show-details': { type: 'switch', aliases: ['d'] } }, run: a => { const st = S(); const v = findVm(st, a['resource-group'], a.name); if (!v) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Compute/virtualMachines/${a.name}' under resource group '${a['resource-group']}' was not found.`); const nic = st.nics.find(n => eq(n.name, v.nic)); const pip = st.pips.find(p => eq(p.name, nic.pip)); return J({ name: v.name, location: v.location, hardwareProfile: { vmSize: v.size }, osProfile: { adminUsername: v.user, linuxConfiguration: v.os === 'Linux' ? { disablePasswordAuthentication: v.auth === 'ssh' } : null }, networkProfile: { networkInterfaces: [{ id: id(nic.rg, 'Microsoft.Network/networkInterfaces', nic.name) }] }, powerState: v.power, privateIps: nic.privateIp, publicIps: pip ? pip.ip : '' }); } },
+      'az vm delete': { desc: 'Delete a VM (its NIC, disk and public IP stay)', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, yes: { type: 'switch', aliases: ['y'] } }, run: a => { const st = S(); const v = findVm(st, a['resource-group'], a.name); if (!v) throw CmdError('(ResourceNotFound) VM not found.'); if (!a.yes && !(a._g && (a._g.yes || a._g.y))) throw CmdError('Are you sure you want to perform this operation? (y/n): \n(Add --yes.)'); st.vms = st.vms.filter(x => x !== v); const nic = st.nics.find(n => eq(n.name, v.nic)); if (nic) nic.vm = null; lab.touch(); return '(VM deleted. Its NIC, public IP and OS disk remain: delete them too if you\'re recreating the VM with the same name.)'; } },
+      'az vm run-command invoke': { desc: 'Run a script inside a VM', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, 'command-id': { required: true }, scripts: { type: 'multi' } },
+        run: a => {
+          const st = S(); const v = findVm(st, a['resource-group'], a.name); if (!v) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Compute/virtualMachines/${a.name}' was not found.`);
+          if (v.os === 'Linux' && a['command-id'] !== 'RunShellScript') throw CmdError(`(BadRequest) Command '${a['command-id']}' is not supported for Linux. Use RunShellScript.`);
+          const s = (a.scripts || []).join(' ');
+          let stdout = '';
+          if (/apt(-get)?\s+(-y\s+)?install/.test(s) && /\bnginx\b/.test(s)) { const upd = /apt(-get)?\s+update/.test(s); if (!upd) stdout = 'E: Unable to locate package nginx\n(Fresh images have an empty package index: run apt-get update first.)'; else { v.nginx = true; stdout = 'Setting up nginx (1.24.0-2ubuntu7.1) ...\nCreated symlink /etc/systemd/system/multi-user.target.wants/nginx.service'; } }
+          else if (/systemctl\s+(status|is-active)\s+nginx/.test(s)) stdout = v.nginx ? 'active' : 'Unit nginx.service could not be found.';
+          else stdout = '(script ran)';
+          lab.touch(); return J({ value: [{ code: 'ProvisioningState/succeeded', displayStatus: 'Provisioning succeeded', level: 'Info', message: `Enable succeeded: \n[stdout]\n${stdout}\n\n[stderr]\n` }] });
+        } },
+      'az network nic list': { desc: 'List network interfaces', params: { 'resource-group': { aliases: ['g'] } }, run: a => { const st = S(); const ns = st.nics.filter(n => !a['resource-group'] || eq(n.rg, a['resource-group'])); const rows = ns.map(n => ({ Name: n.name, ResourceGroup: n.rg, PrivateIp: n.privateIp, Subnet: n.subnet.vnet + '/' + n.subnet.name, NSG: n.nsg || 'None', VM: n.vm || '' })); return isTable(a) ? tbl(rows) : J(rows); } },
+      'az network nic update': { desc: 'Update a NIC (set or --remove networkSecurityGroup)', params: { 'resource-group': G, name: { aliases: ['n'], required: true }, 'network-security-group': { aliases: ['nsg'] }, remove: {} },
+        run: a => { const st = S(); const nic = findNic(st, a['resource-group'], a.name); if (!nic) throw CmdError(`(ResourceNotFound) The Resource 'Microsoft.Network/networkInterfaces/${a.name}' under resource group '${a['resource-group']}' was not found.`); if (a.remove && /networkSecurityGroup/i.test(a.remove)) nic.nsg = null; if (a['network-security-group'] !== undefined) { if (['', '""'].includes(a['network-security-group'])) nic.nsg = null; else { const n = findNsg(st, nic.rg, a['network-security-group']); if (!n) throw CmdError('NSG not found.'); nic.nsg = n.name; } } lab.touch(); return J({ name: nic.name, networkSecurityGroup: nic.nsg ? { id: id(nic.rg, 'Microsoft.Network/networkSecurityGroups', nic.nsg) } : null, ipConfigurations: [{ privateIPAddress: nic.privateIp }] }); } },
+      'az network nic list-effective-nsg': { desc: 'Show the NSGs that apply to a NIC (subnet + NIC)', params: { 'resource-group': G, name: { aliases: ['n'], required: true } },
+        run: a => { const st = S(); const nic = findNic(st, a['resource-group'], a.name); if (!nic) throw CmdError(`(ResourceNotFound) NIC '${a.name}' not found.`); const v = findVm(st, nic.rg, nic.vm || ''); if (!v) throw CmdError('(NetworkInterfaceNotAttached) Effective NSGs are only available for a NIC attached to a running VM.'); const vnet = vnetOfNic(st, nic); const sn = vnet.subnets.find(s => eq(s.name, nic.subnet.name)); const list = []; if (sn.nsg) list.push({ association: { subnet: { id: id(vnet.rg, 'Microsoft.Network/virtualNetworks', vnet.name) + '/subnets/' + sn.name } }, nsg: findNsg(st, vnet.rg, sn.nsg) }); if (nic.nsg) list.push({ association: { networkInterface: { id: id(nic.rg, 'Microsoft.Network/networkInterfaces', nic.name) } }, nsg: findNsg(st, nic.rg, nic.nsg) }); return J({ value: list.map(x => ({ association: x.association, networkSecurityGroup: { id: id(x.nsg.rg, 'Microsoft.Network/networkSecurityGroups', x.nsg.name) }, effectiveSecurityRules: x.nsg.rules.filter(r => r.direction === 'Inbound').concat(DEFAULT_RULES).sort((p, q) => p.priority - q.priority).map(r => ({ name: (r.dflt ? 'defaultSecurityRules/' : 'securityRules/') + r.name, priority: r.priority, access: r.access, protocol: r.protocol === '*' ? 'All' : r.protocol, sourceAddressPrefix: r.src.join(','), destinationPortRange: r.ports.map(p => (p === '*' ? '0-65535' : p.includes('-') ? p : p + '-' + p)).join(','), direction: r.direction })) })) }); } },
+      'az network watcher test-ip-flow': { desc: 'Test whether a packet would be allowed to/from a VM (IP flow verify)', params: { 'resource-group': G, vm: { required: true }, direction: { type: 'enum', values: ['Inbound', 'Outbound'], required: true }, protocol: { type: 'enum', values: ['TCP', 'UDP'], required: true }, local: { required: true }, remote: { required: true } },
+        run: a => {
+          const st = S(); const v = findVm(st, a['resource-group'], a.vm); if (!v) throw CmdError(`(ResourceNotFound) VM '${a.vm}' not found.`);
+          if (a.direction !== 'Inbound') return J({ access: 'Allow', ruleName: 'defaultSecurityRules/AllowInternetOutBound' });
+          const [lip, lport] = a.local.split(':'), [rip] = a.remote.split(':'); const nic = st.nics.find(n => eq(n.name, v.nic));
+          if (lip !== nic.privateIp) throw CmdError(`(InvalidArgument) Local IP ${lip} isn't assigned to ${v.name}. Its private IP is ${nic.privateIp}.`);
+          if (!net.isIp(rip) || !/^\d+$/.test(lport || '')) throw CmdError('ERROR: --local and --remote must be IP:port.');
+          const r = effective(st, v, rip, +lport, a.protocol === 'TCP' ? 'Tcp' : 'Udp');
+          if (+lport === 22 && !isPrivate(rip) && rip !== st.V.admin && !r.allow) st.flags.flowTested = true;
+          lab.touch(); return J({ access: r.allow ? 'Allow' : 'Deny', ruleName: `${r.nsg ? r.nsg + ': ' : ''}${DEFAULT_RULES.some(d => d.name === r.rule) ? 'defaultSecurityRules' : 'securityRules'}/${r.rule}` });
+        } },
+      curl: { raw: true, desc: 'HTTP request from your admin workstation', run: x => {
+        const st = S(); const t = x._pos; const u = t.find(s => !s.startsWith('-')); if (!u) throw CmdError('curl: no URL specified!');
+        const m = u.match(/^(?:(https?):\/\/)?([^/:]+)(?::(\d+))?/); const port = +(m[3] || (m[1] === 'https' ? 443 : 80)); const host = m[2];
+        const pip = st.pips.find(p => p.ip === host); const nic = pip && st.nics.find(n => eq(n.pip, pip.name)); const v = nic && st.vms.find(y => eq(y.name, nic.vm));
+        if (!v) return { text: `curl: (28) Failed to connect to ${host} port ${port} after 21002 ms: Timeout was reached`, cls: 'err' };
+        const r = effective(st, v, st.V.admin, port);
+        if (!r.allow) return { text: `curl: (28) Failed to connect to ${host} port ${port} after 21002 ms: Timeout was reached\n(Dropped by NSG ${r.nsg}, rule ${r.rule}.)`, cls: 'err' };
+        if (!v.nginx || port !== 80) return { text: `curl: (7) Failed to connect to ${host} port ${port} after 38 ms: Couldn't connect to server`, cls: 'err' };
+        st.flags.curlOk = true; lab.touch();
+        return t.some(s => /^-[a-zA-Z]*I/.test(s)) ? 'HTTP/1.1 200 OK\nServer: nginx/1.24.0 (Ubuntu)\nContent-Type: text/html\nContent-Length: 615\nConnection: keep-alive' : '<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n…';
+      } },
+      ssh: { raw: true, desc: 'SSH from your admin workstation: ssh user@IP', run: x => {
+        const st = S(); const tgt = x._pos.find(s => !s.startsWith('-')) || ''; const [user, host] = tgt.includes('@') ? tgt.split('@') : ['ruben', tgt];
+        const pip = st.pips.find(p => p.ip === host); const nic = pip && st.nics.find(n => eq(n.pip, pip.name)); const v = nic && st.vms.find(y => eq(y.name, nic.vm));
+        if (!v) return { text: `ssh: connect to host ${host} port 22: Connection timed out`, cls: 'err' };
+        const r = effective(st, v, st.V.admin, 22); if (!r.allow) return { text: `ssh: connect to host ${host} port 22: Connection timed out\n(Dropped by NSG ${r.nsg}, rule ${r.rule}.)`, cls: 'err' };
+        if (v.os !== 'Linux') return { text: `ssh: connect to host ${host} port 22: Connection refused`, cls: 'err' };
+        if (user !== v.user) return { text: `${user}@${host}: Permission denied (publickey).`, cls: 'err' };
+        if (v.auth === 'password') return { text: `${user}@${host}'s password: \n(Password login: this VM accepts passwords from anyone who can reach port 22. Interactive prompts aren't simulated.)`, cls: 'warn' };
+        if (!st.sshKey) return { text: `${user}@${host}: Permission denied (publickey).`, cls: 'err' };
+        st.flags.sshOk = true; lab.touch();
+        return `Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-1017-azure x86_64)\n${user}@${v.name}:~$ exit\nlogout\nConnection to ${host} closed.`;
+      } },
+      ls: { raw: true, desc: 'List files (your workstation)', run: x => { const st = S(); const p = (x._pos.find(s => !s.startsWith('-')) || '~').replace(/\/$/, ''); if (/\.ssh$/.test(p)) return st.sshKey ? 'id_rsa  id_rsa.pub  known_hosts' : { text: `ls: cannot access '${p}': No such file or directory`, cls: 'err' }; return '.azure  .ssh'.replace('  .ssh', st.sshKey ? '  .ssh' : ''); } }
+    };
+  }
+
+  // ---------- render
+  function render(st) {
+    const rows = [];
+    st.rgs.forEach(r => rows.push([r.name, 'Resource group', '—', r.location, Object.entries(r.tags).map(([k, v]) => `${k}=${v}`).join(', ') || 'no tags']));
+    st.vnets.forEach(v => rows.push([v.name, 'Virtual network', v.rg, v.location, v.prefixes.join(', ') + ' · ' + v.subnets.map(s => `${s.name} ${s.prefix}${s.nsg ? ' [NSG ' + s.nsg + ']' : ''}`).join(', ')]));
+    st.nsgs.forEach(n => rows.push([n.name, 'Network security group', n.rg, n.location, n.rules.filter(r => r.direction === 'Inbound').sort((a, b) => a.priority - b.priority).map(r => `${r.priority} ${r.access} ${r.protocol} ${r.src.join('/')}→${r.ports.join('/')}`).join(' · ') || 'default rules only']));
+    st.vms.forEach(v => rows.push([v.name, 'Virtual machine', v.rg, v.location, `${v.image} · ${v.size} · auth: ${v.auth}${v.nginx ? ' · nginx' : ''}`]));
+    st.nics.forEach(n => rows.push([n.name, 'Network interface', n.rg, n.location, `${n.privateIp} in ${n.subnet.vnet}/${n.subnet.name}${n.nsg ? ' · NSG ' + n.nsg : ''}`]));
+    st.pips.forEach(p => rows.push([p.name, 'Public IP address', p.rg, p.location, `${p.ip} (${p.sku})`]));
+    document.querySelector('#az-res tbody').innerHTML = rows.map(r => `<tr>${r.map((c, i) => `<td${i === 0 || i === 4 ? ' class="mono"' : ''} style="font-size:12px">${esc(c)}</td>`).join('')}</tr>`).join('');
+  }
+  function onReset(st) {
+    const V = st.V;
+    document.getElementById('wo').innerHTML = `<dt>Region</dt><dd><code>${V.region}</code> (only region allowed by policy)</dd><dt>Resource group</dt><dd><code>${RG}</code> · tags <code>cost-center=${V.cc}</code> <code>env=prod</code></dd><dt>VNet</dt><dd><code>${VNET}</code> ${V.p}.0.0/16</dd><dt>Subnet</dt><dd><code>${SNET}</code> ${V.p}.1.0/24</dd><dt>NSG</dt><dd><code>${NSG}</code> on the subnet: HTTP/HTTPS from the internet, SSH only from the admin IP <code>${V.admin}</code></dd><dt>VM</dt><dd><code>${VM}</code> · Ubuntu 24.04 · Standard_B2s · SSH keys only · nginx</dd><dt>You are on</dt><dd>admin workstation ${V.admin}, az CLI signed in</dd>`;
+    document.getElementById('vnote').textContent = st.v === 1 ? 'Note from a colleague: "I already made the resource group for you."' : st.v === 2 ? 'Note: networking pre-created the NSG from an old template.' : '';
+  }
+
+  // ---------- checks
+  const theVm = st => findVm(st, RG, VM);
+  const SUBNET_NSG = st => { const v = findVnet(st, RG, VNET); const s = v && v.subnets.find(x => eq(x.name, SNET)); return s && s.nsg ? findNsg(st, RG, s.nsg) : null; };
+  const lab = Lab({
+    id: 'azure-vnet-lab', dialect: 'bash', variants: 3, termTitle: 'bash — admin workstation (az CLI)',
+    prompt: 'ruben@admin-ws:~$ ',
+    banner: 'Azure CLI 2.67.0 · signed in as ruben@contoso.com · subscription "Contoso Production"\nTip: az <group> --help, and -o table for readable lists. Type "help" for the commands in this simulation.\n',
+    createState, commands, render, onReset,
+    objectives: [
+      { text: 'Resource group <code>rg-web-prod</code> in the required region, tagged <code>cost-center</code> and <code>env=prod</code>.',
+        check: st => { const r = findRg(st, RG); if (!r) return 'The resource group doesn\'t exist.'; if (!eq(r.location, st.V.region)) return `It's in ${r.location}, not ${st.V.region}. A resource group's location can't be changed.`; if (r.tags['cost-center'] !== st.V.cc) return `Tag cost-center should be ${st.V.cc}.`; return r.tags.env === 'prod' || 'Tag env=prod is missing.'; },
+        hints: ['Read the work order for region and tags. Policy will reject anything else.', 'A resource group\'s region is fixed at creation. If it\'s wrong (and empty), delete and recreate it. Tags are key=value pairs separated by spaces.', `<code>az group create -n rg-web-prod -l &lt;region&gt; --tags cost-center=&lt;cc&gt; env=prod</code> (use <code>az group delete -n rg-web-prod --yes</code> first if it's in the wrong region)`] },
+      { text: 'Virtual network <code>vnet-web</code> with subnet <code>snet-web</code>, using the address ranges in the work order.',
+        check: st => { const v = findVnet(st, RG, VNET); if (!v) return 'vnet-web doesn\'t exist in rg-web-prod.'; if (!v.prefixes.includes(st.V.p + '.0.0/16')) return `The VNet address space should include ${st.V.p}.0.0/16.`; const s = v.subnets.find(x => eq(x.name, SNET)); if (!s) return 'Subnet snet-web is missing.'; return s.prefix === st.V.p + '.1.0/24' || `snet-web is ${s.prefix}, expected ${st.V.p}.1.0/24.`; },
+        hints: ['One command can create the VNet and its first subnet.', 'Address space is a CIDR for the whole VNet. Subnets must sit inside it.', '<code>az network vnet create -g rg-web-prod -n vnet-web --address-prefixes &lt;x&gt;.0.0/16 --subnet-name snet-web --subnet-prefixes &lt;x&gt;.1.0/24</code>'] },
+      { text: '<code>nsg-web</code> is on the subnet: 80/443 open to the internet, SSH only from the admin IP, nothing else open.',
+        check: st => { const n = SUBNET_NSG(st); if (!n) return 'snet-web has no NSG associated.'; if (!eq(n.name, NSG)) return `The subnet uses ${n.name}, not nsg-web.`; const vnet = findVnet(st, RG, VNET); const t = (ip, p) => evalNsg(st, n, ip, p, 'Tcp', vnet).allow;
+          if (!t(INET, 80) || !t(INET, 443)) return 'HTTP and/or HTTPS from the internet isn\'t allowed.'; if (!t(st.V.admin, 22)) return 'SSH from the admin IP isn\'t allowed.'; if (t(INET, 22)) return 'SSH is open to the whole internet.'; if (t(INET, 3389) || t(INET, 8080)) return 'Other ports are open to the internet (check for an allow-all rule).'; return true; },
+        hints: ['List the NSG\'s rules with --include-default to see how the built-in rules end in DenyAllInBound.', 'Lower priority numbers win. One rule can list several ports (80 443). Restrict SSH with --source-address-prefixes. Associate the NSG on the subnet.', `<code>az network nsg rule create -g rg-web-prod --nsg-name nsg-web -n Allow-Web --priority 100 --protocol Tcp --source-address-prefixes Internet --destination-port-ranges 80 443</code>, a second rule for 22 from the admin IP, then <code>az network vnet subnet update -g rg-web-prod --vnet-name vnet-web -n snet-web --network-security-group nsg-web</code>`] },
+      { text: 'VM <code>vm-web-01</code>: Ubuntu 24.04, Standard_B2s, in <code>snet-web</code>, SSH key authentication only.',
+        check: st => { const v = theVm(st); if (!v) return 'vm-web-01 doesn\'t exist in rg-web-prod.'; const nic = st.nics.find(n => eq(n.name, v.nic)); if (!eq(nic.subnet.vnet, VNET) || !eq(nic.subnet.name, SNET)) return `The VM is in ${nic.subnet.vnet}/${nic.subnet.name}. az vm create made its own network because no --vnet-name/--subnet was given.`; if (!/ubuntu2404|ubuntu-24_04/i.test(v.image)) return `Image is ${v.image}, not Ubuntu 24.04.`; if (v.size !== 'Standard_B2s') return `Size is ${v.size}, not Standard_B2s.`; return v.auth === 'ssh' || 'Password authentication is enabled on the VM.'; },
+        hints: ['az vm create has many defaults: network, size, NSG, auth. Specify what the work order asks for.', 'Without --vnet-name/--subnet it creates a new VNet. Without --size you get Standard_DS1_v2. A password enables password login. Use SSH keys.', '<code>az vm create -g rg-web-prod -n vm-web-01 --image Ubuntu2404 --size Standard_B2s --vnet-name vnet-web --subnet snet-web --admin-username azureuser --generate-ssh-keys</code> (consider --nsg "", see the next objective)'] },
+      { text: 'Effective security: SSH from the internet is blocked at every layer, but works from the admin IP.',
+        check: st => { const v = theVm(st); if (!v) return 'Create the VM first.'; if (effective(st, v, INET, 22).allow) return 'SSH from the internet still gets through.'; if (!effective(st, v, st.V.admin, 22).allow) { const r = effective(st, v, st.V.admin, 22); return `SSH from the admin IP is blocked by ${r.nsg} (${r.rule}).`; } return true; },
+        hints: ['There can be two NSGs in the path: one on the subnet and one on the NIC. Traffic must pass both.', 'By default az vm create attaches its own NSG to the NIC, with SSH open to *. Compare with az network nic list-effective-nsg.', 'Either create the VM with <code>--nsg ""</code>, or remove the NIC\'s NSG: <code>az network nic update -g rg-web-prod -n vm-web-01VMNic --remove networkSecurityGroup</code>'] },
+      { text: 'nginx installed on the VM and the website loads from your workstation over HTTP.',
+        check: st => { const v = theVm(st); if (!v) return 'Create the VM first.'; if (!v.nginx) return 'nginx isn\'t installed on the VM.'; const r = effective(st, v, INET, 80); if (!r.allow) return `HTTP from the internet is blocked by ${r.nsg} (${r.rule}).`; return st.flags.curlOk || 'Test it with curl against the VM\'s public IP.'; },
+        hints: ['You can run a script on the VM without SSH.', 'az vm run-command invoke with RunShellScript. Fresh images need apt-get update first. Then curl the public IP (az vm list -d -o table).', '<code>az vm run-command invoke -g rg-web-prod -n vm-web-01 --command-id RunShellScript --scripts "sudo apt-get update &amp;&amp; sudo apt-get install -y nginx"</code>, then <code>curl -I http://&lt;public-ip&gt;</code>'] },
+      { text: 'Prove the lockdown with Network Watcher: IP flow verify shows SSH from an internet address is denied.', optional: true,
+        check: st => st.flags.flowTested || 'Run az network watcher test-ip-flow for TCP 22 from a public IP that isn\'t the admin\'s.',
+        hints: ['IP flow verify tests a 5-tuple against the effective NSG rules and names the rule that decides.', 'Local = the VM\'s private IP:22, remote = any public IP:port.', `<code>az network watcher test-ip-flow -g rg-web-prod --vm vm-web-01 --direction Inbound --protocol TCP --local &lt;private-ip&gt;:22 --remote ${INET}:50000</code>`] }
+    ],
+    solution(st) {
+      const V = st.V; const s = [];
+      if (st.v === 1) s.push({ cmd: 'az group list -o table', note: 'Check what exists: the colleague\'s resource group is in the wrong region, and a region can\'t be changed.' }, { cmd: `az group delete -n ${RG} --yes`, note: 'It\'s empty, so delete and recreate it.' });
+      s.push({ cmd: `az group create -n ${RG} -l ${V.region} --tags cost-center=${V.cc} env=prod`, note: st.v === 2 ? 'The group exists with the right region but missing a tag. Running create again with the same location updates its tags.' : 'Resource group in the only region policy allows, with the required tags.' });
+      s.push({ cmd: `az network vnet create -g ${RG} -n ${VNET} --address-prefixes ${V.p}.0.0/16 --subnet-name ${SNET} --subnet-prefixes ${V.p}.1.0/24` });
+      if (st.v === 2) s.push({ cmd: `az network nsg rule list -g ${RG} --nsg-name ${NSG} -o table`, note: 'The pre-created NSG has a "temporary" allow-all rule at priority 100. It would override everything below it.' }, { cmd: `az network nsg rule delete -g ${RG} --nsg-name ${NSG} -n Allow-All-Inbound` });
+      else s.push({ cmd: `az network nsg create -g ${RG} -n ${NSG}` });
+      s.push({ cmd: `az network nsg rule create -g ${RG} --nsg-name ${NSG} -n Allow-Web --priority 100 --protocol Tcp --source-address-prefixes Internet --destination-port-ranges 80 443`, note: 'Web from anywhere. SSH only from the admin\'s /32. The default DenyAllInBound (65500) blocks the rest.' });
+      s.push({ cmd: `az network nsg rule create -g ${RG} --nsg-name ${NSG} -n Allow-SSH-Admin --priority 110 --protocol Tcp --source-address-prefixes ${V.admin}/32 --destination-port-ranges 22` });
+      s.push({ cmd: `az network vnet subnet update -g ${RG} --vnet-name ${VNET} -n ${SNET} --network-security-group ${NSG}`, note: 'Associate the NSG with the subnet so every VM in it is covered.' });
+      s.push({ cmd: `az vm create -g ${RG} -n ${VM} --image Ubuntu2404 --size Standard_B2s --vnet-name ${VNET} --subnet ${SNET} --admin-username azureuser --generate-ssh-keys --nsg ""`, note: '--nsg "" stops az from attaching its own NIC NSG (which opens SSH to *). Without --vnet-name/--subnet it would create a separate network.' });
+      s.push({ cmd: `az network nic list-effective-nsg -g ${RG} -n ${VM}VMNic`, note: 'Only nsg-web applies, at the subnet.' });
+      s.push({ cmd: `az vm run-command invoke -g ${RG} -n ${VM} --command-id RunShellScript --scripts "sudo apt-get update && sudo apt-get install -y nginx"`, note: 'Install nginx without opening an SSH session.' });
+      s.push({ cmd: `curl -I http://${V.pip}` }, { cmd: `ssh azureuser@${V.pip}`, note: 'SSH works from the admin IP with the key.' });
+      s.push({ cmd: `az network watcher test-ip-flow -g ${RG} --vm ${VM} --direction Inbound --protocol TCP --local ${V.p}.1.4:22 --remote ${INET}:50000`, note: 'Bonus: from any other internet address, SSH is denied by the default DenyAllInBound rule.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Policy sets the guardrails', text: 'Allowed locations and required tags are enforced at creation time (RequestDisallowedByPolicy). A resource group\'s region is metadata you can\'t change later.' },
+      { title: 'NSG rules: priority, then default rules', text: 'Lowest number wins and evaluation stops at the first match. Below your rules sit AllowVnetInBound (65000), AllowAzureLoadBalancerInBound (65001) and DenyAllInBound (65500). A "temporary" allow-all at priority 100 beats everything.' },
+      { title: 'Two NSGs, both must allow', text: 'Inbound traffic passes the subnet NSG, then the NIC NSG. az vm create adds a NIC NSG with SSH open to * by default. That quietly undoes a careful subnet NSG, or blocks HTTP that the subnet allows.' },
+      { title: 'Defaults are decisions', text: 'Without flags, az vm create picks a new VNet, Standard_DS1_v2, a public IP and an NSG. Explicit flags make the deployment repeatable and reviewable.' },
+      { title: 'SSH keys, no passwords', text: 'Key-only auth sets disablePasswordAuthentication, so password spraying against port 22 is pointless, and SSH is reachable only from the admin IP anyway.' },
+      { title: 'Verify, don\'t assume', text: 'list-effective-nsg and IP flow verify show which rule actually decides, the same tools you\'d use when a user says "the site is down".' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

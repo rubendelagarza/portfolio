@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Local LLM + Telegram renewal bot — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 16</div>
+    <h1>Lab: Local LLM + Telegram renewal bot</h1>
+    <p>Run Qwen3.5 4B on an office Linux server with Ollama, then deploy a Telegram bot that reminds an insurance agent which policies are due for renewal, written by the local model. No customer data leaves the building.</p>
+    <div class="lab-meta"><span class="pill">Intermediate–Advanced</span><span class="pill">~20 min</span><span class="pill">Ollama · Qwen3.5 · Python · Telegram · systemd</span><span class="pill">3 randomized starting points</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> self-hosting a small open-weight model (Ollama, Qwen3.5 4B, CPU-only sizing), keeping its API private, Python deployment on Ubuntu 24.04 (venv, PEP 668), secrets and a dedicated service user, a Telegram bot created with BotFather, and debugging the glue code between a database, a local LLM and a chat app.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Telegram</strong> <span class="muted">· Andrea Leal's phone · simulation</span></span><button type="button" class="ghost sm" id="tg-ff" style="background:transparent;color:#e5e7eb;border-color:#4b5563">⏩ Fast-forward to the next daily reminder</button></div>
+          <div class="tg">
+            <div class="tg-list" id="tg-list"></div>
+            <div class="tg-chat">
+              <div class="tg-title" id="tg-title"></div>
+              <div class="tg-msgs" id="tg-msgs" aria-live="polite"></div>
+              <div class="tg-input row" style="gap:6px"><input type="text" id="tg-input" placeholder="Message" aria-label="Message" /><button type="button" class="sm" id="tg-send">Send</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <p style="font-size:14px">Andrea Leal, an independent insurance agent, wants a Telegram assistant that tells her every morning which policies are due for renewal, and answers <code>/polizas</code> on demand. Policy data must stay in the office, so the language model runs locally on <code>srv-ia01</code>. You're in an SSH session as <code>ruben</code>.</p>
+          <dl class="facts"><dt>Server</dt><dd>srv-ia01 · Ubuntu 24.04 · 4 vCPU · 8 GB RAM · no GPU</dd><dt>Model</dt><dd>qwen3.5:4b (Ollama, ~3.4 GB)</dd><dt>Bot code</dt><dd>/opt/polizabot (read README.md)</dd><dt>Rule</dt><dd>Remind 30 days ahead, every day at 09:00 Mexico City time</dd></dl>
+          <p class="muted" style="font-size:12px;margin:8px 0 0" id="vnote"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Tips</h3>
+          <p class="muted" style="font-size:13px;margin:0">Type <code>help</code> for the commands. Run each command on its own line. Today in the simulation is <b>2026-11-20</b>.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 16 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim; const esc = Lab.util.esc; const CmdError = Lab.CmdError;
+  const IP = '192.168.10.40', LAPTOP = '192.168.10.23';
+  const MODEL = 'qwen3.5:4b', VENV = '/opt/polizabot/venv', ENVF = '/etc/polizabot/polizabot.env', BOT = '/opt/polizabot/bot.py', DB = '/opt/polizabot/polizas.db';
+  const VARIANTS = [
+    { chat: 5128834411, token: '8123456789:AAHq3vK9x2LmN0pQr7sT1uVwXyZ4bC6dE8f', note: 'Fresh server: nothing installed yet.' },
+    { chat: 6630192257, token: '7954203318:AAF2jR8kLp0QsW5tY7uI9oP3aS6dF1gH4jK', note: 'A colleague installed Ollama last month to try Llama 3.1. The disk is nearly full.' },
+    { chat: 7041558820, token: '8460917725:AAGm4nB7vC1xZ9lK3jH5gF8dS2aQ6wE0rT', note: 'A colleague installed Ollama and "opened it up so the office can use it too".' }
+  ];
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+  const POLICIES = [
+    ['POL-24-0912', 'Laura Méndez', 'Auto', '2026-11-24', 8450],
+    ['POL-24-1033', 'Ferretería Garza SA de CV', 'Daños', '2026-12-02', 23900],
+    ['POL-25-0101', 'Carlos Ibarra', 'Gastos médicos', '2026-12-15', 31200],
+    ['POL-24-0877', 'Sofía Treviño', 'Vida', '2026-11-18', 12600],
+    ['POL-24-0790', 'Transportes Leal', 'Flotilla', '2026-11-05', 58300],
+    ['POL-25-0230', 'Andrea Cantú', 'Hogar', '2027-01-30', 6900],
+    ['POL-25-0315', 'Miguel Salinas', 'Auto', '2027-03-12', 9100]
+  ];
+  const DUE = ['POL-24-0912', 'POL-24-1033', 'POL-25-0101'];
+  const SQL_OK = "\"SELECT numero, cliente, tipo, vence, prima FROM polizas \"\n        \"WHERE vence BETWEEN date('now') AND date('now', '+30 days') ORDER BY vence\"";
+  const SQL_BAD = "\"SELECT numero, cliente, tipo, vence, prima FROM polizas \"\n        \"WHERE vence < date('now') ORDER BY vence\"";
+  const botPy = (v, fixed) => `#!/usr/bin/env python3
+"""PolizaBot: reminds an insurance agent of policies due for renewal.
+Telegram (python-telegram-bot) + a local model served by Ollama."""
+import datetime
+import os
+import sqlite3
+import sys
+${fixed ? 'from zoneinfo import ZoneInfo\n' : ''}
+import requests
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+load_dotenv("/etc/polizabot/polizabot.env")
+
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = int(os.environ["AGENT_CHAT_ID"])
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "${v === 2 && !fixed ? 'http://127.0.0.1:11434/api/generate' : 'http://127.0.0.1:11434/api/chat'}")
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5")
+DB_PATH = os.environ.get("DB_PATH", "/opt/polizabot/polizas.db")
+
+
+def polizas_por_vencer():
+    """Policies that expire in the next 30 days."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        ${v === 1 && !fixed ? SQL_BAD : SQL_OK}
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def redactar(rows):
+    """Ask the local model to write the reminder in Spanish."""
+    if not rows:
+        return "No hay pólizas por renovar en los próximos 30 días."
+    lista = "\\n".join(f"- {n} | {c} | {t} | vence {v} | prima \${p:,.2f}" for n, c, t, v, p in rows)
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "Eres el asistente de una agente de seguros en México. Escribe en español, breve y profesional."},
+            {"role": "user", "content": f"Redacta un recordatorio de estas pólizas por renovar, ordenadas por fecha:\\n{lista}"},
+        ],${v === 0 && !fixed ? '' : '\n        "think": False,'}
+        "stream": False,
+    }
+    r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Hola, soy PolizaBot. Escribe /polizas para ver las pólizas por renovar. Tu chat ID es {update.effective_chat.id}.")
+
+
+async def cmd_polizas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(redactar(polizas_por_vencer()))
+
+
+async def recordatorio_diario(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=CHAT_ID, text=redactar(polizas_por_vencer()))
+
+
+def main():
+    if "--test" in sys.argv:
+        print(redactar(polizas_por_vencer()))
+        return
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("polizas", cmd_polizas))
+    app.job_queue.run_daily(recordatorio_diario, time=datetime.time(hour=9, minute=0${fixed ? ', tzinfo=ZoneInfo("America/Mexico_City")' : ''}))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+`;
+  const README = `# PolizaBot
+
+Telegram bot that reminds the agent of policies due for renewal, written by a
+local model (Ollama on this server, model ${MODEL}).
+
+## Install
+1. Ollama with the model ${MODEL}. Its API must only be reachable from this server.
+2. A Python virtual environment in ${VENV} with requirements.txt
+   (Ubuntu 24.04 blocks system-wide pip installs).
+3. A system user "polizabot" (no login shell) to run the bot.
+
+## Configuration: ${ENVF}
+  TELEGRAM_TOKEN=   token from @BotFather
+  AGENT_CHAT_ID=    Andrea's chat ID (send /start to the bot, then call getUpdates)
+  OLLAMA_MODEL=     ${MODEL}
+The file holds the bot token: keep it away from other users.
+
+## Test without Telegram
+  sudo -u polizabot ${VENV}/bin/python ${BOT} --test
+
+## Run
+Create /etc/systemd/system/polizabot.service and enable it.
+`;
+  const OLLAMA_UNIT = exposed => `[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+${exposed ? 'Environment="OLLAMA_HOST=0.0.0.0:11434"\n' : ''}
+[Install]
+WantedBy=default.target
+`;
+  const BOT_UNIT = `[Unit]
+Description=PolizaBot (Telegram + local Qwen3.5)
+After=network-online.target ollama.service
+Wants=ollama.service
+
+[Service]
+User=polizabot
+Group=polizabot
+EnvironmentFile=${ENVF}
+WorkingDirectory=/opt/polizabot
+ExecStart=${VENV}/bin/python ${BOT}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+  function installOllama(st, exposed) {
+    st.fs['/usr/local/bin/ollama'] = L.f('#!ollama\n', 'root', 'root', 0o755);
+    st.fs['/usr/share/ollama'] = L.d('ollama', 'ollama', 0o755);
+    st.fs['/etc/systemd/system/ollama.service'] = L.f(OLLAMA_UNIT(exposed));
+    st.users.ollama = { uid: 997, groups: ['ollama', 'render', 'video'], shell: '/bin/false', system: true };
+    if (!st.users.ruben.groups.includes('ollama')) st.users.ruben.groups.push('ollama');
+    st.units.ollama = OLLAMA_UNIT(exposed);
+    st.services.ollama = { installed: true, custom: true, active: true, enabled: true, unit: L.parseUnit(OLLAMA_UNIT(exposed)), env: exposed ? { OLLAMA_HOST: '0.0.0.0:11434' } : {}, listen: { addr: exposed ? '0.0.0.0' : '127.0.0.1', port: 11434 } };
+  }
+  function createState(v) {
+    const fs = L.baseFs('ruben');
+    fs['/opt/polizabot'] = L.d();
+    fs[BOT] = L.f(botPy(v, false), 'root', 'root', 0o644);
+    fs['/opt/polizabot/README.md'] = L.f(README);
+    fs['/opt/polizabot/requirements.txt'] = L.f('python-telegram-bot[job-queue]>=21.0\nrequests>=2.31\npython-dotenv>=1.0\n');
+    const dbNode = L.f('', 'root', 'root', 0o644); dbNode.db = L.newDb();
+    L.sql.exec(dbNode.db, 'CREATE TABLE polizas (numero TEXT PRIMARY KEY, cliente TEXT NOT NULL, tipo TEXT, vence TEXT NOT NULL, prima REAL)');
+    POLICIES.forEach(p => L.sql.exec(dbNode.db, `INSERT INTO polizas VALUES ('${p[0]}', '${p[1]}', '${p[2]}', '${p[3]}', ${p[4]})`));
+    fs[DB] = dbNode;
+    const st = { v, V: VARIANTS[v], fs, cwd: '/home/ruben', users: L.baseUsers('ruben'), units: {}, packages: ['ufw', 'curl', 'python3', 'openssh-server', 'sqlite3'],
+      services: { ssh: { installed: true, active: true, enabled: true }, ufw: { installed: true, active: true, enabled: true }, cron: { installed: true, active: true, enabled: true } },
+      ufw: { enabled: true, defaultIn: 'deny', rules: [{ action: 'ALLOW', from: 'Anywhere', app: 'OpenSSH' }].concat(v === 2 ? [{ action: 'ALLOW', from: 'Anywhere', port: 11434, proto: 'tcp' }] : []) },
+      models: v === 1 ? [{ name: 'llama3.1:8b', id: '46e0c10c039e', size: 4.9 }] : [], diskFree: v === 1 ? 2.1 : 18.4,
+      venv: { exists: false, deps: false }, pipSystem: false,
+      tg: { chats: { bf: [] }, active: 'bf', bfState: null, bot: null, updates: [], seq: 849331207 }, flags: {} };
+    if (v !== 0) installOllama(st, v === 2);
+    return st;
+  }
+
+  // ---------- model + bot behavior
+  const ollamaUp = st => st.services.ollama && st.services.ollama.active;
+  const hasModel = (st, m) => st.models.some(x => x.name === m || x.name === m + ':latest');
+  const fmtDate = d => d.split('-').reverse().join('/');
+  const daysTo = d => Math.round((Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10)) - Date.UTC(2026, 10, 20)) / 86400000);
+  const money = n => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  function parseBot(code) {
+    const g = (re) => { const m = code.match(re); return m ? m[1] : null; };
+    const exec = code.match(/execute\(\s*((?:(?:"[^"]*"|'[^']*')\s*)+)\)/);
+    return {
+      model: g(/MODEL\s*=\s*os\.environ\.get\(\s*"OLLAMA_MODEL"\s*,\s*"([^"]+)"\s*\)/),
+      url: g(/OLLAMA_URL\s*=\s*os\.environ\.get\(\s*"OLLAMA_URL"\s*,\s*"([^"]+)"\s*\)/),
+      sql: exec ? exec[1].match(/"([^"]*)"|'([^']*)'/g).map(x => x.slice(1, -1)).join('') : null,
+      think: /"think"\s*:\s*False/.test(code) ? false : /"think"\s*:\s*True/.test(code) ? true : null,
+      tz: /tzinfo\s*=\s*ZoneInfo\(\s*["']America\/Mexico_City["']\s*\)/.test(code),
+      tzImport: /from\s+zoneinfo\s+import\s+ZoneInfo/.test(code),
+      usesZone: /ZoneInfo\(/.test(code)
+    };
+  }
+  const lineNo = (code, re) => code.split('\n').findIndex(l => re.test(l)) + 1;
+  // Runs polizas_por_vencer() + redactar() with a given code snapshot and environment.
+  function compose(st, code, env) {
+    const b = parseBot(code);
+    if (!b.model || !b.url || !b.sql) return { err: ['  File "' + BOT + '", line 1', 'SyntaxError: this simulation runs bot.py when its structure is kept (MODEL = os.environ.get(...), OLLAMA_URL = ..., con.execute("...")). Restore the line you changed.'] };
+    const tb = (fn, re, code2, last) => ['Traceback (most recent call last):', `  File "${BOT}", line ${lineNo(code, /print\(redactar/)}, in ${fn}`, '    print(redactar(polizas_por_vencer()))', `  File "${BOT}", line ${lineNo(code, re)}, in ${code2}`].concat(last);
+    // database
+    let rows;
+    try { const n = L.get(st, env.DB_PATH || DB); if (!n || !n.db) throw L.sql.err('unable to open database file'); rows = L.sql.exec(n.db, b.sql).rows; }
+    catch (e) { return { err: tb('main', /\.execute\(/, 'polizas_por_vencer', ['    rows = con.execute(', `sqlite3.OperationalError: ${e.message}`]) }; }
+    if (!rows.length) return { ok: true, rows, text: 'No hay pólizas por renovar en los próximos 30 días.' };
+    // ollama
+    const url = env.OLLAMA_URL || b.url; const model = env.OLLAMA_MODEL || b.model;
+    const um = url.match(/^http:\/\/(127\.0\.0\.1|localhost):11434\/api\/(chat|generate)$/);
+    if (!um) return { err: tb('main', /requests\.post/, 'redactar', ['    r = requests.post(OLLAMA_URL, json=payload, timeout=180)', `requests.exceptions.InvalidURL: unsupported OLLAMA_URL ${url} (this simulation expects http://127.0.0.1:11434/api/...)`]) };
+    if (!ollamaUp(st)) return { err: tb('main', /requests\.post/, 'redactar', ['    r = requests.post(OLLAMA_URL, json=payload, timeout=180)', "requests.exceptions.ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=11434): Max retries exceeded with url: /api/" + um[2] + " (Caused by NewConnectionError('Failed to establish a new connection: [Errno 111] Connection refused'))"]) };
+    if (!hasModel(st, model)) return { err: tb('main', /raise_for_status/, 'redactar', ['    r.raise_for_status()', `requests.exceptions.HTTPError: 404 Client Error: Not Found for url: ${url}`]), detail: `model "${model}" not found` };
+    if (um[2] === 'generate') return { err: tb('main', /\["message"\]/, 'redactar', ['    return r.json()["message"]["content"]', "KeyError: 'message'"]) };
+    const body = rows.map((r, i) => `${i + 1}. ${r[0]} · ${r[1]} · ${r[2]} · vence el ${fmtDate(r[3])} (${daysTo(r[3]) >= 0 ? 'en ' + daysTo(r[3]) + ' días' : 'hace ' + -daysTo(r[3]) + ' días'}) · prima ${money(r[4])}`).join('\n');
+    const first = rows[0];
+    let text = `Buen día, Andrea. Estas son las pólizas por renovar:\n\n${body}\n\nTe sugiero contactar primero a ${first[1]}: su póliza ${first[0]} ${daysTo(first[3]) >= 0 ? 'vence en ' + daysTo(first[3]) + ' días' : 'venció hace ' + -daysTo(first[3]) + ' días'}.`;
+    if (b.think !== false) text = `<think>\nOkay, the user wants a renewal reminder in Spanish. Let me list the policies ordered by date, mention the premium, and keep it short and professional. The first one expires soonest, so I should suggest contacting that client first...\n</think>\n\n` + text;
+    const correct = b.think === false && rows.length === DUE.length && rows.every((r, i) => r[0] === DUE[i]);
+    return { ok: true, rows, text, correct };
+  }
+
+  // ---------- Telegram
+  const tgSend = (st, chat, from, text, time) => { (st.tg.chats[chat] = st.tg.chats[chat] || []).push({ from, text, time: time || '21:1' + (st.tg.chats[chat].length % 10) }); };
+  const botLive = st => { const s = st.services.polizabot; return s && s.active && s.ok; };
+  function botReply(st, text) {
+    const s = st.services.polizabot; const env = s.env;
+    if (/^\/start\b/.test(text)) { tgSend(st, 'bot', 'them', `Hola, soy PolizaBot. Escribe /polizas para ver las pólizas por renovar. Tu chat ID es ${st.V.chat}.`); return; }
+    if (/^\/polizas\b/.test(text)) {
+      const r = compose(st, s.code, env);
+      if (r.err) { s.log = (s.log || []).slice(-20).concat([`polizabot[4121]: ERROR:telegram.ext.Application:No error handlers are registered, logging exception.`]).concat(r.err.map(l => 'polizabot[4121]: ' + l)); st.flags.tgOk = false; return; }
+      tgSend(st, 'bot', 'them', r.text); st.flags.tgOk = !!r.correct; if (r.correct) st.flags.testOk = true; return;
+    }
+  }
+  function tgUser(st, text) {
+    const chat = st.tg.active;
+    tgSend(st, chat, 'me', text);
+    if (chat === 'bf') return botFather(st, text.trim());
+    if (botLive(st)) botReply(st, text);
+    else st.tg.updates.push({ update_id: ++st.tg.seq, text });
+  }
+  const TAKEN = ['polizabot', 'polizas_bot', 'seguros_bot', 'agentebot', 'reminder_bot'];
+  function botFather(st, t) {
+    const say = x => tgSend(st, 'bf', 'them', x);
+    if (t === '/start' || t === '/help') { say('I can help you create and manage Telegram bots.\n\n/newbot - create a new bot\n/mybots - edit your bots\n/token - generate authorization token'); st.tg.bfState = null; return; }
+    if (t === '/newbot') { say('Alright, a new bot. How are we going to call it? Please choose a name for your bot.'); st.tg.bfState = 'name'; return; }
+    if (t === '/mybots' || t === '/token') { say(st.tg.bot ? `${st.tg.bot.name} (@${st.tg.bot.username})\n\nUse this token to access the HTTP API:\n${st.tg.bot.token}` : 'You have currently no bots.'); return; }
+    if (st.tg.bfState === 'name') { st.tg.pendingName = t; st.tg.bfState = 'username'; say('Good. Now let\'s choose a username for your bot. It must end in `bot`. Like this, for example: TetrisBot or tetris_bot.'); return; }
+    if (st.tg.bfState === 'username') {
+      const u = t.replace(/^@/, '');
+      if (!/bot$/i.test(u)) return say('Sorry, the username must end in \'bot\'. E.g. \'Tetris_bot\' or \'Tetrisbot\'');
+      if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(u)) return say('Sorry, this username is invalid. Use 5–32 characters: letters, digits and underscores.');
+      if (TAKEN.includes(u.toLowerCase())) return say('Sorry, this username is already taken. Please try something different.');
+      st.tg.bot = { name: st.tg.pendingName, username: u, token: st.V.token }; st.tg.bfState = null; st.tg.chats.bot = [];
+      say(`Done! Congratulations on your new bot. You will find it at t.me/${u}. You can now add a description, about section and profile picture for your bot, see /help for a list of commands.\n\nUse this token to access the HTTP API:\n${st.V.token}\nKeep your token secure and store it safely, it can be used by anyone to control your bot.`);
+      return;
+    }
+    say('Unrecognized command. Say what?');
+  }
+
+  // ---------- extra commands
+  const cfg = {
+    user: 'ruben', home: '/home/ruben', host: 'srv-ia01', ip: IP, adminIp: LAPTOP,
+    packages: { 'python3-venv': () => null, 'python3.12-venv': st => { st.packages.push('python3-venv'); return null; }, 'python3-pip': () => null },
+    start: (st, name, unit, env) => {
+      if (name === 'ollama') { const h = (env.OLLAMA_HOST || '127.0.0.1:11434').split(':'); return { ok: true, listen: { addr: h[0] === 'localhost' ? '127.0.0.1' : h[0], port: +(h[1] || 11434) } }; }
+      if (name === 'polizabot') {
+        const sv = st.services.polizabot; const fail = lines => { sv.ok = false; return { ok: false, log: lines.map(l => 'polizabot[4121]: ' + l).concat(['polizabot.service: Main process exited, code=exited, status=1/FAILURE', 'polizabot.service: Failed with result \'exit-code\'.']) }; };
+        const exe = (unit.ExecStart || '').split(/\s+/)[0];
+        if (exe !== VENV + '/bin/python' || !st.venv.deps) return fail(['Traceback (most recent call last):', `  File "${BOT}", line 13, in <module>`, '    import requests', "ModuleNotFoundError: No module named 'requests'"]);
+        const code = (L.get(st, BOT) || {}).c || ''; const b = parseBot(code);
+        if (b.usesZone && !b.tzImport) return fail([`  File "${BOT}", line ${lineNo(code, /run_daily/)}, in main`, "NameError: name 'ZoneInfo' is not defined"]);
+        if (!env.TELEGRAM_TOKEN) return fail([`  File "${BOT}", line ${lineNo(code, /^TOKEN/)}, in <module>`, "KeyError: 'TELEGRAM_TOKEN'"]);
+        if (!env.AGENT_CHAT_ID) return fail([`  File "${BOT}", line ${lineNo(code, /^CHAT_ID/)}, in <module>`, "KeyError: 'AGENT_CHAT_ID'"]);
+        if (!/^\d+$/.test(env.AGENT_CHAT_ID)) return fail([`ValueError: invalid literal for int() with base 10: '${env.AGENT_CHAT_ID}'`]);
+        if (!st.tg.bot || env.TELEGRAM_TOKEN !== st.tg.bot.token) return fail([`telegram.error.InvalidToken: The token \`${env.TELEGRAM_TOKEN}\` was rejected by the server.`]);
+        sv.ok = true; sv.code = code; sv.log = ['polizabot[4121]: INFO:telegram.ext.Application:Application started'];
+        return { ok: true };
+      }
+      return { ok: true };
+    },
+    listeners: st => (st.services.ollama && st.services.ollama.active ? [{ addr: st.services.ollama.listen.addr, port: st.services.ollama.listen.port, proc: 'ollama' }] : []),
+    curl: (st, toks) => curl(st, toks),
+    extra: (lab, who) => ({
+      ollama: { raw: true, desc: 'Run local models: ollama pull|list|run|ps|rm|show|--version', run: a => ollamaCmd(lab.state, a._pos) },
+      free: { raw: true, desc: 'Memory usage (free -h)', run: () => '               total        used        free      shared  buff/cache   available\nMem:           7.7Gi       1.1Gi       5.2Gi        12Mi       1.6Gi       6.4Gi\nSwap:          2.0Gi          0B       2.0Gi' },
+      df: { raw: true, desc: 'Disk usage (df -h)', run: () => { const st = lab.state; const used = 40 - st.diskFree; return `Filesystem      Size  Used Avail Use% Mounted on\ntmpfs           785M  1.2M  784M   1% /run\n/dev/sda2        40G  ${used.toFixed(1)}G  ${st.diskFree.toFixed(1)}G  ${Math.round(used / 40 * 100)}% /\ntmpfs           3.9G     0  3.9G   0% /dev/shm`; } },
+      nproc: { raw: true, desc: 'Number of CPUs', run: () => '4' },
+      'nvidia-smi': { raw: true, desc: 'NVIDIA GPU status', run: () => { throw CmdError("Command 'nvidia-smi' not found, but can be installed with:\nsudo apt install nvidia-utils-550\n(This server has no GPU: Ollama runs the model on the CPU.)"); } },
+      timedatectl: { raw: true, desc: 'Show time and time zone', run: a => { if (a._pos[0] === 'set-timezone') return { text: 'Time zone changed. (Note: the bot schedules with its own time zone setting, not the server\'s.)', cls: 'muted' }; return '               Local time: Fri 2026-11-20 21:14:05 UTC\n           Universal time: Fri 2026-11-20 21:14:05 UTC\n                Time zone: Etc/UTC (UTC, +0000)\nSystem clock synchronized: yes\n              NTP service: active'; } },
+      python3: { raw: true, aliases: ['python'], desc: 'Run Python (python3 -m venv DIR, python3 FILE)', run: a => python(lab, who, a._pos, 'system') },
+      [VENV + '/bin/python']: { raw: true, desc: 'The venv\'s Python', run: a => { if (!lab.state.venv.exists) throw CmdError(`bash: ${VENV}/bin/python: No such file or directory`); return python(lab, who, a._pos, 'venv'); } },
+      [VENV + '/bin/pip']: { raw: true, desc: 'The venv\'s pip', run: a => { if (!lab.state.venv.exists) throw CmdError(`bash: ${VENV}/bin/pip: No such file or directory`); return pip(lab, who, a._pos, true); } },
+      pip: { raw: true, aliases: ['pip3'], desc: 'System pip', run: a => pip(lab, who, a._pos, false) }
+    })
+  };
+  function ollamaCmd(st, t) {
+    if (!L.get(st, '/usr/local/bin/ollama')) throw CmdError("Command 'ollama' not found. Install it with the official script:\ncurl -fsSL https://ollama.com/install.sh | sh");
+    const sub = t[0];
+    if (sub === '--version' || sub === '-v') return ollamaUp(st) ? 'ollama version is 0.13.2' : 'Warning: could not connect to a running Ollama instance\nWarning: client version is 0.13.2';
+    if (!ollamaUp(st)) throw CmdError('Error: could not connect to ollama app, is it running?');
+    if (sub === 'list' || sub === 'ls') return 'NAME            ID              SIZE      MODIFIED\n' + st.models.map(m => `${m.name.padEnd(16)}${m.id}    ${m.size.toFixed(1)} GB    ${m.when || '5 weeks ago'}`).join('\n');
+    if (sub === 'ps') return 'NAME          ID              SIZE      PROCESSOR    CONTEXT    UNTIL\n' + (st.flags.loaded ? `${MODEL}    2a654d98e6fb    4.6 GB    100% CPU     4096       4 minutes from now` : '');
+    if (sub === 'rm') { const n = t[1]; const i = st.models.findIndex(m => m.name === n); if (i < 0) throw CmdError(`Error: model '${n}' not found`); st.diskFree += st.models[i].size; st.models.splice(i, 1); return `deleted '${n}'`; }
+    if (sub === 'pull') {
+      const n = t[1]; if (!n) throw CmdError('Error: accepts 1 arg(s), received 0');
+      if (n !== MODEL) throw CmdError(`Error: this simulation only downloads ${MODEL} (the model in the work order).`);
+      if (hasModel(st, n)) return `pulling manifest\nverifying sha256 digest\nwriting manifest\nsuccess (${n} was already up to date)`;
+      if (st.diskFree < 3.6) throw CmdError(`pulling manifest\npulling 81fb60c7daa8:  43% ▕███████           ▏ 1.4 GB/3.4 GB\nError: write /usr/share/ollama/.ollama/models/blobs/sha256-81fb60c7daa8-partial: no space left on device`);
+      st.models.push({ name: n, id: '2a654d98e6fb', size: 3.4, when: 'Less than a second ago' }); st.diskFree -= 3.4;
+      return 'pulling manifest\npulling 81fb60c7daa8: 100% ▕██████████████████▏ 3.4 GB\npulling 7339fa418c9a: 100% ▕██████████████████▏  11 KB\npulling 9371364b27a5: 100% ▕██████████████████▏   65 B\npulling f6417cb1e269: 100% ▕██████████████████▏   42 B\npulling 0cb05c6e4e02: 100% ▕██████████████████▏  475 B\nverifying sha256 digest\nwriting manifest\nsuccess';
+    }
+    if (sub === 'show') { if (!hasModel(st, t[1])) throw CmdError(`Error: model '${t[1]}' not found`); return '  Model\n    architecture        qwen35\n    parameters          4.2B\n    context length      262144\n    quantization        Q4_K_M\n\n  Capabilities\n    completion\n    vision\n    tools\n    thinking\n\n  License\n    Apache License Version 2.0'; }
+    if (sub === 'run') {
+      const n = t[1]; if (!n) throw CmdError('Error: accepts 1 arg(s), received 0');
+      if (!hasModel(st, n)) throw CmdError(`pulling manifest\nError: pull model manifest: file does not exist\n(${n} isn't downloaded: run "ollama pull ${n}" first.)`);
+      const prompt = t.slice(2).filter(x => !x.startsWith('--')).join(' ');
+      if (!prompt) return { text: `(Interactive chat isn't simulated: add a prompt in quotes, e.g. ollama run ${n} --think=false "¿Qué modelo eres?")`, cls: 'muted' };
+      st.flags.modelTested = true; st.flags.loaded = true;
+      const noThink = t.includes('--think=false') || t.includes('--hidethinking');
+      return (noThink ? '' : 'Thinking...\nThe user is greeting me in Spanish and asking who I am. I should answer briefly in Spanish.\n...done thinking.\n\n') + 'Hola. Soy Qwen3.5, un modelo de lenguaje de Alibaba Cloud, ejecutándome localmente en este servidor con Ollama. ¿En qué te ayudo?';
+    }
+    throw CmdError(`Error: unknown command "${sub}" for "ollama"\nAvailable in this simulation: pull, list, run, ps, rm, show, --version`);
+  }
+  function curl(st, toks) {
+    const url = toks.find(x => /^https?:\/\//.test(x)) || '';
+    const di = toks.findIndex(x => x === '-d' || x === '--data'); const data = di >= 0 ? toks[di + 1] : null;
+    let m;
+    if ((m = url.match(/^https:\/\/api\.telegram\.org\/bot([^/]+)\/(\w+)(\?.*)?$/))) {
+      const tok = m[1], method = m[2];
+      if (!st.tg.bot || tok !== st.tg.bot.token) return '{"ok":false,"error_code":401,"description":"Unauthorized"}';
+      if (method === 'getMe') return `{"ok":true,"result":{"id":${tok.split(':')[0]},"is_bot":true,"first_name":"${st.tg.bot.name}","username":"${st.tg.bot.username}","can_join_groups":true,"supports_inline_queries":false}}`;
+      if (method === 'getUpdates') {
+        if (botLive(st)) return '{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"}';
+        if (!st.tg.updates.length) return '{"ok":true,"result":[]}';
+        st.flags.chatIdSeen = true;
+        return '{"ok":true,"result":[' + st.tg.updates.map(u => `{"update_id":${u.update_id},"message":{"message_id":${u.update_id - 849331207},"from":{"id":${st.V.chat},"is_bot":false,"first_name":"Andrea","last_name":"Leal","language_code":"es"},"chat":{"id":${st.V.chat},"first_name":"Andrea","last_name":"Leal","type":"private"},"date":1795208${String(u.update_id).slice(-3)},"text":${JSON.stringify(u.text)}}}`).join(',') + ']}';
+      }
+      if (method === 'sendMessage') {
+        const q = new URLSearchParams((m[3] || '').slice(1) || (data || ''));
+        if (q.get('chat_id') !== String(st.V.chat)) return '{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}';
+        tgSend(st, 'bot', 'them', q.get('text') || ''); return `{"ok":true,"result":{"message_id":${st.tg.chats.bot.length},"chat":{"id":${st.V.chat},"type":"private"},"text":${JSON.stringify(q.get('text') || '')}}}`;
+      }
+      return '{"ok":false,"error_code":404,"description":"Not Found"}';
+    }
+    if (/ollama\.com\/install\.sh/.test(url)) return { text: '#!/bin/sh\n# This script installs Ollama on Linux…\n(Pipe it to sh to run it: curl -fsSL https://ollama.com/install.sh | sh)', cls: 'muted' };
+    if ((m = url.match(/^http:\/\/(127\.0\.0\.1|localhost|192\.168\.10\.40):11434(\/[\w/]*)?$/))) {
+      if (!st.services.ollama || !st.services.ollama.active || (m[1] === IP && st.services.ollama.listen.addr === '127.0.0.1')) return { text: `curl: (7) Failed to connect to ${m[1]} port 11434 after 0 ms: Couldn't connect to server`, cls: 'err' };
+      const path = m[2] || '/';
+      if (path === '/') return 'Ollama is running';
+      if (path === '/api/tags') return JSON.stringify({ models: st.models.map(x => ({ name: x.name, model: x.name, size: Math.round(x.size * 1e9), details: { format: 'gguf', parameter_size: x.name === MODEL ? '4.2B' : '8.0B', quantization_level: 'Q4_K_M' } })) });
+      if (path === '/api/chat' || path === '/api/generate') {
+        let j; try { j = JSON.parse(data || ''); } catch (e) { return '{"error":"invalid JSON body (send it with -d \'{...}\')"}'; }
+        if (!hasModel(st, j.model || '')) return `{"error":"model '${j.model}' not found"}`;
+        st.flags.modelTested = true; st.flags.loaded = true;
+        const think = j.think !== false; const ans = '¡Hola! Soy Qwen3.5, ejecutándome localmente con Ollama.';
+        const content = (think ? '<think>\nThe user greets me. Answer briefly in Spanish.\n</think>\n\n' : '') + ans;
+        return path === '/api/chat' ? JSON.stringify({ model: j.model, created_at: '2026-11-20T21:14:09.51Z', message: { role: 'assistant', content }, done: true, done_reason: 'stop', total_duration: 6512000000, eval_count: 42 }) : JSON.stringify({ model: j.model, created_at: '2026-11-20T21:14:09.51Z', response: content, done: true });
+      }
+      return '404 page not found';
+    }
+    return { text: `curl: (6) Could not resolve host: ${url.replace(/^https?:\/\//, '').split('/')[0] || '(none)'}`, cls: 'err' };
+  }
+  function python(lab, who, t, which) {
+    const st = lab.state; const user = who();
+    if (t[0] === '-m' && t[1] === 'venv') {
+      const dir = L.norm(t[2] || '', st.cwd, '/home/ruben');
+      if (dir !== VENV) throw CmdError(`(Use ${VENV}, the path the README and the service expect.)`);
+      if (!st.packages.includes('python3-venv')) throw CmdError('The virtual environment was not created successfully because ensurepip is not\navailable.  On Debian/Ubuntu systems, you need to install the python3-venv\npackage using the following command.\n\n    apt install python3.12-venv\n\nYou may need to use sudo with that command.  After installing the python3-venv\npackage, recreate your virtual environment.');
+      const parent = L.get(st, '/opt/polizabot'); if (!L.can(st, user, parent, 'w')) throw CmdError(`Error: [Errno 13] Permission denied: '${VENV}'`);
+      [VENV, VENV + '/bin', VENV + '/lib'].forEach(p => { st.fs[p] = L.d(user, user === 'root' ? 'root' : user); });
+      st.fs[VENV + '/bin/python'] = L.f('#!python\n', user, user, 0o755); st.fs[VENV + '/bin/pip'] = L.f('#!pip\n', user, user, 0o755);
+      st.venv.exists = true; st.venv.owner = user; lab.touch(); return null;
+    }
+    if (t[0] === '-m' && t[1] === 'pip') return pip(lab, who, t.slice(2), which === 'venv');
+    if (t[0] === '--version' || t[0] === '-V') return 'Python 3.12.3';
+    const f = t.find(x => !x.startsWith('-')); if (!f) return { text: 'Python 3.12.3 (main, Nov  6 2024, 18:32:19) [GCC 13.2.0] on linux\n(Interactive mode isn\'t simulated: run a script.)', cls: 'muted' };
+    const p = L.norm(f, st.cwd, '/home/ruben'); const node = L.get(st, p);
+    if (!node) return { text: `python3: can't open file '${p}': [Errno 2] No such file or directory`, cls: 'err' };
+    if (!L.can(st, user, node, 'r')) return { text: `python3: can't open file '${p}': [Errno 13] Permission denied`, cls: 'err' };
+    if (p !== BOT) return { text: '(Only bot.py is simulated.)', cls: 'muted' };
+    const code = node.c;
+    if (which !== 'venv' || !st.venv.deps) return { text: `Traceback (most recent call last):\n  File "${BOT}", line ${lineNo(code, /^import requests/)}, in <module>\n    import requests\nModuleNotFoundError: No module named 'requests'`, cls: 'err' };
+    if (!t.includes('--test')) return { text: 'Starting the bot in the foreground (Ctrl+C to stop)… In this simulation, run it as the systemd service instead, or use --test.', cls: 'muted' };
+    // load_dotenv
+    const envNode = L.get(st, ENVF); let env = {};
+    if (envNode) { if (!L.canEnter(st, user, ENVF) || !L.can(st, user, envNode, 'r')) return { text: `Traceback (most recent call last):\n  File "${BOT}", line ${lineNo(code, /^load_dotenv/)}, in <module>\n    load_dotenv("/etc/polizabot/polizabot.env")\nPermissionError: [Errno 13] Permission denied: '${ENVF}'`, cls: 'err' }; env = L.readEnvFile(envNode.c); }
+    if (!env.TELEGRAM_TOKEN) return { text: `Traceback (most recent call last):\n  File "${BOT}", line ${lineNo(code, /^TOKEN/)}, in <module>\n    TOKEN = os.environ["TELEGRAM_TOKEN"]\nKeyError: 'TELEGRAM_TOKEN'`, cls: 'err' };
+    if (!env.AGENT_CHAT_ID) return { text: `Traceback (most recent call last):\n  File "${BOT}", line ${lineNo(code, /^CHAT_ID/)}, in <module>\n    CHAT_ID = int(os.environ["AGENT_CHAT_ID"])\nKeyError: 'AGENT_CHAT_ID'`, cls: 'err' };
+    const r = compose(st, code, env);
+    if (r.err) return { text: r.err.join('\n'), cls: 'err' };
+    if (r.correct) st.flags.testOk = true; lab.touch();
+    return r.text;
+  }
+  function pip(lab, who, t, venv) {
+    const st = lab.state;
+    if (!venv) {
+      if (!st.packages.includes('python3-pip')) throw CmdError("Command 'pip' not found, but can be installed with:\nsudo apt install python3-pip");
+      throw CmdError('error: externally-managed-environment\n\n× This environment is externally managed\n╰─> To install Python packages system-wide, try apt install\n    python3-xyz, where xyz is the package you are trying to\n    install.\n\n    If you wish to install a non-Debian-packaged Python package,\n    create a virtual environment using python3 -m venv path/to/venv.\n    Then use path/to/venv/bin/python and path/to/venv/bin/pip.\n\nnote: If you believe this is a mistake, please contact your Python installation or OS distribution provider.\nhint: See PEP 668 for the detailed specification.');
+    }
+    if (t[0] !== 'install') return { text: '(pip install -r requirements.txt is what this lab needs.)', cls: 'muted' };
+    if (who() !== st.venv.owner && who() !== 'root') throw CmdError(`ERROR: Could not install packages due to an OSError: [Errno 13] Permission denied: '${VENV}/lib/python3.12/site-packages/requests'\nCheck the permissions.`);
+    const ri = t.indexOf('-r'); const req = ri >= 0 ? L.norm(t[ri + 1] || '', st.cwd, '/home/ruben') : null;
+    const named = t.slice(1).filter(x => !x.startsWith('-') && x !== t[ri + 1]).join(' ');
+    if (req && req !== '/opt/polizabot/requirements.txt') throw CmdError(`ERROR: Could not open requirements file: [Errno 2] No such file or directory: '${t[ri + 1]}'`);
+    if (!req && !(/telegram/.test(named) && /requests/.test(named) && /dotenv/.test(named))) return { text: 'Installed, but the bot needs everything in requirements.txt: pip install -r /opt/polizabot/requirements.txt', cls: 'warn' };
+    st.venv.deps = true; lab.touch();
+    return 'Collecting python-telegram-bot>=21.0 (from python-telegram-bot[job-queue]>=21.0->-r requirements.txt (line 1))\nCollecting requests>=2.31\nCollecting python-dotenv>=1.0\nCollecting APScheduler<3.12.0,>=3.10.4 (from python-telegram-bot[job-queue])\nCollecting httpx<0.29,>=0.27\n…\nSuccessfully installed APScheduler-3.11.0 anyio-4.11.0 certifi-2025.10.5 charset-normalizer-3.4.4 h11-0.16.0 httpcore-1.0.9 httpx-0.28.1 idna-3.11 python-dotenv-1.2.1 python-telegram-bot-22.5 requests-2.32.5 sniffio-1.3.1 tzlocal-5.3.1 urllib3-2.5.0';
+  }
+
+  // ---------- GUI
+  let lab; const $ = s => document.querySelector(s); const S = () => lab.state;
+  function renderTg(st) {
+    const chats = [['bf', 'BotFather', '✔️ Verified']].concat(st.tg.bot ? [['bot', st.tg.bot.name, '@' + st.tg.bot.username]] : []);
+    if (!st.tg.bot && st.tg.active === 'bot') st.tg.active = 'bf';
+    $('#tg-list').innerHTML = chats.map(([k, n, sub]) => `<button type="button" class="tg-chatbtn${st.tg.active === k ? ' active' : ''}" data-chat="${k}" id="tg-chat-${k}"><b>${esc(n)}</b><span>${esc(sub)}</span></button>`).join('');
+    const cur = chats.find(c => c[0] === st.tg.active);
+    $('#tg-title').textContent = cur[1] + (cur[0] === 'bot' ? (botLive(st) ? ' · bot' : ' · bot (not running)') : '');
+    const msgs = st.tg.chats[st.tg.active] || [];
+    $('#tg-msgs').innerHTML = msgs.length ? msgs.map(m => `<div class="tg-msg ${m.from}"><div>${esc(m.text).replace(/\n/g, '<br>')}</div><span>${m.time}</span></div>`).join('') : `<div class="muted" style="font-size:12px;text-align:center;padding:20px">${st.tg.active === 'bf' ? 'Send /newbot to create a bot.' : 'Send /start to your bot.'}</div>`;
+    $('#tg-msgs').scrollTop = 1e6;
+  }
+  $('#tg-list').addEventListener('click', e => { const b = e.target.closest('[data-chat]'); if (!b) return; S().tg.active = b.dataset.chat; renderTg(S()); });
+  const sendTg = () => { const v = $('#tg-input').value.trim(); if (!v) return; $('#tg-input').value = ''; tgUser(S(), v); lab.touch(); lab.refresh(); };
+  $('#tg-send').addEventListener('click', sendTg);
+  $('#tg-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendTg(); });
+  $('#tg-ff').addEventListener('click', () => {
+    const st = S(); if (!botLive(st)) { st.flags.ffNote = true; alertTg(st, 'Nothing arrives: the bot service isn\'t running.'); return; }
+    const s = st.services.polizabot; const b = parseBot(s.code); const at = b.tz ? '09:00' : '03:00';
+    if (s.env.AGENT_CHAT_ID !== String(st.V.chat)) { s.log = (s.log || []).concat([`polizabot[4121]: ERROR:telegram.ext.JobQueue:Job "recordatorio_diario" raised an exception: telegram.error.BadRequest: Chat not found`]); alertTg(st, 'The scheduled job ran, but no message reached Andrea (check the bot\'s logs).'); return; }
+    const r = compose(st, s.code, s.env);
+    if (r.err) { s.log = (s.log || []).concat(r.err.map(l => 'polizabot[4121]: ' + l)); alertTg(st, 'The scheduled job ran, but no message reached Andrea (check the bot\'s logs).'); return; }
+    if (!st.tg.chats.bot) st.tg.chats.bot = [];
+    tgSend(st, 'bot', 'them', r.text, at + (b.tz ? '' : ' ⚠')); st.flags.reminderOk = !!r.correct; st.flags.reminderLocal = !!r.correct && b.tz;
+    st.tg.active = 'bot'; alertTg(st, b.tz ? 'Reminder delivered at 09:00 Mexico City time.' : 'Reminder delivered at 03:00 Mexico City time (09:00 UTC): the job uses UTC unless a time zone is given.');
+  });
+  function alertTg(st, text) { st.tg.note = text; lab.touch(); lab.refresh(); }
+  function render(st) { renderTg(st); if (st.tg.note) { $('#tg-msgs').insertAdjacentHTML('beforeend', `<div class="tg-sys">${esc(st.tg.note)}</div>`); st.tg.note = null; } }
+  function onReset(st) { $('#tg-input').value = ''; document.getElementById('ed-panel').hidden = true; $('#vnote').textContent = st.V.note; }
+
+  // ---------- checks
+  const envOf = st => { const n = L.get(st, ENVF); return n ? L.readEnvFile(n.c) : null; };
+  lab = Lab({
+    id: 'local-llm-bot-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@192.168.10.40 — srv-ia01',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@srv-ia01:${st.cwd === '/home/ruben' ? '~' : st.cwd.replace(/^\/home\/ruben/, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nLast login: Fri Nov 20 21:02:17 2026 from 192.168.10.23\nType "help" for the commands available in this simulation.\n',
+    createState, commands: lab => L.commands(lab, cfg), render, onReset,
+    bashPipe: (line, l) => {
+      if (/^\s*curl\s+(-\S+\s+)*https:\/\/ollama\.com\/install\.sh\s*\|\s*(sudo\s+)?sh\s*$/.test(line)) {
+        const st = l.state; const pre = st.sudoAsked ? '' : '[sudo] password for ruben: ********\n'; st.sudoAsked = true;
+        if (L.get(st, '/usr/local/bin/ollama')) return `${pre}>>> Cleaning up old version at /usr/local/lib/ollama\n>>> Installing ollama to /usr/local\n>>> Downloading Linux amd64 bundle\n######################################################################## 100.0%\n>>> Adding ollama user to render group...\n>>> Adding ollama user to video group...\n>>> Adding current user to ollama group...\n>>> Creating ollama systemd service...\n>>> Enabling and starting ollama service...\n>>> The Ollama API is now available at 127.0.0.1:11434.\n>>> Install complete. Run "ollama" from the command line.\nWARNING: No NVIDIA/AMD GPU detected. Ollama will run in CPU-only mode.\n(Already installed: the existing service file was kept.)`;
+        installOllama(st, false); l.touch();
+        return `${pre}>>> Installing ollama to /usr/local\n>>> Downloading Linux amd64 bundle\n######################################################################## 100.0%\n>>> Creating ollama user...\n>>> Adding ollama user to render group...\n>>> Adding ollama user to video group...\n>>> Adding current user to ollama group...\n>>> Creating ollama systemd service...\n>>> Enabling and starting ollama service...\nCreated symlink /etc/systemd/system/default.target.wants/ollama.service → /etc/systemd/system/ollama.service.\n>>> The Ollama API is now available at 127.0.0.1:11434.\n>>> Install complete. Run "ollama" from the command line.\nWARNING: No NVIDIA/AMD GPU detected. Ollama will run in CPU-only mode.`;
+      }
+      return undefined;
+    },
+    objectives: [
+      { text: 'Ollama is installed, running and enabled, and its API is reachable only from this server.',
+        check: st => { const s = st.services.ollama; if (!s) return 'Ollama isn\'t installed.'; if (!s.active || !s.enabled) return 'The ollama service must be active and enabled.'; if (s.listen.addr !== '127.0.0.1') return `The API listens on ${s.listen.addr}:11434, so the whole network can use the model (and read prompts with client data).`; if (L.ufwAllows(st, LAPTOP, 11434)) return 'The firewall still opens port 11434.'; return true; },
+        hints: ['Ollama publishes an official install script for Linux. Check where its API listens with ss -tlnp.', 'By default Ollama binds to 127.0.0.1. OLLAMA_HOST=0.0.0.0 in its unit exposes it to everyone: the bot runs on the same server, so nothing else needs it.', '<code>curl -fsSL https://ollama.com/install.sh | sh</code>. If exposed: remove the OLLAMA_HOST line from <code>/etc/systemd/system/ollama.service</code> with <code>sudo nano</code>, <code>sudo systemctl daemon-reload</code>, <code>sudo systemctl restart ollama</code>, <code>sudo ufw delete allow 11434/tcp</code>'] },
+      { text: 'Download qwen3.5:4b and get an answer from it.',
+        check: st => (hasModel(st, MODEL) ? (st.flags.modelTested || 'Downloaded: now ask it something (ollama run or the API).') : 'qwen3.5:4b isn\'t downloaded.'),
+        hints: ['Check the hardware first: free -h and df -h. A 4B model at Q4 needs about 3.4 GB of disk and ~4–5 GB of RAM.', 'If the download fails, read the error. ollama list shows what is already taking space.', '<code>ollama pull qwen3.5:4b</code> (free space with <code>ollama rm &lt;old model&gt;</code> if needed), then <code>ollama run qwen3.5:4b --think=false "Hola, ¿qué modelo eres?"</code>'] },
+      { text: 'Create Andrea\'s bot with @BotFather and find her chat ID.',
+        check: st => (st.tg.bot ? (st.flags.chatIdSeen || 'Bot created. Andrea must message it, then read her chat ID from getUpdates.') : 'No bot yet.'),
+        hints: ['In Telegram, BotFather creates bots and gives you the token. Usernames must end in "bot" and be unique.', 'The chat ID appears in the API once Andrea sends the bot a message: call getUpdates with the token while the bot isn\'t running.', 'BotFather: <code>/newbot</code>, a name, a username ending in bot. Open the bot, send <code>/start</code>, then <code>curl -s https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> and read <code>"chat":{"id":…}</code>.'] },
+      { text: 'Prepare the bot safely: a polizabot system user, a Python venv with the requirements, and a config file that only root and polizabot can read.',
+        check: st => {
+          const u = st.users.polizabot; if (!u || !u.system || !/nologin|false/.test(u.shell)) return 'Create a system user polizabot with no login shell.';
+          if (!st.venv.exists) return `No virtual environment at ${VENV}.`; if (!st.venv.deps) return 'The venv doesn\'t have the requirements installed.';
+          const n = L.get(st, ENVF); if (!n) return `${ENVF} doesn't exist.`;
+          const e = L.readEnvFile(n.c); const miss = [];
+          if (!st.tg.bot || e.TELEGRAM_TOKEN !== st.tg.bot.token) miss.push('TELEGRAM_TOKEN'); if (e.AGENT_CHAT_ID !== String(st.V.chat)) miss.push('AGENT_CHAT_ID'); if (e.OLLAMA_MODEL !== MODEL) miss.push('OLLAMA_MODEL');
+          if (miss.length) return `In the config file: ${miss.join(', ')} ${miss.length > 1 ? 'are' : 'is'} missing or wrong.`;
+          if (n.m & 0o007) return `The config file holds the bot token but is ${L.modeStr(n)} ${n.o}:${n.g}: anyone on the server can read it.`;
+          if (!(n.o === 'polizabot' || (n.g === 'polizabot' && (n.m & 0o040)) || n.o === 'root')) return 'The config file must be readable by root and polizabot only.';
+          return true;
+        },
+        hints: ['Read /opt/polizabot/README.md. Ubuntu 24.04 refuses system-wide pip installs (PEP 668): use a venv.', 'venv needs the python3-venv package. Install the requirements with the venv\'s own pip. Make the config file owned by root, group polizabot, mode 640.', '<code>sudo apt install -y python3-venv</code>, <code>sudo useradd --system --no-create-home --shell /usr/sbin/nologin polizabot</code>, <code>sudo python3 -m venv /opt/polizabot/venv</code>, <code>sudo /opt/polizabot/venv/bin/pip install -r /opt/polizabot/requirements.txt</code>, <code>sudo mkdir -p /etc/polizabot</code>, <code>sudo nano /etc/polizabot/polizabot.env</code>, <code>sudo chown root:polizabot …</code>, <code>sudo chmod 640 …</code>'] },
+      { text: 'A test run (--test) lists exactly the policies due in the next 30 days, written by the local model with no reasoning text.',
+        check: st => st.flags.testOk || 'No correct test run yet.',
+        hints: ['Run the test as the bot user with the venv\'s Python and read what comes back: an error, wrong policies, or extra text.', 'Compare with the data (sqlite3 /opt/polizabot/polizas.db "SELECT numero, vence FROM polizas") and with Ollama\'s API: /api/chat returns "message", /api/generate returns "response", and Qwen3.5 thinks out loud unless "think": False is sent.', '<code>sudo -u polizabot /opt/polizabot/venv/bin/python /opt/polizabot/bot.py --test</code>, then <code>sudo nano /opt/polizabot/bot.py</code>: fix the query (vence BETWEEN date(\'now\') AND date(\'now\', \'+30 days\')), the URL (/api/chat) or add "think": False, depending on what you see.'] },
+      { text: 'Run the bot as a systemd service: it answers /polizas in Telegram and the daily reminder reaches Andrea.',
+        check: st => {
+          const s = st.services.polizabot; if (!s) return 'There\'s no polizabot.service yet.';
+          if (!s.active || !s.enabled) return 'The service must be active and enabled.';
+          if (!s.unit || s.unit.User !== 'polizabot') return 'The service must run as the polizabot user.';
+          const b = parseBot(s.code || ''); const r = compose(st, s.code || '', s.env || {});
+          if (!r.correct) return 'The running service uses code that doesn\'t produce the right reminder (restart it after editing bot.py).';
+          if (!st.flags.tgOk) return 'Send /polizas to the bot in Telegram and check the reply.';
+          return st.flags.reminderOk || 'Fast-forward to the next daily reminder to confirm it reaches Andrea.';
+        },
+        hints: ['Write a unit like the one in Lab 13: User, EnvironmentFile, ExecStart with the venv\'s Python. Code is loaded at start, so restart after changes.', 'After=ollama.service makes it start after the model server. Telegram uses long polling, so no inbound port is needed.', '<code>sudo nano /etc/systemd/system/polizabot.service</code> (User=polizabot, EnvironmentFile=/etc/polizabot/polizabot.env, ExecStart=/opt/polizabot/venv/bin/python /opt/polizabot/bot.py), <code>sudo systemctl daemon-reload</code>, <code>sudo systemctl enable --now polizabot</code>, then /polizas in Telegram and ⏩.'] },
+      { text: 'The daily reminder arrives at 09:00 Mexico City time, not 09:00 UTC.', optional: true,
+        check: st => st.flags.reminderLocal || 'The reminder hasn\'t arrived at 09:00 local time yet.',
+        hints: ['python-telegram-bot\'s job queue uses UTC unless the time has a time zone. Changing the server\'s time zone doesn\'t change that.', 'Give datetime.time a tzinfo, and import ZoneInfo from zoneinfo.', 'In bot.py: <code>from zoneinfo import ZoneInfo</code> and <code>datetime.time(hour=9, minute=0, tzinfo=ZoneInfo("America/Mexico_City"))</code>, then <code>sudo systemctl restart polizabot</code> and ⏩ again.'] }
+    ],
+    solution(st) {
+      const v = st.v; const V = st.V; const s = [];
+      s.push({ cmd: 'free -h', note: 'Size the server first: a 4B model at Q4 needs ~3.4 GB of disk and ~4–5 GB of RAM. No GPU, so it runs on the CPU.' }, { cmd: 'df -h' });
+      if (v === 0) s.push({ cmd: 'curl -fsSL https://ollama.com/install.sh | sh', note: 'Official installer: creates the ollama user and a systemd service listening on 127.0.0.1:11434.' });
+      else s.push({ cmd: 'systemctl status ollama', note: 'Ollama is already installed here.' });
+      if (v === 2) {
+        s.push({ cmd: 'sudo ss -tlnp', note: 'The API listens on 0.0.0.0, and the firewall opens 11434: anyone on the network can use the model and read prompts with client data.' });
+        s.push({ cmd: 'sudo nano /etc/systemd/system/ollama.service' }, { run: api => api.fill('#ed-text', OLLAMA_UNIT(false), { instant: true }), note: 'Remove the OLLAMA_HOST line: the default is 127.0.0.1.' }, { run: api => api.click('#ed-save') });
+        s.push({ cmd: 'sudo systemctl daemon-reload' }, { cmd: 'sudo systemctl restart ollama' }, { cmd: 'sudo ufw delete allow 11434/tcp' });
+      }
+      if (v === 1) s.push({ cmd: 'ollama list', note: 'The disk is 95% full: an old 4.9 GB test model is taking the space.' }, { cmd: 'ollama rm llama3.1:8b' });
+      s.push({ cmd: 'ollama pull qwen3.5:4b' }, { cmd: 'ollama run qwen3.5:4b --think=false "Hola, ¿qué modelo eres?"', note: 'Quick test. --think=false skips the reasoning trace.' });
+      s.push({ note: 'Telegram: create the bot with BotFather and keep the token.', run: api => api.click('#tg-chat-bf') }, { run: api => api.fill('#tg-input', '/newbot') }, { run: api => api.click('#tg-send') }, { run: api => api.fill('#tg-input', 'PolizaBot Andrea') }, { run: api => api.click('#tg-send') }, { run: api => api.fill('#tg-input', 'andrea_polizas_bot') }, { run: api => api.click('#tg-send') });
+      s.push({ note: 'Andrea sends /start so her chat shows up in the API.', run: api => api.click('#tg-chat-bot') }, { run: api => api.fill('#tg-input', '/start') }, { run: api => api.click('#tg-send') });
+      s.push({ cmd: `curl -s https://api.telegram.org/bot${V.token}/getUpdates`, note: `Her chat ID is ${V.chat}.` });
+      s.push({ cmd: 'cat /opt/polizabot/README.md' });
+      s.push({ cmd: 'sudo apt install -y python3-venv', note: 'Ubuntu 24.04 blocks system-wide pip (PEP 668), so use a venv. It needs python3-venv.' });
+      s.push({ cmd: 'sudo useradd --system --no-create-home --shell /usr/sbin/nologin polizabot' });
+      s.push({ cmd: 'sudo python3 -m venv /opt/polizabot/venv' }, { cmd: 'sudo /opt/polizabot/venv/bin/pip install -r /opt/polizabot/requirements.txt' });
+      s.push({ cmd: 'sudo mkdir -p /etc/polizabot', note: 'Secrets in a file readable only by root and the bot user.' }, { cmd: `sudo nano ${ENVF}` }, { run: api => api.fill('#ed-text', `TELEGRAM_TOKEN=${V.token}\nAGENT_CHAT_ID=${V.chat}\nOLLAMA_MODEL=${MODEL}\n`, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: `sudo chown root:polizabot ${ENVF}` }, { cmd: `sudo chmod 640 ${ENVF}` });
+      s.push({ cmd: `sudo -u polizabot ${VENV}/bin/python ${BOT} --test`, note: v === 0 ? 'The reply starts with <think>…: Qwen3.5 reasons out loud unless the request sends "think": False.' : v === 1 ? 'It lists policies that already expired: the query uses vence < date(\'now\').' : 'KeyError: \'message\': the code calls /api/generate, which returns "response". The chat endpoint returns "message".' });
+      s.push({ cmd: `sudo nano ${BOT}`, note: 'Fix it. Also give the daily job a time zone, so 09:00 means Mexico City, not UTC.' }, { run: api => api.fill('#ed-text', botPy(v, true), { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: `sudo -u polizabot ${VENV}/bin/python ${BOT} --test`, note: 'Now: exactly the three policies due in the next 30 days.' });
+      s.push({ cmd: 'sudo nano /etc/systemd/system/polizabot.service' }, { run: api => api.fill('#ed-text', BOT_UNIT, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'sudo systemctl daemon-reload' }, { cmd: 'sudo systemctl enable --now polizabot', note: 'Long polling: the bot calls Telegram, so no inbound port opens.' });
+      s.push({ note: 'In Telegram, Andrea asks for the list.', run: api => api.fill('#tg-input', '/polizas') }, { run: api => api.click('#tg-send') });
+      s.push({ note: 'And the scheduled reminder at 09:00 Mexico City time.', run: api => api.click('#tg-ff') });
+      return s;
+    },
+    debrief: [
+      { title: 'Small models run fine on a CPU', text: 'Qwen3.5 4B at Q4 is ~3.4 GB and answers in seconds on 4 vCPUs and 8 GB of RAM. Check disk and memory before pulling: a full disk fails halfway through the download.' },
+      { title: 'Keep the model API private', text: 'Ollama has no authentication. OLLAMA_HOST=0.0.0.0 plus an open port lets anyone on the network use the model and read the prompts, which here contain client names and premiums.' },
+      { title: 'Ubuntu 24.04 wants a venv', text: 'PEP 668 blocks system-wide pip installs. A venv per app (python3-venv) keeps dependencies isolated, and the systemd unit points at the venv\'s Python.' },
+      { title: 'Secrets and a service user', text: 'The bot token controls the bot. It lives in a 640 root:polizabot file, loaded by systemd, and the bot runs as a nologin system user.' },
+      { title: 'Debug the glue, not the model', text: 'The model was fine. The bugs were in the glue: an endpoint returning a different field, a reasoning trace nobody asked for, and a date filter returning the wrong rows. Test with --test against real data before going live.' },
+      { title: 'Time zones in schedulers', text: 'python-telegram-bot schedules in UTC unless told otherwise. "09:00" without a tzinfo is 03:00 in Mexico City, and changing the server time zone doesn\'t fix it.' }
+    ]
+  });
+  L.attachEditor(lab);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Deploy a web app on a Linux server — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 13</div>
+    <h1>Lab: Deploy a web app on a Linux server</h1>
+    <p>A fresh Ubuntu server and an app in <code>/opt/shopapp</code>. Install nginx, lock the server down with a firewall, run the app as a proper systemd service under its own user, and publish it through an nginx reverse proxy.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">bash · nginx · systemd · ufw</span><span class="pill">3 randomized servers</span><span class="pill">Part 1 of 3</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> Linux server administration for hosting a site: package management, firewalling without locking yourself out, least-privilege service accounts, systemd units and nginx reverse proxying. Part 1 of a three-lab series (next: Cloudflare SSL, then SQLite and Google sign-in).</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+        <div id="browser-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <p style="font-size:14px">Contoso Shop's new VPS (<code>web01</code>, 203.0.113.50, Ubuntu 24.04) is ready, and DNS for <code>app.example-shop.com</code> already points to it. You're connected over SSH as <code>ruben</code> (sudo rights) from your laptop at 198.51.100.23.</p>
+          <p class="muted" style="font-size:12px;margin:0">Read <code>/opt/shopapp/README.md</code> for how the app runs.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Requirements</h3>
+          <ul style="font-size:13px;padding-left:18px;margin:0">
+            <li>Public ports: SSH (22), HTTP (80), HTTPS (443). Everything else denied.</li>
+            <li>The app must not run as root. Use a dedicated system user called <code>shopapp</code> with no login shell.</li>
+            <li>The systemd service must be called <code>shopapp</code> and start at boot.</li>
+            <li>The app listens on localhost only; nginx is the only public entry point.</li>
+          </ul>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 13 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim;
+  const IP = '203.0.113.50', LAPTOP = '198.51.100.23', HOST = 'app.example-shop.com';
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+  document.getElementById('browser-slot').innerHTML = L.browserHtml('Your laptop · browser');
+  const VARIANTS = [{ port: 3000, apache: false, ufw: false }, { port: 8080, apache: true, ufw: false }, { port: 5000, apache: false, ufw: true }];
+
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/opt/shopapp'] = L.d(); fs['/opt/shopapp/bin'] = L.d();
+    fs['/opt/shopapp/bin/shopapp'] = L.f('#!/usr/bin/env python3\n# Contoso Shop: production entry point (gunicorn wrapper)\n', 'root', 'root', 0o755);
+    fs['/opt/shopapp/README.md'] = L.f(`# Contoso Shop\n\nStart the app with:\n\n    /opt/shopapp/bin/shopapp\n\nIt listens on 127.0.0.1:$PORT (default ${V.port}) and logs to stdout.\nIt does NOT need root and should not run as root.\nPut a reverse proxy (nginx) in front of it for public traffic.\n`);
+    fs['/opt/shopapp/.env.example'] = L.f(`PORT=${V.port}\n`);
+    const services = { ssh: { installed: true, active: true, enabled: true }, ufw: { installed: true, active: true, enabled: true }, cron: { installed: true, active: true, enabled: true } };
+    const packages = ['ufw', 'curl', 'python3', 'openssh-server'];
+    if (V.apache) {
+      services.apache2 = { installed: true, active: true, enabled: true }; packages.push('apache2');
+      fs['/var/www/html'] = L.d(); fs['/var/www/html/index.html'] = L.f('<html><title>Apache2 Ubuntu Default Page</title></html>\n'); fs['/etc/apache2'] = L.d();
+    }
+    return { v, V, fs, cwd: '/home/ruben', users: L.baseUsers('ruben'), services, units: {}, packages, ufw: { enabled: V.ufw, defaultIn: 'deny', rules: V.ufw ? [{ action: 'ALLOW', from: 'Anywhere', port: 22, proto: 'tcp' }] : [] }, flags: {} };
+  }
+
+  function appStart(st, unit, env) {
+    if ((unit.ExecStart || '').split(/\s+/)[0] !== '/opt/shopapp/bin/shopapp') return { ok: false, log: [`shopapp.service: Main process exited, code=exited, status=2/INVALIDARGUMENT (${unit.ExecStart} is not the app entry point)`] };
+    const port = env.PORT ? parseInt(env.PORT, 10) : st.V.port;
+    const user = unit.User || 'root';
+    if (port < 1024 && user !== 'root') return { ok: false, log: [`shopapp[3120]: PermissionError: [Errno 13] Permission denied: can't bind to 127.0.0.1:${port} (ports below 1024 need root)`, 'shopapp.service: Main process exited, code=exited, status=1/FAILURE'] };
+    if (L.nginxListeners(st).some(l => l.port === port) || (st.services.apache2 && st.services.apache2.active && port === 80)) return { ok: false, log: [`shopapp[3120]: OSError: [Errno 98] Address already in use: 127.0.0.1:${port}`, 'shopapp.service: Main process exited, code=exited, status=1/FAILURE'] };
+    return { ok: true, listen: { addr: '127.0.0.1', port } };
+  }
+  function upstream(st, host, port) {
+    const a = st.services.shopapp;
+    if (['127.0.0.1', 'localhost'].includes(host) && a && a.active && a.listen && a.listen.port === port) return { status: 200, title: 'Contoso Shop', body: '<!doctype html><html><head><title>Contoso Shop</title></head><body><h1>Contoso Shop</h1><p>Spring sale is live.</p></body></html>', shop: true };
+    return null;
+  }
+  const cfg = {
+    user: 'ruben', home: '/home/ruben', host: 'web01', ip: IP, adminIp: LAPTOP,
+    packages: { nginx: st => L.installNginx(st) },
+    start: (st, name, unit, env) => {
+      if (name === 'nginx') return L.nginxStart(st);
+      if (name === 'apache2') return L.nginxListeners(st).some(l => l.port === 80) ? { ok: false, log: ['(98)Address already in use: AH00072: make_sock: could not bind to address 0.0.0.0:80'] } : { ok: true };
+      if (name === 'shopapp') return appStart(st, unit, env);
+      return { ok: true };
+    },
+    reload: (st, name) => (name === 'nginx' ? L.nginxReload(st) : { ok: true }),
+    listeners: st => L.nginxListeners(st).concat(st.services.apache2 && st.services.apache2.active ? [{ addr: '0.0.0.0', port: 80, proc: 'apache2' }] : [], st.services.shopapp && st.services.shopapp.active ? [{ addr: '127.0.0.1', port: st.services.shopapp.listen.port, proc: 'shopapp' }] : []),
+    curl: (st, toks) => L.curl(st, toks, { hosts: { [HOST]: IP }, ip: IP, upstream })
+  };
+  function browse(st, url) {
+    if (!/^https?:\/\//.test(url)) url = 'http://' + url;
+    const m = url.match(/^(https?):\/\/([^/:]+)(?::(\d+))?(\/.*)?$/i);
+    if (!m) return { url, secure: false, html: L.errorPage('Invalid address', 'Check the URL.', '') };
+    const scheme = m[1].toLowerCase(), host = m[2].toLowerCase();
+    if (host !== HOST && host !== IP) return { url, secure: false, html: L.errorPage('This site can\'t be reached', `Check if there is a typo in ${Lab.util.esc(host)}.`, 'DNS_PROBE_FINISHED_NXDOMAIN') };
+    const r = L.http(st, { scheme, host, port: m[3] ? +m[3] : null, path: m[4] || '/', from: LAPTOP, local: false }, upstream);
+    if (r.err === 'timeout') return { url, secure: false, html: L.errorPage('This site can\'t be reached', `${host} took too long to respond.`, 'ERR_CONNECTION_TIMED_OUT') };
+    if (r.err === 'refused' || r.err === 'tlsproto') return { url, secure: false, html: L.errorPage('This site can\'t be reached', `${host} refused to connect.`, scheme === 'https' ? 'ERR_SSL_PROTOCOL_ERROR' : 'ERR_CONNECTION_REFUSED') };
+    if (r.shop) { st.flags.browserOk = true; return { url, secure: false, html: L.shopPage() }; }
+    if (r.welcome) return { url, secure: false, html: '<div class="br-page"><h4>Welcome to nginx!</h4><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p></div>' };
+    if (r.apache) return { url, secure: false, html: '<div class="br-page"><h4>Apache2 Default Page</h4><p><b>It works!</b> This is the default welcome page used to test the correct operation of the Apache2 server after installation on Ubuntu systems.</p></div>' };
+    return { url, secure: false, html: `<div class="br-page" style="text-align:center"><h4>${r.status} ${r.status === 502 ? 'Bad Gateway' : r.status === 404 ? 'Not Found' : ''}</h4><hr><p class="muted">nginx/1.24.0 (Ubuntu)</p></div>` };
+  }
+  const routesToApp = st => { const r = L.http(st, { scheme: 'http', host: HOST, port: 80, path: '/', from: IP, local: true }, upstream); return !!r.shop; };
+  const unitOf = st => (st.services.shopapp && st.services.shopapp.unit) || null;
+
+  const UNIT = port => `[Unit]\nDescription=Contoso Shop web app\nAfter=network.target\n\n[Service]\nUser=shopapp\nGroup=shopapp\nEnvironment=PORT=${port}\nWorkingDirectory=/opt/shopapp\nExecStart=/opt/shopapp/bin/shopapp\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n`;
+  const SITE = port => `server {\n    listen 80;\n    server_name ${HOST};\n\n    location / {\n        proxy_pass http://127.0.0.1:${port};\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n`;
+
+  let lab;
+  lab = Lab({
+    id: 'linux-web-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@203.0.113.50 — web01',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@web01:${st.cwd === '/home/ruben' ? '~' : st.cwd.replace(/^\/home\/ruben/, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\n\n  System information as of Fri Nov 20 19:02:14 CST 2026\n  IPv4 address for eth0: 203.0.113.50\n\nLast login: Fri Nov 20 18:55:02 2026 from 198.51.100.23\nType "help" for the commands available in this simulation. Files open in the editor panel with nano.\n',
+    createState, commands: lab => L.commands(lab, cfg),
+    onReset: () => { document.getElementById('ed-panel').hidden = true; document.getElementById('br-url').value = 'http://' + HOST; document.getElementById('br-view').innerHTML = '<div class="muted" style="padding:20px">Press Go to load the site.</div>'; },
+    objectives: [
+      { text: 'nginx is installed, running and enabled at boot.',
+        check: st => { const n = st.services.nginx; if (!n || !n.installed) return 'nginx isn\'t installed.'; if (!n.active) return 'nginx is installed but not running. Check systemctl status nginx.'; return n.enabled || 'nginx won\'t start at boot.'; },
+        hints: ['Use the package manager (as root).', 'Ubuntu starts nginx right after installing it, unless something else already uses port 80.', '<code>sudo apt update</code>, <code>sudo apt install -y nginx</code>, then <code>systemctl status nginx</code>. If port 80 is taken, find out by what with <code>sudo ss -tlnp</code>.'] },
+      { text: 'Firewall: ufw active, incoming denied by default, only SSH, HTTP and HTTPS allowed, and you never cut off your own SSH session.',
+        check: st => {
+          if (st.flags.lockout) return 'You locked yourself out at some point (an outage in production). Reset the lab to try again.';
+          const u = st.ufw; if (!u.enabled) return 'ufw isn\'t active.'; if (u.defaultIn !== 'deny') return 'Default incoming policy isn\'t deny.';
+          const ok = [22, 80, 443].every(p => L.ufwAllows(st, '192.0.2.77', p));
+          if (!ok) return 'Not all of SSH, HTTP and HTTPS are allowed from the internet.';
+          if (L.ufwAllows(st, '192.0.2.77', 3306) || L.ufwAllows(st, '192.0.2.77', st.V.port)) return 'Something beyond 22/80/443 is open (the app port must stay private).';
+          return true;
+        },
+        hints: ['Allow SSH before enabling the firewall, or the enable command cuts your own session.', 'ufw has app profiles: <code>OpenSSH</code> and (once nginx is installed) <code>Nginx Full</code> = 80+443.', '<code>sudo ufw allow OpenSSH</code>; <code>sudo ufw allow \'Nginx Full\'</code>; <code>sudo ufw default deny incoming</code>; <code>sudo ufw enable</code>; <code>sudo ufw status verbose</code>'] },
+      { text: 'The app runs as systemd service <code>shopapp</code>, under a dedicated system user with no login shell, started at boot.',
+        check: st => {
+          const s = st.services.shopapp; if (!s) return 'There\'s no shopapp.service unit yet.';
+          if (!s.active) return s.failed ? 'shopapp.service failed to start. Read systemctl status / journalctl.' : 'shopapp.service isn\'t running.';
+          const u = unitOf(st); const user = (u && u.User) || 'root';
+          if (user === 'root') return 'The app is running as root.';
+          const acct = st.users[user]; if (!acct || !acct.system || !/nologin|false/.test(acct.shell || '')) return `The service user "${user}" should be a system account with a nologin shell.`;
+          if (user !== 'shopapp') return 'The requirement says the user should be called shopapp.';
+          return s.enabled || 'The service won\'t start at boot (enable it).';
+        },
+        hints: ['Two parts: a locked-down user account, and a unit file in /etc/systemd/system.', '<code>useradd --system --no-create-home --shell /usr/sbin/nologin</code>; the unit needs <code>User=</code>, <code>ExecStart=</code> and the <code>PORT</code> from the README. After writing it: daemon-reload.', '<code>sudo useradd --system --no-create-home --shell /usr/sbin/nologin shopapp</code>, then <code>sudo nano /etc/systemd/system/shopapp.service</code> (User=shopapp, Environment=PORT=…, ExecStart=/opt/shopapp/bin/shopapp, WantedBy=multi-user.target), <code>sudo systemctl daemon-reload</code>, <code>sudo systemctl enable --now shopapp</code>'] },
+      { text: 'nginx reverse-proxies <code>app.example-shop.com</code> to the app (config tested, site enabled, nginx reloaded).',
+        check: st => {
+          if (routesToApp(st)) return true;
+          const t = L.nginxTest(st);
+          if (!st.packages.includes('nginx')) return 'Install nginx first.';
+          if (t.errors.length) return 'The nginx config on disk has an error. Run sudo nginx -t.';
+          const disk = L.nginxRoute(t, 80, HOST); const loc = disk && L.nginxLocation(disk, '/');
+          if (!disk || !disk.names.includes(HOST)) return 'No enabled server block for app.example-shop.com (a file in sites-available does nothing until it\'s linked into sites-enabled).';
+          const live = st.nginxLive && L.nginxRoute(st.nginxLive, 80, HOST);
+          if (loc && loc.proxy && (!live || !live.names.includes(HOST))) return 'The config on disk looks right, but nginx hasn\'t loaded it yet (reload nginx).';
+          return 'Requests for app.example-shop.com don\'t reach the app yet (502 means nginx can\'t reach the upstream port).';
+        },
+        hints: ['Write a server block in sites-available, link it into sites-enabled, test, reload.', '<code>proxy_pass</code> must point at the port the app really listens on (README / your unit file). <code>sudo nginx -t</code> before every reload.', '<code>sudo nano /etc/nginx/sites-available/shopapp</code> (server_name app.example-shop.com; location / { proxy_pass http://127.0.0.1:PORT; }), <code>sudo ln -s /etc/nginx/sites-available/shopapp /etc/nginx/sites-enabled/</code>, <code>sudo nginx -t</code>, <code>sudo systemctl reload nginx</code>'] },
+      { text: 'Verify from your laptop: <code>http://app.example-shop.com</code> shows the Contoso Shop app in the browser.',
+        check: st => (st.flags.browserOk && routesToApp(st) && L.ufwAllows(st, LAPTOP, 80)) || 'The browser hasn\'t loaded the app yet.',
+        hints: ['Use the browser panel below the terminal.', 'If it times out, the firewall is blocking 80. If you see "Welcome to nginx", your site isn\'t enabled or matched. 502 means the app isn\'t reachable.', 'Load <code>http://app.example-shop.com</code> in the browser panel.'] },
+      { text: 'Make the service restart itself if the app crashes.', optional: true,
+        check: st => { const u = unitOf(st); return (u && /^(on-failure|always|on-abnormal)$/.test(u.Restart || '')) || 'The running unit has no Restart= policy (or it hasn\'t been reloaded).'; },
+        hints: ['It\'s a [Service] setting.', '<code>Restart=on-failure</code> (and daemon-reload + restart to apply).', 'Add <code>Restart=on-failure</code> under [Service], then <code>sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart shopapp</code>.'] }
+    ],
+    solution(st) {
+      const port = st.V.port; const s = [];
+      s.push({ cmd: 'cat /opt/shopapp/README.md', note: `Read the app's README first: it listens on 127.0.0.1:${port} and must not run as root.` });
+      if (st.V.apache) s.push({ cmd: 'sudo ss -tlnp', note: 'Something already listens on port 80. It\'s apache2, a leftover from a previous setup.' }, { cmd: 'sudo systemctl disable --now apache2', note: 'Stop and disable apache2 so nginx can take port 80.' });
+      s.push({ cmd: 'sudo apt update' }, { cmd: 'sudo apt install -y nginx', note: 'Install nginx. Ubuntu starts and enables it automatically.' });
+      if (st.V.ufw) s.push({ cmd: 'sudo ufw status verbose', note: 'ufw is already active, but only SSH is allowed, so web traffic would time out.' });
+      s.push({ cmd: 'sudo ufw allow OpenSSH', note: 'Firewall: allow SSH first so enabling ufw can\'t cut off this session.' }, { cmd: "sudo ufw allow 'Nginx Full'", note: 'Nginx Full = ports 80 and 443.' }, { cmd: 'sudo ufw default deny incoming' });
+      if (!st.V.ufw) s.push({ cmd: 'sudo ufw enable' });
+      s.push({ cmd: 'sudo useradd --system --no-create-home --shell /usr/sbin/nologin shopapp', note: 'A dedicated system user with no shell: if the app is ever compromised, the attacker isn\'t root and can\'t log in.' });
+      s.push({ cmd: 'sudo nano /etc/systemd/system/shopapp.service', note: 'The systemd unit: run as shopapp, PORT from the README, restart on failure, start at boot.' }, { run: api => api.fill('#ed-text', UNIT(port), { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'sudo systemctl daemon-reload' }, { cmd: 'sudo systemctl enable --now shopapp' }, { cmd: `curl -I http://127.0.0.1:${port}`, note: 'The app answers locally.' });
+      s.push({ cmd: 'sudo nano /etc/nginx/sites-available/shopapp', note: 'nginx server block: match the hostname and proxy to the app on localhost.' }, { run: api => api.fill('#ed-text', SITE(port), { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'sudo ln -s /etc/nginx/sites-available/shopapp /etc/nginx/sites-enabled/', note: 'Enable it: nginx only reads sites-enabled.' }, { cmd: 'sudo nginx -t', note: 'Always test before reloading.' }, { cmd: 'sudo systemctl reload nginx' });
+      s.push({ cmd: `curl -I -H "Host: ${HOST}" http://127.0.0.1` });
+      s.push({ note: 'Check from the laptop.', run: async api => { await api.fill('#br-url', 'http://' + HOST); await api.click('#br-go'); }, wait: 900 });
+      return s;
+    },
+    debrief: [
+      { title: 'Read before you install', text: 'The README told you the port and that the app must not run as root. On a used server, <code>ss -tlnp</code> shows what already owns port 80 before nginx fails mysteriously.' },
+      { title: 'Firewall order matters', text: 'Allowing SSH before <code>ufw enable</code> is the difference between a hardened server and a support ticket to the hosting provider for console access.' },
+      { title: 'Least privilege for services', text: 'A <code>--system</code> user with a <code>nologin</code> shell can run the app but can\'t log in, own other files or touch the system. If the app is compromised, so is only that account.' },
+      { title: 'systemd is the supervisor', text: 'A unit gives you boot start, restarts on crash, logs in journalctl and a defined user. Edit, <code>daemon-reload</code>, then restart: skipping the reload is the classic "my change didn\'t apply".' },
+      { title: 'nginx: available vs enabled', text: 'Files in sites-available do nothing until linked into sites-enabled. <code>nginx -t</code> before every reload means a typo never takes the site down.' },
+      { title: 'Localhost behind a proxy', text: 'The app binds 127.0.0.1 and only nginx is exposed. TLS, headers and rate limits live in one place, and the app port is never reachable from the internet.' }
+    ]
+  });
+  L.attachEditor(lab);
+  L.attachBrowser(lab, browse, () => null);
+})();
+</script>
+</body>
+</html>

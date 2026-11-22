@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Onboard a SaaS app with SAML SSO and MFA — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 02</div>
+    <h1>Lab: Onboard a SaaS app with SAML SSO and MFA</h1>
+    <p>Finance bought "Expensly". Wire it to the corporate identity provider with SAML, prove a pilot user can sign in, then roll out MFA safely with Conditional Access, starting in report-only mode.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~10 min</span><span class="pill">Identity admin console</span><span class="pill">3 randomized vendor configs</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the SSO/MFA delivery work I managed as a First Line Engineer at Atos and Webhelp: reading vendor metadata, decoding sign-in errors, and rolling out MFA in stages without locking anyone out.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Identity admin console</strong> <span class="muted">· simulation modeled on Microsoft Entra ID</span></span><span class="muted">Contoso Ltd · admin.rdg@contoso.com</span></div>
+          <div class="mock-body">
+            <nav class="mock-nav" id="mock-nav">
+              <div class="grp">Enterprise app · Expensly</div>
+              <button type="button" id="nav-sso" data-tab="sso" class="active">Single sign-on</button>
+              <button type="button" id="nav-users" data-tab="users">Users and groups</button>
+              <button type="button" id="nav-test" data-tab="test">Test sign-in</button>
+              <div class="grp">Protection</div>
+              <button type="button" id="nav-ca" data-tab="ca">Conditional Access</button>
+            </nav>
+            <div class="mock-main">
+
+              <!-- SSO -->
+              <div data-panel="sso">
+                <h3>Set up single sign-on with SAML</h3>
+                <div class="mock-section">
+                  <h4>1 · Basic SAML Configuration</h4>
+                  <div class="field"><label for="f-identifier">Identifier (Entity ID) <span style="color:var(--danger)">*</span></label><input type="text" id="f-identifier" spellcheck="false" /></div>
+                  <div class="field"><label for="f-reply">Reply URL (Assertion Consumer Service URL) <span style="color:var(--danger)">*</span></label><input type="text" id="f-reply" spellcheck="false" /></div>
+                  <div class="field"><label for="f-signon">Sign on URL (optional)</label><input type="text" id="f-signon" spellcheck="false" /></div>
+                  <div class="field"><label for="f-relay">Relay State (optional)</label><input type="text" id="f-relay" spellcheck="false" /></div>
+                  <button type="button" class="sm" id="btn-save-saml">Save</button>
+                  <div id="msg-saml" class="inline-msg"></div>
+                </div>
+                <div class="mock-section">
+                  <h4>2 · Attributes &amp; Claims</h4>
+                  <div class="grid-2">
+                    <div class="field"><label for="f-nameid-src">Unique User Identifier (Name ID): source attribute</label>
+                      <select id="f-nameid-src"><option>user.userprincipalname</option><option>user.mail</option><option>user.objectid</option><option>user.employeeid</option></select></div>
+                    <div class="field"><label for="f-nameid-fmt">Name identifier format</label>
+                      <select id="f-nameid-fmt"><option>Default</option><option>Email address</option><option>Persistent</option><option>Unspecified</option><option>Transient</option></select>
+                      <small>"Default" honors the format the app requests.</small></div>
+                  </div>
+                  <label>Additional claims</label>
+                  <table class="data" id="claims-table" style="font-size:12px"><thead><tr><th>Claim name</th><th>Value</th><th></th></tr></thead><tbody></tbody></table>
+                  <div class="row mt-16" style="align-items:flex-end">
+                    <div style="flex:1;min-width:160px"><label for="f-claim-name">New claim name</label><input type="text" id="f-claim-name" placeholder="e.g. email" spellcheck="false" /><small class="muted" style="font-size:11px">Leave the namespace empty to send the bare name.</small></div>
+                    <div><label for="f-claim-src">Source attribute</label>
+                      <select id="f-claim-src"><option>user.mail</option><option>user.department</option><option>user.givenname</option><option>user.surname</option><option>user.userprincipalname</option><option>user.jobtitle</option><option>user.employeeid</option><option>user.objectid</option></select></div>
+                    <div><button type="button" class="sm" id="btn-add-claim">Add claim</button></div>
+                  </div>
+                  <div id="msg-claims" class="inline-msg"></div>
+                </div>
+                <div class="mock-section">
+                  <h4>3 · SAML Certificates</h4>
+                  <dl class="facts"><dt>Status</dt><dd>Active</dd><dt>Thumbprint</dt><dd>9F3A1C0B7E52D4A8F61B2C9E0D7A43B85C1E6F20</dd><dt>Expiration</dt><dd>11/20/2029</dd></dl>
+                  <div class="field mt-16"><label for="f-signing">Signing option</label>
+                    <select id="f-signing"><option>Sign SAML assertion</option><option>Sign SAML response</option><option>Sign SAML response and assertion</option></select></div>
+                </div>
+              </div>
+
+              <!-- Users -->
+              <div data-panel="users" hidden>
+                <h3>Users and groups</h3>
+                <div class="mock-section">
+                  <label class="row" style="color:var(--text);font-size:14px;gap:8px"><input type="checkbox" id="f-assign-req" /> Assignment required (only assigned users and groups can sign in)</label>
+                </div>
+                <div class="mock-section">
+                  <h4>Assigned</h4>
+                  <table class="data" id="assign-table" style="font-size:13px"><thead><tr><th>Name</th><th>Type</th><th>Role</th><th></th></tr></thead><tbody></tbody></table>
+                  <div class="row mt-16" style="align-items:flex-end">
+                    <div style="flex:1"><label for="f-assign-group">Add user or group</label>
+                      <select id="f-assign-group"><option>Expensly Pilot</option><option>All Employees</option><option>Finance</option><option>Maria Torres</option><option>Luis Mendez</option></select></div>
+                    <button type="button" class="sm" id="btn-assign">Assign</button>
+                  </div>
+                  <div id="msg-assign" class="inline-msg"></div>
+                </div>
+              </div>
+
+              <!-- Test -->
+              <div data-panel="test" hidden>
+                <h3>Test sign-in (SP-initiated)</h3>
+                <div class="row" style="align-items:flex-end">
+                  <div style="flex:1"><label for="t-user">Sign in as</label>
+                    <select id="t-user"><option value="maria">Maria Torres · mtorres@contoso.onmicrosoft.com (Expensly Pilot)</option><option value="luis">Luis Mendez · lmendez@contoso.onmicrosoft.com</option></select></div>
+                  <button type="button" class="sm" id="t-run">Run test sign-in</button>
+                </div>
+                <div id="t-summary" class="inline-msg"></div>
+                <pre class="log mt-16" id="t-log">Run a test to see the SAML request, the identity provider's decision, the assertion and Expensly's response.</pre>
+              </div>
+
+              <!-- CA -->
+              <div data-panel="ca" hidden>
+                <h3>Conditional Access policies</h3>
+                <table class="data" id="ca-table" style="font-size:13px"><thead><tr><th>Policy</th><th>State</th><th></th></tr></thead><tbody></tbody></table>
+                <div class="mock-section mt-16">
+                  <h4>New policy</h4>
+                  <div class="field"><label for="ca-name">Name</label><input type="text" id="ca-name" placeholder="e.g. Expensly – require MFA" /></div>
+                  <div class="grid-2">
+                    <div class="field check-list"><label style="color:var(--muted)">Users: include</label>
+                      <label><input type="radio" name="ca-inc" id="ca-inc-all" /> All users</label>
+                      <label><input type="radio" name="ca-inc" id="ca-inc-sel" checked /> Select groups:</label>
+                      <div style="padding-left:20px">
+                        <label><input type="checkbox" id="ca-inc-g-pilot" /> Expensly Pilot</label>
+                        <label><input type="checkbox" id="ca-inc-g-allemp" /> All Employees</label>
+                        <label><input type="checkbox" id="ca-inc-g-finance" /> Finance</label>
+                      </div>
+                    </div>
+                    <div class="field check-list"><label style="color:var(--muted)">Users: exclude</label>
+                      <label><input type="checkbox" id="ca-exc-g-bg" /> BG-Emergency-Access <span class="muted">(break-glass)</span></label>
+                      <label><input type="checkbox" id="ca-exc-g-finance" /> Finance</label>
+                    </div>
+                    <div class="field check-list"><label style="color:var(--muted)">Target resources</label>
+                      <label><input type="radio" name="ca-app" id="ca-app-all" /> All cloud apps</label>
+                      <label><input type="radio" name="ca-app" id="ca-app-sel" checked /> Select apps:</label>
+                      <div style="padding-left:20px">
+                        <label><input type="checkbox" id="ca-app-expensly" /> Expensly</label>
+                        <label><input type="checkbox" id="ca-app-o365" /> Office 365</label>
+                      </div>
+                    </div>
+                    <div class="field check-list"><label style="color:var(--muted)">Grant</label>
+                      <label><input type="radio" name="ca-grant" id="ca-grant-block" /> Block access</label>
+                      <label><input type="radio" name="ca-grant" id="ca-grant-grant" checked /> Grant access, requiring all selected:</label>
+                      <div style="padding-left:20px">
+                        <label><input type="checkbox" id="ca-mfa" /> Require multifactor authentication</label>
+                        <label><input type="checkbox" id="ca-compliant" /> Require device to be marked as compliant</label>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="row" style="align-items:flex-end">
+                    <div><label for="ca-state-new">Enable policy</label><select id="ca-state-new"><option>Report-only</option><option>On</option><option>Off</option></select></div>
+                    <button type="button" class="sm" id="ca-create">Create</button>
+                  </div>
+                  <div id="msg-ca" class="inline-msg"></div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Vendor setup email</h3>
+          <p style="font-size:14px">"Here is our SP metadata. Expensly identifies users by <strong>email address</strong> and needs two attributes, named exactly <code>email</code> and <code>department</code>."</p>
+          <pre class="ref" id="sp-metadata"></pre>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Directory facts</h3>
+          <table class="brief">
+            <tr><th>User</th><th>UPN / mail</th><th>Groups</th></tr>
+            <tr><td>Maria Torres</td><td>mtorres@contoso.onmicrosoft.com<br>maria.torres@contoso.com</td><td>Expensly Pilot, Finance, All Employees</td></tr>
+            <tr><td>Luis Mendez</td><td>lmendez@contoso.onmicrosoft.com<br>luis.mendez@contoso.com</td><td>All Employees</td></tr>
+            <tr><td>bg-admin1</td><td>bg-admin1@contoso.onmicrosoft.com</td><td>BG-Emergency-Access</td></tr>
+          </table>
+          <p class="muted" style="font-size:12px;margin:8px 0 0">The test browser is an unmanaged device. Maria is registered for MFA.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 02 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const $ = s => document.querySelector(s);
+  const $$ = s => [...document.querySelectorAll(s)];
+  const APP_ID = 'a3f1c2d4-7b8e-4f60-9d21-5e0c8b7a1f93';
+  const TENANT_ID = '4b1d6e2a-9c3f-4e8b-a7d5-1f2e3c4d5e6f';
+  const META = [
+    { entityId: 'https://sso.expensly.io/saml/contoso', postAcs: 'https://contoso.expensly.io/saml/acs', redirectAcs: 'https://contoso.expensly.io/saml/acs/redirect', login: 'https://contoso.expensly.io/login' },
+    { entityId: 'urn:expensly:sp:contoso-prod', postAcs: 'https://app.expensly.io/sso/saml2/consume?tenant=contoso', redirectAcs: 'https://app.expensly.io/sso/saml2/redirect?tenant=contoso', login: 'https://app.expensly.io/login?tenant=contoso' },
+    { entityId: 'https://contoso.expensly.io', postAcs: 'https://contoso.expensly.io/auth/saml/callback', redirectAcs: 'https://contoso.expensly.io/auth/saml/redirect', login: 'https://contoso.expensly.io/login' }
+  ];
+  const GROUPS = { pilot: 'Expensly Pilot', allemp: 'All Employees', finance: 'Finance', bg: 'BG-Emergency-Access' };
+  const USERS = {
+    maria: { name: 'Maria Torres', userprincipalname: 'mtorres@contoso.onmicrosoft.com', mail: 'maria.torres@contoso.com', department: 'Finance', givenname: 'Maria', surname: 'Torres', jobtitle: 'Accounts Payable Lead', employeeid: 'E10482', objectid: '8d2c4b1e-55f0-4a7e-9c3d-0b6a1e2f3c4d', groups: ['Expensly Pilot', 'Finance', 'All Employees'] },
+    luis: { name: 'Luis Mendez', userprincipalname: 'lmendez@contoso.onmicrosoft.com', mail: 'luis.mendez@contoso.com', department: 'Sales', givenname: 'Luis', surname: 'Mendez', jobtitle: 'Account Executive', employeeid: 'E10977', objectid: '1f7e9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b', groups: ['All Employees'] }
+  };
+  const EXPENSLY_ACCOUNTS = ['maria.torres@contoso.com', 'luis.mendez@contoso.com'];
+  const DEFAULT_CLAIMS = [
+    { name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress', src: 'user.mail' },
+    { name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname', src: 'user.givenname' },
+    { name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name', src: 'user.userprincipalname' },
+    { name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname', src: 'user.surname' }
+  ];
+  const norm = u => String(u || '').trim().toLowerCase();
+
+  function metadataXml(m) {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+    entityID="${m.entityId}">
+  <md:SPSSODescriptor AuthnRequestsSigned="false"
+      WantAssertionsSigned="true"
+      protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress</md:NameIDFormat>
+    <md:AssertionConsumerService index="1"
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
+        Location="${m.redirectAcs}"/>
+    <md:AssertionConsumerService index="0" isDefault="true"
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+        Location="${m.postAcs}"/>
+  </md:SPSSODescriptor>
+</md:EntityDescriptor>`;
+  }
+
+  function createState(v) {
+    const meta = META[v];
+    return {
+      v, meta,
+      app: { identifier: 'https://expensly.io', replyUrl: meta.redirectAcs, signOnUrl: '', relayState: '', nameIdSrc: 'user.userprincipalname', nameIdFmt: 'Default', claims: DEFAULT_CLAIMS.map(c => Object.assign({}, c)), signing: 'Sign SAML assertion', assignmentRequired: true, assigned: [] },
+      policies: [{ id: 'p1', name: 'Block legacy authentication', state: 'On', history: ['On'], incAll: true, incGroups: [], excGroups: ['BG-Emergency-Access'], appAll: true, apps: [], grant: 'block', mfa: false, compliant: false, legacyOnly: true }],
+      nextId: 2, log: null, summary: null,
+      flags: { reportSeen: {}, mfaOk: {} }
+    };
+  }
+
+  // ---------- policy evaluation
+  const applies = (p, user) => p.state !== 'Off' && !p.legacyOnly &&
+    (p.incAll || p.incGroups.some(g => user.groups.includes(g))) &&
+    !p.excGroups.some(g => user.groups.includes(g)) &&
+    (p.appAll || p.apps.includes('Expensly'));
+  const isTarget = p => !p.legacyOnly && !p.incAll && p.incGroups.includes('Expensly Pilot') && p.excGroups.includes('BG-Emergency-Access') && !p.appAll && p.apps.includes('Expensly') && p.grant === 'grant' && p.mfa;
+  function targetIssues(p) {
+    const i = [];
+    if (p.incAll) i.push('it targets all users instead of the pilot group');
+    else if (!p.incGroups.includes('Expensly Pilot')) i.push('it doesn\'t include the Expensly Pilot group');
+    if (!p.excGroups.includes('BG-Emergency-Access')) i.push('the break-glass group isn\'t excluded');
+    if (p.appAll) i.push('it targets all cloud apps instead of Expensly');
+    else if (!p.apps.includes('Expensly')) i.push('it doesn\'t target Expensly');
+    if (p.grant !== 'grant' || !p.mfa) i.push('it doesn\'t grant access with MFA');
+    return i;
+  }
+
+  // ---------- the test sign-in
+  function runTest(st, lab, who) {
+    const user = USERS[who]; const m = st.meta; const app = st.app;
+    const L = []; const add = (text, cls) => L.push({ text, cls });
+    const reqId = '_' + Math.random().toString(16).slice(2, 14);
+    add('▶ 1. Browser → Expensly: GET ' + m.login, 'hd');
+    add('   Expensly redirects to the identity provider with a SAMLRequest (HTTP-Redirect binding). Decoded:', 'muted');
+    add(`   <samlp:AuthnRequest ID="${reqId}" Version="2.0"\n       Destination="https://login.microsoftonline.com/${TENANT_ID}/saml2"\n       AssertionConsumerServiceURL="${m.postAcs}"\n       ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST">\n     <saml:Issuer>${m.entityId}</saml:Issuer>\n     <samlp:NameIDPolicy Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"/>\n   </samlp:AuthnRequest>`);
+    add('▶ 2. Identity provider validates the request', 'hd');
+    const fail = (code, msg, summary) => { add(`   ✖ ${code}: ${msg}`, 'err'); return { ok: false, summary }; };
+    let r = (() => {
+      if (norm(app.identifier) !== norm(m.entityId)) return fail('AADSTS700016', `Application with identifier '${m.entityId}' was not found in the directory 'Contoso Ltd'. This can happen if the application has not been installed by the administrator of the tenant or consented to by any user in the tenant.`, 'Failed at the identity provider: identifier (Entity ID) mismatch.');
+      add(`   ✓ Issuer matches the app's Identifier`, 'ok');
+      if (norm(app.replyUrl) !== norm(m.postAcs)) return fail('AADSTS50011', `The redirect URI '${m.postAcs}' specified in the request does not match the redirect URIs configured for the application '${APP_ID}'. Make sure the redirect URI sent in the request matches one added to your application.`, 'Failed at the identity provider: reply URL mismatch.');
+      add('   ✓ AssertionConsumerServiceURL matches a configured Reply URL', 'ok');
+      add(`   User signs in: ${user.userprincipalname} · password ✓`, 'muted');
+      const assignedOk = !app.assignmentRequired || app.assigned.includes(user.name) || app.assigned.some(a => user.groups.includes(a));
+      if (!assignedOk) return fail('AADSTS50105', `Your administrator has configured the application Expensly ('${APP_ID}') to block users unless they are specifically granted ('assigned') access to the application. The signed in user '${user.userprincipalname}' is blocked because they are not a direct member of a group with access, nor had access directly assigned by an administrator.`, 'Failed at the identity provider: user isn\'t assigned to the app.');
+      add(app.assignmentRequired ? '   ✓ User is assigned to the app' : '   ! Assignment not required: any user in the tenant can sign in', app.assignmentRequired ? 'ok' : 'warn');
+      add('▶ 3. Conditional Access evaluation', 'hd');
+      let anyApplied = false; const mfaBy = [];
+      for (const p of st.policies) {
+        if (p.legacyOnly) { add(`   – "${p.name}": not applied (client app is a modern browser)`, 'muted'); continue; }
+        if (p.state === 'Off') continue;
+        if (!applies(p, user)) { add(`   – "${p.name}": not applied (user or app out of scope)`, 'muted'); continue; }
+        anyApplied = true;
+        if (p.state === 'Report-only') {
+          const would = p.grant === 'block' ? 'block access' : [p.mfa && 'require MFA', p.compliant && 'require a compliant device'].filter(Boolean).join(' and ') || 'grant access';
+          add(`   ◌ Report-only: "${p.name}" would ${would}. Not enforced.`, 'warn');
+          if (isTarget(p) && !p.compliant) st.flags.reportSeen[p.id] = true;
+          continue;
+        }
+        if (p.grant === 'block') return fail('AADSTS53003', `Access has been blocked by Conditional Access policies. The access policy does not allow token issuance. (Policy: "${p.name}")`, 'Blocked by Conditional Access.');
+        if (p.compliant) return fail('AADSTS53000', `Device is not in required device state: compliant. Conditional Access policy "${p.name}" requires a compliant device, and the device is not compliant.`, 'Blocked by Conditional Access: the test device isn\'t compliant.');
+        if (p.mfa) { mfaBy.push(p); }
+      }
+      if (mfaBy.length) add(`   ✓ MFA required by ${mfaBy.map(p => '"' + p.name + '"').join(', ')} → Authenticator push sent → approved`, 'ok');
+      else if (!anyApplied) add('   No policy applied: single-factor sign-in', 'muted');
+      add('▶ 4. Identity provider → browser → HTTP-POST SAMLResponse to ' + app.replyUrl, 'hd');
+      const nameId = user[app.nameIdSrc.replace('user.', '')];
+      const attrs = app.claims.map(c => ({ name: c.name, value: user[c.src.replace('user.', '')] }));
+      const signA = app.signing !== 'Sign SAML response';
+      add(`   <samlp:Response Destination="${app.replyUrl}" InResponseTo="${reqId}">${app.signing !== 'Sign SAML assertion' ? '\n     <ds:Signature>…response signature…</ds:Signature>' : ''}\n     <Assertion>\n       <Issuer>https://sts.windows.net/${TENANT_ID}/</Issuer>${signA ? '\n       <ds:Signature>…assertion signature…</ds:Signature>' : ''}\n       <Subject><NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">${nameId}</NameID></Subject>\n       <AttributeStatement>\n${attrs.map(a => `         <Attribute Name="${a.name}"><AttributeValue>${a.value}</AttributeValue></Attribute>`).join('\n')}\n       </AttributeStatement>\n     </Assertion>\n   </samlp:Response>`);
+      add('▶ 5. Expensly validates the assertion', 'hd');
+      if (!signA) return fail('Expensly', 'SAML assertion is not signed. This service provider requires signed assertions (WantAssertionsSigned="true").', 'Expensly rejected the assertion: it isn\'t signed.');
+      add('   ✓ Assertion signature valid', 'ok');
+      if (!EXPENSLY_ACCOUNTS.includes(norm(nameId))) return fail('Expensly', `No Expensly account matches the NameID '${nameId}'. Accounts are keyed by email address.`, 'Expensly couldn\'t match the user: wrong NameID value.');
+      add(`   ✓ NameID ${nameId} matches an Expensly account`, 'ok');
+      const missing = ['email', 'department'].filter(n => !attrs.some(a => a.name === n));
+      if (missing.length) return fail('Expensly', `Required attribute(s) missing from the assertion: ${missing.join(', ')}. Attribute names must match exactly (no namespace).`, 'Expensly rejected the assertion: required attributes missing.');
+      const email = attrs.find(a => a.name === 'email').value;
+      if (norm(email) !== norm(user.mail)) return fail('Expensly', `The 'email' attribute (${email}) doesn't match the account (${user.mail}).`, 'Expensly rejected the assertion: email attribute has the wrong value.');
+      const dept = attrs.find(a => a.name === 'department').value;
+      if (dept !== user.department) return fail('Expensly', `The 'department' attribute (${dept}) isn't a valid Expensly cost center.`, 'Expensly rejected the assertion: department attribute has the wrong value.');
+      add('   ✓ Attributes email and department present', 'ok');
+      add(`✔ Expensly: session created for ${user.mail}`, 'ok');
+      mfaBy.forEach(p => { if (isTarget(p)) st.flags.mfaOk[p.id] = true; });
+      return { ok: true, summary: mfaBy.length ? 'Sign-in succeeded with MFA.' : 'Sign-in succeeded.' };
+    })();
+    if (r.ok && who === 'maria') st.flags.testOk = true;
+    st.log = L; st.summary = r;
+    lab.touch(); lab.refresh();
+  }
+
+  // ---------- UI wiring
+  let lab;
+  const S = () => lab.state;
+  const setMsg = (id, text, cls) => { const el = $(id); el.textContent = text || ''; el.className = 'inline-msg' + (cls ? ' ' + cls : ''); };
+  function showTab(name) {
+    $$('#mock-nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+    $$('[data-panel]').forEach(p => { p.hidden = p.dataset.panel !== name; });
+  }
+  $('#mock-nav').addEventListener('click', e => { const b = e.target.closest('button[data-tab]'); if (b) showTab(b.dataset.tab); });
+
+  $('#btn-save-saml').addEventListener('click', () => {
+    const id = $('#f-identifier').value.trim(), reply = $('#f-reply').value.trim();
+    if (!id || !reply) return setMsg('#msg-saml', 'Identifier and Reply URL are required.', 'err');
+    if (!/^(https?:\/\/|urn:)/i.test(id)) return setMsg('#msg-saml', 'Identifier must be a URI (http(s):// or urn:).', 'err');
+    if (!/^https:\/\//i.test(reply)) return setMsg('#msg-saml', 'Reply URL must use HTTPS.', 'err');
+    Object.assign(S().app, { identifier: id, replyUrl: reply, signOnUrl: $('#f-signon').value.trim(), relayState: $('#f-relay').value.trim() });
+    setMsg('#msg-saml', 'Saved basic SAML configuration.', 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#f-nameid-src').addEventListener('change', e => { S().app.nameIdSrc = e.target.value; setMsg('#msg-claims', 'Saved Name ID.', 'ok'); lab.touch(); lab.refresh(); });
+  $('#f-nameid-fmt').addEventListener('change', e => { S().app.nameIdFmt = e.target.value; setMsg('#msg-claims', 'Saved Name ID format.', 'ok'); lab.touch(); lab.refresh(); });
+  $('#f-signing').addEventListener('change', e => { S().app.signing = e.target.value; lab.touch(); lab.refresh(); });
+  $('#btn-add-claim').addEventListener('click', () => {
+    const name = $('#f-claim-name').value.trim(); const src = $('#f-claim-src').value;
+    if (!name) return setMsg('#msg-claims', 'Enter a claim name.', 'err');
+    if (S().app.claims.some(c => c.name === name)) return setMsg('#msg-claims', `A claim named "${name}" already exists. Remove it first to change its value.`, 'err');
+    S().app.claims.push({ name, src }); $('#f-claim-name').value = '';
+    setMsg('#msg-claims', `Added claim "${name}" → ${src}.`, 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#claims-table').addEventListener('click', e => {
+    const b = e.target.closest('button[data-rm-claim]'); if (!b) return;
+    S().app.claims.splice(+b.dataset.rmClaim, 1); lab.touch(); lab.refresh();
+  });
+  $('#f-assign-req').addEventListener('change', e => { S().app.assignmentRequired = e.target.checked; lab.touch(); lab.refresh(); });
+  $('#btn-assign').addEventListener('click', () => {
+    const v = $('#f-assign-group').value;
+    if (S().app.assigned.includes(v)) return setMsg('#msg-assign', `${v} is already assigned.`, 'err');
+    S().app.assigned.push(v); setMsg('#msg-assign', `Assigned ${v}.`, 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#assign-table').addEventListener('click', e => {
+    const b = e.target.closest('button[data-unassign]'); if (!b) return;
+    S().app.assigned = S().app.assigned.filter(a => a !== b.dataset.unassign); lab.touch(); lab.refresh();
+  });
+  $('#t-run').addEventListener('click', () => runTest(S(), lab, $('#t-user').value));
+  $('#ca-create').addEventListener('click', () => {
+    const name = $('#ca-name').value.trim();
+    if (!name) return setMsg('#msg-ca', 'Give the policy a name.', 'err');
+    if (S().policies.some(p => p.name.toLowerCase() === name.toLowerCase())) return setMsg('#msg-ca', 'A policy with that name already exists.', 'err');
+    const incAll = $('#ca-inc-all').checked;
+    const incGroups = ['pilot', 'allemp', 'finance'].filter(k => $('#ca-inc-g-' + k).checked).map(k => GROUPS[k]);
+    if (!incAll && !incGroups.length) return setMsg('#msg-ca', 'Select at least one group to include (or All users).', 'err');
+    const appAll = $('#ca-app-all').checked;
+    const apps = [['expensly', 'Expensly'], ['o365', 'Office 365']].filter(([k]) => $('#ca-app-' + k).checked).map(([, n]) => n);
+    if (!appAll && !apps.length) return setMsg('#msg-ca', 'Select at least one target app (or All cloud apps).', 'err');
+    const grant = $('#ca-grant-block').checked ? 'block' : 'grant';
+    const mfa = $('#ca-mfa').checked, compliant = $('#ca-compliant').checked;
+    if (grant === 'grant' && !mfa && !compliant) return setMsg('#msg-ca', 'Select at least one grant control.', 'err');
+    const state = $('#ca-state-new').value;
+    const p = { id: 'p' + S().nextId++, name, state, history: [state], incAll, incGroups: incAll ? [] : incGroups, excGroups: [['bg', 'BG-Emergency-Access'], ['finance', 'Finance']].filter(([k]) => $('#ca-exc-g-' + k).checked).map(([, n]) => n), appAll, apps: appAll ? [] : apps, grant, mfa: grant === 'grant' && mfa, compliant: grant === 'grant' && compliant, legacyOnly: false };
+    S().policies.push(p);
+    setMsg('#msg-ca', `Created "${name}" (${state}).`, 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#ca-table').addEventListener('change', e => {
+    const s = e.target.closest('select[data-policy]'); if (!s) return;
+    const p = S().policies.find(x => x.id === s.dataset.policy); p.state = s.value; p.history.push(s.value); lab.touch(); lab.refresh();
+  });
+  $('#ca-table').addEventListener('click', e => {
+    const b = e.target.closest('button[data-del-policy]'); if (!b) return;
+    S().policies = S().policies.filter(p => p.id !== b.dataset.delPolicy); lab.touch(); lab.refresh();
+  });
+
+  function esc(s) { return Lab.util.esc(s); }
+  function render(st) {
+    $('#claims-table tbody').innerHTML = st.app.claims.map((c, i) => `<tr><td class="mono" style="overflow-wrap:anywhere">${esc(c.name)}</td><td class="mono">${esc(c.src)}</td><td><button type="button" class="ghost sm" data-rm-claim="${i}">Remove</button></td></tr>`).join('');
+    $('#assign-table tbody').innerHTML = st.app.assigned.length ? st.app.assigned.map(a => `<tr><td>${esc(a)}</td><td>${GROUPS.pilot === a || Object.values(GROUPS).includes(a) ? 'Group' : 'User'}</td><td>User</td><td><button type="button" class="ghost sm" data-unassign="${esc(a)}">Remove</button></td></tr>`).join('') : '<tr><td colspan="4" class="muted">No users or groups assigned.</td></tr>';
+    $('#f-assign-req').checked = st.app.assignmentRequired;
+    $('#ca-table tbody').innerHTML = st.policies.map(p => `<tr><td>${esc(p.name)}<div class="muted" style="font-size:11px">${p.legacyOnly ? 'All users (excl. break-glass) · legacy auth clients · Block' : `${p.incAll ? 'All users' : p.incGroups.join(', ')}${p.excGroups.length ? ' · excl. ' + p.excGroups.join(', ') : ''} · ${p.appAll ? 'All cloud apps' : p.apps.join(', ')} · ${p.grant === 'block' ? 'Block' : [p.mfa && 'MFA', p.compliant && 'Compliant device'].filter(Boolean).join(' + ')}`}</div></td>
+      <td><select id="ca-state-${p.id}" data-policy="${p.id}" style="width:auto">${['Report-only', 'On', 'Off'].map(s => `<option${s === p.state ? ' selected' : ''}>${s}</option>`).join('')}</select></td>
+      <td>${p.legacyOnly ? '' : `<button type="button" class="ghost sm" data-del-policy="${p.id}">Delete</button>`}</td></tr>`).join('');
+    const log = $('#t-log');
+    if (st.log) {
+      log.innerHTML = st.log.map(l => `<span class="${l.cls || ''}">${esc(l.text)}</span>`).join('\n');
+      setMsg('#t-summary', st.summary.summary, st.summary.ok ? 'ok' : 'err');
+    }
+  }
+  function onReset(st) {
+    $('#sp-metadata').textContent = metadataXml(st.meta);
+    $('#f-identifier').value = st.app.identifier; $('#f-reply').value = st.app.replyUrl; $('#f-signon').value = ''; $('#f-relay').value = '';
+    $('#f-nameid-src').value = st.app.nameIdSrc; $('#f-nameid-fmt').value = st.app.nameIdFmt; $('#f-signing').value = st.app.signing;
+    $('#f-claim-name').value = ''; $('#ca-name').value = '';
+    ['#ca-inc-all', '#ca-app-all', '#ca-grant-block', '#ca-mfa', '#ca-compliant', '#ca-inc-g-pilot', '#ca-inc-g-allemp', '#ca-inc-g-finance', '#ca-exc-g-bg', '#ca-exc-g-finance', '#ca-app-expensly', '#ca-app-o365'].forEach(s => { $(s).checked = false; });
+    $('#ca-inc-sel').checked = true; $('#ca-app-sel').checked = true; $('#ca-grant-grant').checked = true; $('#ca-state-new').value = 'Report-only';
+    $('#t-log').textContent = 'Run a test to see the SAML request, the identity provider\'s decision, the assertion and Expensly\'s response.';
+    ['#msg-saml', '#msg-claims', '#msg-assign', '#msg-ca', '#t-summary'].forEach(id => setMsg(id, ''));
+    showTab('sso');
+  }
+
+  lab = Lab({
+    id: 'sso-mfa-lab', variants: 3, terminal: null,
+    createState, onReset, render,
+    objectives: [
+      { text: 'Match Expensly\'s SAML metadata: Identifier (Entity ID) and the Reply URL for the <strong>HTTP-POST</strong> binding.',
+        check: st => {
+          const idOk = norm(st.app.identifier) === norm(st.meta.entityId), replyOk = norm(st.app.replyUrl) === norm(st.meta.postAcs);
+          if (idOk && replyOk) return true;
+          if (!idOk && !replyOk) return 'Neither the Identifier nor the Reply URL matches the vendor metadata.';
+          return idOk ? 'The Reply URL doesn\'t match the HTTP-POST AssertionConsumerService in the metadata.' : 'The Identifier doesn\'t match the metadata\'s entityID.';
+        },
+        hints: ['The metadata has an <code>entityID</code> attribute and two <code>AssertionConsumerService</code> endpoints.', 'The identity provider always POSTs the SAML response, so the Reply URL must be the endpoint with the HTTP-POST binding, not the first one listed.', 'Identifier = the <code>entityID</code> value; Reply URL = the <code>Location</code> on the <code>index="0" isDefault="true"</code> HTTP-POST entry. Then Save.'] },
+      { text: 'Give the Expensly Pilot group access to the app, keeping assignment required.',
+        check: st => {
+          if (!st.app.assignmentRequired) return '"Assignment required" was turned off, so now anyone in the tenant can sign in.';
+          return st.app.assigned.includes('Expensly Pilot') || 'The Expensly Pilot group isn\'t assigned yet.';
+        },
+        hints: ['Look at Users and groups.', 'Turning off "Assignment required" would also let the pilot in, along with everybody else. Assign the group instead.', 'Users and groups → Add user or group: Expensly Pilot → Assign.'] },
+      { text: 'Send the identity Expensly expects: NameID = the user\'s email address, plus attributes named exactly <code>email</code> and <code>department</code>.',
+        check: st => {
+          const a = st.app; const issues = [];
+          if (a.nameIdSrc !== 'user.mail') issues.push(`NameID comes from ${a.nameIdSrc}, which isn't the user's email address`);
+          const e = a.claims.find(c => c.name === 'email'), d = a.claims.find(c => c.name === 'department');
+          if (!e) issues.push('no attribute named "email"'); else if (e.src !== 'user.mail') issues.push(`"email" comes from ${e.src}`);
+          if (!d) issues.push('no attribute named "department"'); else if (d.src !== 'user.department') issues.push(`"department" comes from ${d.src}`);
+          return issues.length ? issues.join('; ') + '.' : true;
+        },
+        hints: ['Compare Maria\'s UPN and her email address in Directory facts. They aren\'t the same.', 'The NameID source should be the mail attribute. The default email claim uses a long URI name, but Expensly wants the bare name <code>email</code>.', 'Name ID source → <code>user.mail</code>. Add claim <code>email</code> → user.mail and claim <code>department</code> → user.department.'] },
+      { text: 'A test sign-in as the pilot user (Maria) succeeds end to end.',
+        check: st => st.flags.testOk || 'No successful test sign-in yet. Read the error in the test log.',
+        hints: ['Use Test sign-in, then read each step of the log.', 'AADSTS errors come from the identity provider; "Expensly:" errors come from the app after it receives the assertion.', 'Fix whatever the first ✖ line says, then run the test again.'] },
+      { text: 'Create a Conditional Access policy that requires MFA for the pilot group on Expensly, excludes the break-glass group, and <strong>starts in Report-only</strong>.',
+        check: st => {
+          const cands = st.policies.filter(p => !p.legacyOnly);
+          const t = cands.find(isTarget);
+          if (!t) return cands.length ? 'Your policy isn\'t scoped right: ' + targetIssues(cands[cands.length - 1]).join('; ') + '.' : 'No new Conditional Access policy yet.';
+          if (t.history[0] !== 'Report-only') return `"${t.name}" was created straight in ${t.history[0]} mode. Delete it and create it in Report-only first.`;
+          if (t.compliant) return `"${t.name}" also requires a compliant device, which the brief didn't ask for and the test device can't meet.`;
+          return true;
+        },
+        hints: ['Scope matters: which users, which app, what control, and who must never be locked out.', 'Break-glass (emergency access) accounts are excluded from every policy. Report-only shows the impact without enforcing anything.', 'Name it; include Select groups → Expensly Pilot; exclude BG-Emergency-Access; target Select apps → Expensly; Grant → Require MFA; Enable policy → Report-only; Create.'] },
+      { text: 'Review a report-only sign-in for Maria, then switch the policy <strong>On</strong> and confirm she\'s prompted for MFA.',
+        check: st => {
+          const t = st.policies.find(p => isTarget(p) && p.history[0] === 'Report-only' && !p.compliant);
+          if (!t) return 'Finish the previous objective first.';
+          if (!st.flags.reportSeen[t.id]) return 'Run a test sign-in while the policy is in Report-only and check what it would have done.';
+          if (t.state !== 'On') return 'The policy is still in ' + t.state + ' mode.';
+          return st.flags.mfaOk[t.id] || 'Run another test sign-in now that the policy is On.';
+        },
+        hints: ['Report-only results show up in the sign-in log as "would require MFA".', 'Run the test while the policy is in Report-only, change its state in the policy list, then test again.', 'Test sign-in (Maria) → Conditional Access: set the policy\'s state to On → Test sign-in again; look for "MFA required … approved".'] }
+    ],
+    solution(st) {
+      const m = st.meta; const nav = t => ({ run: api => api.click('#nav-' + t) });
+      return [
+        { note: 'Single sign-on: copy the entityID and the HTTP-POST ACS from the vendor metadata. The pre-filled Reply URL is the Redirect-binding endpoint, a common copy-paste mistake.', run: api => api.click('#nav-sso') },
+        { run: api => api.fill('#f-identifier', m.entityId) },
+        { run: api => api.fill('#f-reply', m.postAcs) },
+        { run: api => api.click('#btn-save-saml') },
+        { note: 'Maria\'s UPN (mtorres@contoso.onmicrosoft.com) isn\'t her email address. Expensly keys accounts by email, so the NameID must come from user.mail.', run: api => api.fill('#f-nameid-src', 'user.mail') },
+        { note: 'Add the two attributes with the exact bare names the vendor asked for.', run: api => api.fill('#f-claim-name', 'email') },
+        { run: api => api.fill('#f-claim-src', 'user.mail') },
+        { run: api => api.click('#btn-add-claim') },
+        { run: api => api.fill('#f-claim-name', 'department') },
+        { run: api => api.fill('#f-claim-src', 'user.department') },
+        { run: api => api.click('#btn-add-claim') },
+        { note: 'Assignment is required, so assign the pilot group rather than switching that off.', run: api => api.click('#nav-users') },
+        { run: api => api.fill('#f-assign-group', 'Expensly Pilot') },
+        { run: api => api.click('#btn-assign') },
+        { note: 'Test as the pilot user before adding MFA, so any failure is clearly SSO and not policy.', run: api => api.click('#nav-test') },
+        { run: api => api.fill('#t-user', 'maria') },
+        { run: api => api.click('#t-run'), wait: 900 },
+        { note: 'Conditional Access: pilot group only, Expensly only, require MFA, exclude break-glass, and start in Report-only.', run: api => api.click('#nav-ca') },
+        { run: api => api.fill('#ca-name', 'Expensly – require MFA (pilot)') },
+        { run: api => api.check('#ca-inc-sel') },
+        { run: api => api.check('#ca-inc-g-pilot') },
+        { run: api => api.check('#ca-exc-g-bg') },
+        { run: api => api.check('#ca-app-sel') },
+        { run: api => api.check('#ca-app-expensly') },
+        { run: api => api.check('#ca-grant-grant') },
+        { run: api => api.check('#ca-mfa') },
+        { run: api => api.fill('#ca-state-new', 'Report-only') },
+        { run: api => api.click('#ca-create') },
+        { note: 'Test again: the log shows the policy would require MFA, and nothing breaks.', run: api => api.click('#nav-test') },
+        { run: api => api.click('#t-run'), wait: 900 },
+        { note: 'Impact looks right, so switch the policy On.', run: api => api.click('#nav-ca') },
+        { run: api => api.fill('#ca-state-p2', 'On') },
+        { note: 'Final test: Maria gets an MFA prompt and still lands in Expensly.', run: api => api.click('#nav-test') },
+        { run: api => api.click('#t-run'), wait: 900 }
+      ];
+    },
+    debrief: [
+      { title: 'Metadata is the contract', text: 'The <code>entityID</code> must match the Identifier exactly (AADSTS700016 otherwise), and the Reply URL must be the HTTP-POST ACS, because the IdP always POSTs the response (AADSTS50011 otherwise). Copying the first URL in the file is a classic mistake.' },
+      { title: 'UPN isn\'t email', text: 'After migrations, UPNs often stay on the .onmicrosoft.com domain while mail moves to the vanity domain. Apps keyed by email then fail <em>after</em> a successful IdP sign-in, which is why reading the full flow matters.' },
+      { title: 'Name the attributes the app expects', text: 'The default claims use long schema URIs. Many SaaS apps want bare names like <code>email</code>. Exact strings matter.' },
+      { title: 'Assign, don\'t open up', text: 'Turning off "Assignment required" makes the error go away by letting the whole tenant in. Assigning the pilot group keeps access intentional and makes the later rollout a group-membership change.' },
+      { title: 'Report-only first, break-glass always', text: 'Report-only shows exactly who a policy would affect before anyone is challenged. Excluding emergency-access accounts from every policy means a bad policy can never lock out the tenant.' },
+      { title: 'Delivery, not just configuration', text: 'The same sequence scales to the full rollout: SSO validated with a pilot, MFA in report-only, review, enforce, then widen the group in waves while watching helpdesk volume.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

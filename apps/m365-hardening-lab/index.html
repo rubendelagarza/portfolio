@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Harden a new client's Microsoft 365 tenant — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 01</div>
+    <h1>Lab: Harden a new client's Microsoft 365 tenant</h1>
+    <p>A freshly migrated tenant still has permissive defaults. Use Exchange Online and Microsoft Teams PowerShell to lock down meetings and guest access, warn users about external mail, set up a shared mailbox and fix a mailbox that's about to stop receiving mail.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~10 min</span><span class="pill">PowerShell (EXO + Teams)</span><span class="pill">3 randomized tenants</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the Microsoft 365 configuration work I do as a Senior Technical Consultant at Perficient, in the post-migration phase: Outlook/Exchange and Teams settings, permissions, and storage, done through PowerShell so it's repeatable.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Client brief: Contoso Ltd</h3>
+          <p style="font-size:14px">Migration finished last week. Before go-live sign-off, the CISO wants the post-migration hardening checklist done. You're connected to Exchange Online and Microsoft Teams PowerShell as a Global Administrator.</p>
+          <dl class="facts">
+            <dt>Tenant</dt><dd>contoso.onmicrosoft.com</dd>
+            <dt>Mail domain</dt><dd>contoso.com</dd>
+            <dt>Partner</dt><dd>fabrikam.com (the only external org Contoso may chat with)</dd>
+            <dt>Support staff</dt><dd>mail-enabled security group "Support Team"</dd>
+          </dl>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Tips</h3>
+          <p class="muted" style="font-size:13px;margin:0">Type <code>help</code> for the supported cmdlets and <code>Get-Help &lt;cmdlet&gt;</code> for their parameters. Pipelines work (<code>| Sort-Object</code>, <code>| Select-Object</code>, <code>| Format-List</code>, <code>| Where-Object</code>), and so does <code>;</code> between commands.</p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 01 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError } = Lab;
+  const { fmtBytes } = Lab.util;
+  const GB = 1024 ** 3;
+  const Q = gb => `${gb} GB (${(gb * GB).toLocaleString('en-US')} bytes)`;
+  const SERVER = 'BN8PR04A008DC02.NAMPR04A008.PROD.OUTLOOK.COM';
+  const OVER = ['m.alvarez', 'l.mendez', 'd.castro'];
+
+  const PEOPLE = [
+    ['Jorge Perez', 'j.perez', 38.2, 41200], ['Ana Gomez', 'a.gomez', 61.7, 88731], ['Rocio Lopez', 'r.lopez', 22.9, 30417],
+    ['Miguel Alvarez', 'm.alvarez', 47.3, 51022], ['Sofia Torres', 's.torres', 12.4, 15930], ['Luis Mendez', 'l.mendez', 71.8, 97455],
+    ['Diana Castro', 'd.castro', 5.6, 8812], ['Carlos Ruiz', 'c.ruiz', 83.1, 120344], ['Ruben de la Garza', 'admin.rdg', 3.1, 4101]
+  ];
+
+  function createState(v) {
+    const mailboxes = PEOPLE.map(([n, a, gb, items], i) => ({
+      Name: n, Alias: a, DisplayName: n, PrimarySmtpAddress: a + '@contoso.com', Type: 'UserMailbox',
+      ArchiveStatus: 'None', AutoExpanding: false, RetentionPolicy: 'Default MRM Policy', quota: 100,
+      bytes: (a === OVER[v] ? 98.6 : gb) * GB, items: a === OVER[v] ? 214880 : items,
+      last: `11/${19 - (i % 4)}/2026 ${((7 + i) % 12) + 1}:${String(i * 7 % 60).padStart(2, '0')}:14 ${7 + i >= 11 ? 'PM' : 'AM'}`,
+      perms: [{ User: 'NT AUTHORITY\\SELF', AccessRights: ['FullAccess', 'ReadPermission'], IsInherited: false }], sendAs: [{ Trustee: 'NT AUTHORITY\\SELF', AccessRights: ['SendAs'] }]
+    }));
+    return {
+      v, mailboxes,
+      groups: [
+        { Name: 'Support Team', Alias: 'sg-support', PrimarySmtpAddress: 'sg-support@contoso.com', RecipientTypeDetails: 'MailUniversalSecurityGroup' },
+        { Name: 'Finance', Alias: 'sg-finance', PrimarySmtpAddress: 'sg-finance@contoso.com', RecipientTypeDetails: 'MailUniversalSecurityGroup' },
+        { Name: 'All Staff', Alias: 'allstaff', PrimarySmtpAddress: 'allstaff@contoso.com', RecipientTypeDetails: 'MailUniversalDistributionGroup' }
+      ],
+      meetingPolicies: {
+        'Global': { Identity: 'Global', Description: '', AllowMeetNow: true, AllowIPVideo: true, AllowAnonymousUsersToJoinMeeting: true, AllowAnonymousUsersToStartMeeting: false, AutoAdmittedUsers: 'Everyone', AllowPSTNUsersToBypassLobby: true, AllowCloudRecording: true, AllowTranscription: false, AllowExternalParticipantGiveRequestControl: false, AllowExternalNonTrustedMeetingChat: true, DesignatedPresenterRoleMode: 'EveryoneUserOverride' },
+        'Tag:AllOn': { Identity: 'Tag:AllOn', Description: 'Do not assign. This policy is same as global defaults and would be deprecated', AllowMeetNow: true, AllowIPVideo: true, AllowAnonymousUsersToJoinMeeting: true, AllowAnonymousUsersToStartMeeting: false, AutoAdmittedUsers: 'EveryoneInCompany', AllowPSTNUsersToBypassLobby: false, AllowCloudRecording: true, AllowTranscription: false, AllowExternalParticipantGiveRequestControl: false, AllowExternalNonTrustedMeetingChat: true, DesignatedPresenterRoleMode: 'EveryoneUserOverride' },
+        'Tag:RestrictedAnonymousAccess': { Identity: 'Tag:RestrictedAnonymousAccess', Description: 'Do not assign. This policy blocks anonymous users from joining meetings', AllowMeetNow: true, AllowIPVideo: true, AllowAnonymousUsersToJoinMeeting: false, AllowAnonymousUsersToStartMeeting: false, AutoAdmittedUsers: 'EveryoneInCompany', AllowPSTNUsersToBypassLobby: false, AllowCloudRecording: true, AllowTranscription: false, AllowExternalParticipantGiveRequestControl: false, AllowExternalNonTrustedMeetingChat: true, DesignatedPresenterRoleMode: 'EveryoneUserOverride' }
+      },
+      meetingConfig: { Identity: 'Global', DisableAnonymousJoin: false, DisableAppInteractionForAnonymousUsers: false, EnableQoS: false, ClientVideoPort: 50020 },
+      clientConfig: { Identity: 'Global', AllowEmailIntoChannel: true, AllowDropBox: true, AllowBox: true, AllowGoogleDrive: true, AllowShareFile: true, AllowEgnyte: true, AllowGuestUser: true, AllowScopedPeopleSearchandAccess: false, AllowRoleBasedChatPermissions: false },
+      federation: { Identity: 'Global', AllowFederatedUsers: true, AllowedDomains: 'AllowAllKnownDomains', BlockedDomains: [], AllowTeamsConsumer: true, AllowTeamsConsumerInbound: true, AllowPublicUsers: false, TreatDiscoveredPartnersAsUnverified: false },
+      rules: [{ Name: 'Block executable attachments', State: 'Enabled', Mode: 'Enforce', Priority: 0, Comments: 'Created by previous MSP', FromScope: null, SentToScope: null, PrependSubject: null, ApplyHtmlDisclaimerText: null, ApplyHtmlDisclaimerLocation: null, ApplyHtmlDisclaimerFallbackAction: null, SetSCL: null, AttachmentExtensionMatchesWords: ['exe', 'js', 'vbs'] }],
+      external: { Identity: 'contoso.onmicrosoft.com', Enabled: false, AllowList: [] },
+      org: { Name: 'contoso.onmicrosoft.com', DisplayName: 'Contoso Ltd', AuditDisabled: true, OAuth2ClientProfileEnabled: true, IsDehydrated: false, DefaultPublicFolderAgeLimit: null, CustomerLockboxEnabled: false, MailTipsExternalRecipientsTipsEnabled: false },
+      flags: {}
+    };
+  }
+
+  // ---------- helpers
+  const lc = s => String(s).toLowerCase();
+  const findMbx = (st, id) => st.mailboxes.find(m => [m.Name, m.Alias, m.PrimarySmtpAddress, m.DisplayName].some(x => x && lc(x) === lc(id)));
+  const findGroup = (st, id) => st.groups.find(g => [g.Name, g.Alias, g.PrimarySmtpAddress].some(x => lc(x) === lc(id)));
+  const notFound = (cmd, id) => CmdError(`${cmd} : The operation couldn't be performed because object '${id}' couldn't be found on '${SERVER}'.`);
+  const mustMbx = (st, cmd, id) => { const m = findMbx(st, id); if (!m) throw notFound(cmd, id); return m; };
+  const trustee = (st, cmd, id) => { const g = findGroup(st, id); if (g) return g.Name; const m = findMbx(st, id); if (m) return m.Name; throw notFound(cmd, id); };
+  const mbxView = m => ({
+    Name: m.Name, Alias: m.Alias, DisplayName: m.DisplayName, PrimarySmtpAddress: m.PrimarySmtpAddress, RecipientTypeDetails: m.Type,
+    ArchiveStatus: m.ArchiveStatus, ArchiveName: m.ArchiveStatus === 'Active' ? ['In-Place Archive - ' + m.DisplayName] : [],
+    AutoExpandingArchiveEnabled: m.AutoExpanding, RetentionPolicy: m.RetentionPolicy,
+    IssueWarningQuota: Q(m.quota - 2), ProhibitSendQuota: Q(m.quota - 1), ProhibitSendReceiveQuota: Q(m.quota),
+    LitigationHoldEnabled: false, AuditEnabled: true
+  });
+  const MBX_COLS = ['Name', 'Alias', 'RecipientTypeDetails', 'ProhibitSendQuota'];
+  const statsView = m => ({ DisplayName: m.DisplayName, ItemCount: m.items, TotalItemSize: m.bytes, LastLogonTime: m.last, DeletedItemCount: Math.round(m.items * 0.04), TotalDeletedItemSize: m.bytes * 0.03, StorageLimitStatus: null, _alias: m.Alias });
+  const STATS_FMT = { TotalItemSize: fmtBytes, TotalDeletedItemSize: fmtBytes };
+  const ruleView = r => Object.assign({}, r);
+  const RULE_COLS = ['Name', 'State', 'Mode', 'Priority', 'Comments'];
+  const policyId = id => { if (!id) return 'Global'; if (lc(id) === 'global') return 'Global'; return /^tag:/i.test(id) ? 'Tag:' + id.slice(4) : 'Tag:' + id; };
+  const fedView = f => Object.assign({}, f, { AllowedDomains: Array.isArray(f.AllowedDomains) ? (f.AllowedDomains.length ? f.AllowedDomains.map(d => 'Domain=' + d).join(', ') : '(none)') : f.AllowedDomains });
+  const domainRe = /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+  const BOOL = { type: 'bool' };
+  const AUTO = ['EveryoneInCompany', 'EveryoneInSameAndFederatedCompany', 'EveryoneInCompanyExcludingGuests', 'OrganizerOnly', 'InvitedUsers', 'Everyone'];
+  const ACCESS = ['FullAccess', 'ExternalAccount', 'DeleteItem', 'ReadPermission', 'ChangePermission', 'ChangeOwner'];
+  const ruleParams = {
+    FromScope: { type: 'enum', values: ['InOrganization', 'NotInOrganization'], desc: 'Match messages by where the sender is' },
+    SentToScope: { type: 'enum', values: ['InOrganization', 'NotInOrganization', 'ExternalPartner', 'ExternalNonPartner'] },
+    PrependSubject: { desc: 'Text added to the start of the subject, e.g. "[EXTERNAL] "' },
+    ApplyHtmlDisclaimerText: { desc: 'HTML disclaimer text' },
+    ApplyHtmlDisclaimerLocation: { type: 'enum', values: ['Append', 'Prepend'], desc: 'Default: Append (bottom of the message)' },
+    ApplyHtmlDisclaimerFallbackAction: { type: 'enum', values: ['Wrap', 'Ignore', 'Reject'] },
+    SetSCL: { type: 'int' }, Enabled: BOOL, Mode: { type: 'enum', values: ['Audit', 'AuditAndNotify', 'Enforce'] }, Priority: { type: 'int' }, Comments: {},
+    SenderDomainIs: { type: 'list' }, ExceptIfSenderDomainIs: { type: 'list' }
+  };
+  function applyRule(r, a) {
+    ['FromScope', 'SentToScope', 'PrependSubject', 'ApplyHtmlDisclaimerText', 'ApplyHtmlDisclaimerLocation', 'ApplyHtmlDisclaimerFallbackAction', 'SetSCL', 'Mode', 'Comments', 'SenderDomainIs', 'ExceptIfSenderDomainIs'].forEach(k => { if (a[k] !== undefined) r[k] = a[k]; });
+    if (a.ApplyHtmlDisclaimerText !== undefined && !r.ApplyHtmlDisclaimerLocation) r.ApplyHtmlDisclaimerLocation = 'Append';
+    if (a.ApplyHtmlDisclaimerText !== undefined && !r.ApplyHtmlDisclaimerFallbackAction) r.ApplyHtmlDisclaimerFallbackAction = 'Wrap';
+    if (a.Enabled !== undefined) r.State = a.Enabled ? 'Enabled' : 'Disabled';
+  }
+  const confirmText = (what) => `\nConfirm\nAre you sure you want to perform this action?\n${what}\n[Y] Yes  [A] Yes to All  [N] No  [L] No to All  [?] Help (default is "Y"): Y   (auto-answered in this simulation; add -Confirm:$false to skip)`;
+
+  const commands = lab => {
+    const S = () => lab.state;
+    return {
+      'Connect-ExchangeOnline': { desc: 'Connect to Exchange Online', params: { UserPrincipalName: {}, ShowBanner: { type: 'switch' } }, run: () => ({ text: 'Already connected to Exchange Online as admin.rdg@contoso.onmicrosoft.com.', cls: 'muted' }) },
+      'Connect-MicrosoftTeams': { desc: 'Connect to Microsoft Teams', params: { AccountId: {} }, run: () => ({ text: 'Already connected to Microsoft Teams (tenant contoso.onmicrosoft.com).', cls: 'muted' }) },
+
+      // ---------- Exchange Online
+      'Get-Mailbox': {
+        desc: 'List mailboxes', positional: ['Identity'],
+        params: { Identity: {}, ResultSize: {}, RecipientTypeDetails: { type: 'enum', values: ['UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox'] }, Archive: { type: 'switch', desc: 'Only mailboxes with an archive' } },
+        run: a => {
+          let list = a.Identity ? [mustMbx(S(), 'Get-Mailbox', a.Identity)] : S().mailboxes.slice();
+          if (a.RecipientTypeDetails) list = list.filter(m => m.Type === a.RecipientTypeDetails);
+          if (a.Archive) list = list.filter(m => m.ArchiveStatus === 'Active');
+          return { objects: list.map(mbxView), cols: MBX_COLS };
+        }
+      },
+      'Get-MailboxStatistics': {
+        desc: 'Mailbox size and item counts (accepts pipeline input from Get-Mailbox)', positional: ['Identity'],
+        params: { Identity: {}, Archive: { type: 'switch', desc: 'Statistics for the archive mailbox' } },
+        run: (a, c) => {
+          let list;
+          if (a.Identity) list = [mustMbx(S(), 'Get-MailboxStatistics', a.Identity)];
+          else if (c.input) list = c.input.map(o => findMbx(S(), o.Alias || o._alias || o.Name)).filter(Boolean);
+          else throw CmdError('Get-MailboxStatistics : Cannot process command because of one or more missing mandatory parameters: Identity.\n(Tip: pipe mailboxes in, e.g.  Get-Mailbox | Get-MailboxStatistics)');
+          if (a.Archive) {
+            const noArch = list.find(m => m.ArchiveStatus !== 'Active');
+            if (noArch) throw CmdError(`Get-MailboxStatistics : The specified mailbox "${noArch.Alias}" doesn't have an archive.`);
+            return { objects: list.map(m => ({ DisplayName: 'In-Place Archive - ' + m.DisplayName, ItemCount: 0, TotalItemSize: 0, LastLogonTime: '' })), cols: ['DisplayName', 'ItemCount', 'TotalItemSize', 'LastLogonTime'], fmt: STATS_FMT };
+          }
+          return { objects: list.map(statsView), cols: ['DisplayName', 'ItemCount', 'TotalItemSize', 'LastLogonTime'], fmt: STATS_FMT };
+        }
+      },
+      'New-Mailbox': {
+        desc: 'Create a mailbox (use -Shared for a shared mailbox)', positional: ['Name'],
+        params: { Name: { required: true }, Alias: {}, DisplayName: {}, PrimarySmtpAddress: {}, Shared: { type: 'switch' }, Room: { type: 'switch' }, Equipment: { type: 'switch' }, MicrosoftOnlineServicesID: {}, Password: {}, FirstName: {}, LastName: {} },
+        run: a => {
+          const st = S();
+          if (!a.Shared && !a.Room && !a.Equipment && (!a.MicrosoftOnlineServicesID || !a.Password)) throw CmdError('New-Mailbox : Cannot process command because of one or more missing mandatory parameters: MicrosoftOnlineServicesID Password.\n(User mailboxes need a licensed account. Did you mean a -Shared mailbox?)');
+          const alias = a.Alias || a.Name.replace(/[^A-Za-z0-9._-]/g, '');
+          const smtp = a.PrimarySmtpAddress || alias.toLowerCase() + '@contoso.com';
+          const dom = smtp.split('@')[1] || '';
+          if (!['contoso.com', 'contoso.onmicrosoft.com'].includes(lc(dom))) throw CmdError(`New-Mailbox : The domain '${dom}' isn't an accepted domain for your organization.`);
+          if (st.mailboxes.some(m => lc(m.PrimarySmtpAddress) === lc(smtp)) || st.groups.some(g => lc(g.PrimarySmtpAddress) === lc(smtp))) throw CmdError(`New-Mailbox : The proxy address "SMTP:${smtp}" is already being used by the proxy addresses or LegacyExchangeDN. Please choose another proxy address.`);
+          if (st.mailboxes.some(m => lc(m.Name) === lc(a.Name))) throw CmdError(`New-Mailbox : The name "${a.Name}" is already being used. Please try another name.`);
+          const type = a.Shared ? 'SharedMailbox' : a.Room ? 'RoomMailbox' : a.Equipment ? 'EquipmentMailbox' : 'UserMailbox';
+          const m = { Name: a.Name, Alias: alias, DisplayName: a.DisplayName || a.Name, PrimarySmtpAddress: smtp, Type: type, ArchiveStatus: 'None', AutoExpanding: false, RetentionPolicy: 'Default MRM Policy', quota: type === 'UserMailbox' ? 100 : 50, bytes: 0.0001 * GB, items: 0, last: '', perms: [{ User: 'NT AUTHORITY\\SELF', AccessRights: ['FullAccess', 'ReadPermission'], IsInherited: false }], sendAs: [{ Trustee: 'NT AUTHORITY\\SELF', AccessRights: ['SendAs'] }] };
+          st.mailboxes.push(m);
+          return { objects: [mbxView(m)], cols: MBX_COLS };
+        }
+      },
+      'Set-Mailbox': {
+        desc: 'Change mailbox settings', positional: ['Identity'],
+        params: { Identity: { required: true }, RetentionPolicy: {}, LitigationHoldEnabled: BOOL, DisplayName: {}, Type: { type: 'enum', values: ['Regular', 'Shared', 'Room', 'Equipment'] }, AuditEnabled: BOOL },
+        run: a => {
+          const m = mustMbx(S(), 'Set-Mailbox', a.Identity);
+          if (a.RetentionPolicy !== undefined) { if (!['Default MRM Policy', 'Contoso 2-year archive'].some(p => lc(p) === lc(a.RetentionPolicy))) throw CmdError(`Set-Mailbox : Couldn't find object "${a.RetentionPolicy}". Please make sure that it was spelled correctly or specify a different object.`); m.RetentionPolicy = a.RetentionPolicy; }
+          if (a.DisplayName) m.DisplayName = a.DisplayName;
+          if (a.Type) m.Type = { Regular: 'UserMailbox', Shared: 'SharedMailbox', Room: 'RoomMailbox', Equipment: 'EquipmentMailbox' }[a.Type];
+          return null;
+        }
+      },
+      'Enable-Mailbox': {
+        desc: 'Enable an archive or auto-expanding archive', positional: ['Identity'],
+        params: { Identity: { required: true }, Archive: { type: 'switch' }, AutoExpandingArchive: { type: 'switch' } },
+        run: a => {
+          const m = mustMbx(S(), 'Enable-Mailbox', a.Identity);
+          if (!a.Archive && !a.AutoExpandingArchive) throw CmdError('Enable-Mailbox : In Exchange Online this cmdlet enables archives. Specify -Archive (or -AutoExpandingArchive).');
+          if (a.Archive && m.ArchiveStatus === 'Active') return { text: `WARNING: The mailbox "${m.Alias}" already has an archive.`, cls: 'warn' };
+          m.ArchiveStatus = 'Active'; if (a.AutoExpandingArchive) m.AutoExpanding = true;
+          return { objects: [mbxView(m)], cols: ['Name', 'Alias', 'ArchiveStatus', 'ProhibitSendQuota'] };
+        }
+      },
+      'Get-MailboxPermission': {
+        desc: 'Show mailbox permissions (Full Access, etc.)', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => { const m = mustMbx(S(), 'Get-MailboxPermission', a.Identity); return { objects: m.perms.map(p => ({ Identity: m.Name, User: p.User, AccessRights: p.AccessRights, IsInherited: p.IsInherited, Deny: false })) }; }
+      },
+      'Add-MailboxPermission': {
+        desc: 'Grant mailbox permissions such as Full Access', positional: ['Identity'],
+        params: { Identity: { required: true }, User: { required: true }, AccessRights: { type: 'enumlist', values: ACCESS, required: true }, InheritanceType: { type: 'enum', values: ['All', 'None', 'Descendents', 'SelfAndChildren', 'Children'] }, AutoMapping: BOOL },
+        run: a => {
+          const st = S(); const m = mustMbx(st, 'Add-MailboxPermission', a.Identity); const u = trustee(st, 'Add-MailboxPermission', a.User);
+          const ex = m.perms.find(p => p.User === u);
+          if (ex) a.AccessRights.forEach(r => { if (!ex.AccessRights.includes(r)) ex.AccessRights.push(r); });
+          else m.perms.push({ User: u, AccessRights: a.AccessRights.slice(), IsInherited: false });
+          return { objects: [{ Identity: m.Name, User: u, AccessRights: a.AccessRights, IsInherited: false, Deny: false }] };
+        }
+      },
+      'Remove-MailboxPermission': {
+        desc: 'Remove mailbox permissions', positional: ['Identity'],
+        params: { Identity: { required: true }, User: { required: true }, AccessRights: { type: 'enumlist', values: ACCESS, required: true } },
+        run: a => { const st = S(); const m = mustMbx(st, 'Remove-MailboxPermission', a.Identity); const u = trustee(st, 'Remove-MailboxPermission', a.User); m.perms = m.perms.filter(p => p.User !== u); return null; }
+      },
+      'Get-RecipientPermission': {
+        desc: 'Show Send As permissions', positional: ['Identity'], params: { Identity: { required: true } },
+        run: a => { const m = mustMbx(S(), 'Get-RecipientPermission', a.Identity); return { objects: m.sendAs.map(p => ({ Identity: m.Name, Trustee: p.Trustee, AccessControlType: 'Allow', AccessRights: p.AccessRights, Inherited: false })) }; }
+      },
+      'Add-RecipientPermission': {
+        desc: 'Grant Send As on a recipient', positional: ['Identity'],
+        params: { Identity: { required: true }, Trustee: { required: true }, AccessRights: { type: 'enumlist', values: ['SendAs'], required: true } },
+        run: a => {
+          const st = S(); const m = mustMbx(st, 'Add-RecipientPermission', a.Identity); const t = trustee(st, 'Add-RecipientPermission', a.Trustee);
+          if (!m.sendAs.some(p => p.Trustee === t)) m.sendAs.push({ Trustee: t, AccessRights: ['SendAs'] });
+          const confirmed = a._c.confirm === undefined || /^\$?true$/i.test(String(a._c.confirm)) || a._c.confirm === true;
+          return { pre: confirmed ? confirmText(`Adding recipient permission 'SendAs' for user or group '${t}' on recipient '${m.Name}'.`) : '', objects: [{ Identity: m.Name, Trustee: t, AccessControlType: 'Allow', AccessRights: ['SendAs'], Inherited: false }] };
+        }
+      },
+      'Get-Group': {
+        desc: 'List groups', positional: ['Identity'], params: { Identity: {} },
+        run: a => { const list = a.Identity ? [findGroup(S(), a.Identity)].filter(Boolean) : S().groups; if (a.Identity && !list.length) throw notFound('Get-Group', a.Identity); return { objects: list.map(g => Object.assign({}, g)), cols: ['Name', 'Alias', 'PrimarySmtpAddress', 'RecipientTypeDetails'] }; }
+      },
+      'Get-TransportRule': {
+        desc: 'List mail flow (transport) rules', positional: ['Identity'], params: { Identity: {} },
+        run: a => { let list = S().rules; if (a.Identity) { list = list.filter(r => lc(r.Name) === lc(a.Identity)); if (!list.length) throw notFound('Get-TransportRule', a.Identity); } return { objects: list.map(ruleView), cols: RULE_COLS }; }
+      },
+      'New-TransportRule': {
+        desc: 'Create a mail flow (transport) rule', positional: ['Name'],
+        params: Object.assign({ Name: { required: true } }, ruleParams),
+        run: a => {
+          const st = S();
+          if (st.rules.some(r => lc(r.Name) === lc(a.Name))) throw CmdError(`New-TransportRule : A rule named '${a.Name}' already exists.`);
+          if (!['PrependSubject', 'ApplyHtmlDisclaimerText', 'SetSCL'].some(k => a[k] !== undefined)) throw CmdError('New-TransportRule : A transport rule must have at least one action (for example -PrependSubject, -ApplyHtmlDisclaimerText or -SetSCL).');
+          const r = { Name: a.Name, State: 'Enabled', Mode: 'Enforce', Priority: a.Priority !== undefined ? a.Priority : st.rules.length, Comments: '', FromScope: null, SentToScope: null, PrependSubject: null, ApplyHtmlDisclaimerText: null, ApplyHtmlDisclaimerLocation: null, ApplyHtmlDisclaimerFallbackAction: null, SetSCL: null };
+          applyRule(r, a); st.rules.push(r);
+          return { objects: [ruleView(r)], cols: RULE_COLS };
+        }
+      },
+      'Set-TransportRule': {
+        desc: 'Change a transport rule', positional: ['Identity'],
+        params: Object.assign({ Identity: { required: true }, Name: {} }, ruleParams),
+        run: a => { const r = S().rules.find(x => lc(x.Name) === lc(a.Identity)); if (!r) throw notFound('Set-TransportRule', a.Identity); applyRule(r, a); if (a.Name) r.Name = a.Name; return null; }
+      },
+      'Enable-TransportRule': { desc: 'Enable a transport rule', positional: ['Identity'], params: { Identity: { required: true } }, run: a => { const r = S().rules.find(x => lc(x.Name) === lc(a.Identity)); if (!r) throw notFound('Enable-TransportRule', a.Identity); r.State = 'Enabled'; return null; } },
+      'Disable-TransportRule': { desc: 'Disable a transport rule', positional: ['Identity'], params: { Identity: { required: true } }, run: a => { const r = S().rules.find(x => lc(x.Name) === lc(a.Identity)); if (!r) throw notFound('Disable-TransportRule', a.Identity); r.State = 'Disabled'; return { pre: confirmText(`Disabling transport rule "${r.Name}".`) }; } },
+      'Remove-TransportRule': { desc: 'Delete a transport rule', positional: ['Identity'], params: { Identity: { required: true } }, run: a => { const st = S(); const i = st.rules.findIndex(x => lc(x.Name) === lc(a.Identity)); if (i < 0) throw notFound('Remove-TransportRule', a.Identity); st.rules.splice(i, 1); return { pre: confirmText(`Removing Transport Rule "${a.Identity}".`) }; } },
+      'Get-ExternalInOutlook': { desc: 'Show the native Outlook external-sender tag setting', run: () => ({ objects: [Object.assign({}, S().external)] }) },
+      'Set-ExternalInOutlook': { desc: 'Turn the native Outlook external-sender tag on or off', params: { Enabled: BOOL, AllowList: { type: 'list' } }, run: a => { if (a.Enabled !== undefined) S().external.Enabled = a.Enabled; if (a.AllowList) S().external.AllowList = a.AllowList; return { objects: [Object.assign({}, S().external)] }; } },
+      'Get-OrganizationConfig': { desc: 'Organization-wide Exchange settings', run: () => ({ objects: [Object.assign({}, S().org)], view: 'list' }) },
+      'Set-OrganizationConfig': { desc: 'Change organization-wide Exchange settings', params: { AuditDisabled: BOOL, OAuth2ClientProfileEnabled: BOOL, MailTipsExternalRecipientsTipsEnabled: BOOL }, run: a => { ['AuditDisabled', 'OAuth2ClientProfileEnabled', 'MailTipsExternalRecipientsTipsEnabled'].forEach(k => { if (a[k] !== undefined) S().org[k] = a[k]; }); return null; } },
+
+      // ---------- Teams
+      'Get-CsTeamsMeetingPolicy': {
+        desc: 'Show Teams meeting policies', positional: ['Identity'], params: { Identity: {} },
+        run: a => {
+          const st = S();
+          if (a.Identity) { const p = st.meetingPolicies[policyId(a.Identity)]; if (!p) throw CmdError(`Get-CsTeamsMeetingPolicy : Cannot get policy "${a.Identity}" because it does not exist.`); return { objects: [Object.assign({}, p)], view: 'list' }; }
+          return { objects: Object.values(st.meetingPolicies).map(p => Object.assign({}, p)), view: 'list' };
+        }
+      },
+      'Set-CsTeamsMeetingPolicy': {
+        desc: 'Change a Teams meeting policy (Identity defaults to Global)', positional: ['Identity'],
+        params: { Identity: {}, AllowAnonymousUsersToJoinMeeting: BOOL, AllowAnonymousUsersToStartMeeting: BOOL, AutoAdmittedUsers: { type: 'enum', values: AUTO, desc: 'Who skips the lobby' }, AllowPSTNUsersToBypassLobby: BOOL, AllowCloudRecording: BOOL, AllowTranscription: BOOL, AllowMeetNow: BOOL, AllowExternalParticipantGiveRequestControl: BOOL, AllowExternalNonTrustedMeetingChat: BOOL, DesignatedPresenterRoleMode: { type: 'enum', values: ['EveryoneUserOverride', 'EveryoneInCompanyUserOverride', 'EveryoneInSameAndFederatedCompanyUserOverride', 'OrganizerOnlyUserOverride'] } },
+        run: a => {
+          const p = S().meetingPolicies[policyId(a.Identity)];
+          if (!p) throw CmdError(`Set-CsTeamsMeetingPolicy : Cannot set policy "${a.Identity}" because it does not exist.`);
+          Object.keys(a).forEach(k => { if (!k.startsWith('_') && k !== 'Identity' && k in p) p[k] = a[k]; });
+          return null;
+        }
+      },
+      'Get-CsTeamsMeetingConfiguration': { desc: 'Tenant-wide Teams meeting settings', run: () => ({ objects: [Object.assign({}, S().meetingConfig)], view: 'list' }) },
+      'Set-CsTeamsMeetingConfiguration': { desc: 'Change tenant-wide Teams meeting settings', params: { Identity: {}, DisableAnonymousJoin: BOOL, DisableAppInteractionForAnonymousUsers: BOOL }, run: a => { ['DisableAnonymousJoin', 'DisableAppInteractionForAnonymousUsers'].forEach(k => { if (a[k] !== undefined) S().meetingConfig[k] = a[k]; }); return null; } },
+      'Get-CsTeamsClientConfiguration': { desc: 'Teams client settings (guest access, cloud storage)', positional: ['Identity'], params: { Identity: {} }, run: () => ({ objects: [Object.assign({}, S().clientConfig)], view: 'list' }) },
+      'Set-CsTeamsClientConfiguration': {
+        desc: 'Change Teams client settings', positional: ['Identity'],
+        params: { Identity: {}, AllowGuestUser: BOOL, AllowDropBox: BOOL, AllowBox: BOOL, AllowGoogleDrive: BOOL, AllowShareFile: BOOL, AllowEgnyte: BOOL, AllowEmailIntoChannel: BOOL },
+        run: a => { if (a.Identity && lc(a.Identity) !== 'global') throw CmdError(`Set-CsTeamsClientConfiguration : Cannot find configuration "${a.Identity}". Only Global exists in this tenant.`); Object.keys(a).forEach(k => { if (!k.startsWith('_') && k !== 'Identity') S().clientConfig[k] = a[k]; }); return null; }
+      },
+      'Get-CsTenantFederationConfiguration': { desc: 'Teams external access (federation) settings', run: () => ({ objects: [fedView(S().federation)], view: 'list' }) },
+      'Set-CsTenantFederationConfiguration': {
+        desc: 'Change Teams external access (federation)',
+        params: { Identity: {}, AllowFederatedUsers: BOOL, AllowedDomainsAsAList: { desc: 'e.g. "fabrikam.com" or @{Add="fabrikam.com"}' }, AllowedDomains: { desc: 'AllowAllKnownDomains (to restrict, use -AllowedDomainsAsAList)' }, AllowTeamsConsumer: BOOL, AllowTeamsConsumerInbound: BOOL, AllowPublicUsers: BOOL },
+        run: a => {
+          const f = S().federation;
+          ['AllowFederatedUsers', 'AllowTeamsConsumer', 'AllowTeamsConsumerInbound', 'AllowPublicUsers'].forEach(k => { if (a[k] !== undefined) f[k] = a[k]; });
+          if (a.AllowedDomains !== undefined) {
+            if (lc(a.AllowedDomains) === 'allowallknowndomains') f.AllowedDomains = 'AllowAllKnownDomains';
+            else throw CmdError('Set-CsTenantFederationConfiguration : Cannot convert the value of type "System.String" to type "Microsoft.Rtc.Management.WritableConfig.Policy.Edge.AllowList".\n(Use -AllowedDomainsAsAList to set specific domains.)');
+          }
+          if (a.AllowedDomainsAsAList !== undefined) {
+            const raw = a.AllowedDomainsAsAList.trim();
+            const m = raw.match(/^@\{\s*(Add|Remove|Replace)\s*=\s*(.*?)\s*\}$/i);
+            const list = (m ? m[2] : raw).split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+            list.forEach(d => { if (!domainRe.test(d)) throw CmdError(`Set-CsTenantFederationConfiguration : '${d}' is not a valid domain name.`); });
+            let cur = Array.isArray(f.AllowedDomains) ? f.AllowedDomains.slice() : [];
+            if (m && lc(m[1]) === 'add') list.forEach(d => { if (!cur.includes(lc(d))) cur.push(lc(d)); });
+            else if (m && lc(m[1]) === 'remove') cur = cur.filter(d => !list.map(lc).includes(d));
+            else cur = list.map(lc);
+            f.AllowedDomains = cur;
+          }
+          return null;
+        }
+      }
+    };
+  };
+
+  // ---------- checks
+  const LOBBY_OK = ['EveryoneInCompany', 'EveryoneInCompanyExcludingGuests', 'OrganizerOnly', 'InvitedUsers'];
+  function overMbx(st) { return st.mailboxes.find(m => m.Alias === OVER[st.v]); }
+
+  Lab({
+    id: 'm365-hardening-lab', dialect: 'ps', variants: 3, termTitle: 'Windows PowerShell — ExchangeOnlineManagement 3.6 · MicrosoftTeams 6.7',
+    prompt: 'PS C:\\Users\\rdelagarza> ',
+    banner: 'Windows PowerShell\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nConnected to Exchange Online and Microsoft Teams as admin.rdg@contoso.onmicrosoft.com (tenant: contoso.onmicrosoft.com).\nType "help" for the cmdlets available in this simulation.\n',
+    createState, commands,
+    objectives: [
+      { text: 'Meetings: block anonymous join and make everyone from outside the organization, dial-in callers included, wait in the lobby (Global policy).',
+        check: st => {
+          const p = st.meetingPolicies.Global; const issues = [];
+          if (p.AllowAnonymousUsersToJoinMeeting && !st.meetingConfig.DisableAnonymousJoin) issues.push('anonymous users can still join');
+          if (!LOBBY_OK.includes(p.AutoAdmittedUsers)) issues.push(`external people are auto-admitted (AutoAdmittedUsers = ${p.AutoAdmittedUsers})`);
+          if (p.AllowPSTNUsersToBypassLobby) issues.push('dial-in (PSTN) callers still bypass the lobby');
+          return issues.length ? 'Global meeting policy: ' + issues.join('; ') + '.' : true;
+        },
+        hints: ['Start with <code>Get-CsTeamsMeetingPolicy -Identity Global</code>.', 'Three settings matter: anonymous join, who is auto-admitted past the lobby, and whether phone dial-in callers bypass it.', '<code>Set-CsTeamsMeetingPolicy -Identity Global -AllowAnonymousUsersToJoinMeeting $false -AutoAdmittedUsers EveryoneInCompanyExcludingGuests -AllowPSTNUsersToBypassLobby $false</code>'] },
+      { text: 'Guests: turn off Teams guest access, but keep chat and calls with fabrikam.com, and only fabrikam.com.',
+        check: st => {
+          const f = st.federation; const issues = [];
+          if (st.clientConfig.AllowGuestUser) issues.push('guest access is still on');
+          if (!f.AllowFederatedUsers) issues.push('external access (federation) is off, so fabrikam.com can\'t reach you');
+          else if (!Array.isArray(f.AllowedDomains)) issues.push('federation is open to all known domains');
+          else if (f.AllowedDomains.length !== 1 || f.AllowedDomains[0] !== 'fabrikam.com') issues.push(`allowed domains are [${f.AllowedDomains.join(', ')}]`);
+          if (f.AllowTeamsConsumer) issues.push('people with personal Teams accounts can still contact users');
+          return issues.length ? issues.join('; ') + '.' : true;
+        },
+        hints: ['In Teams, guest access and external access (federation) are separate settings.', 'Guest access is in the Teams <em>client</em> configuration; external access is the <em>tenant federation</em> configuration. Personal (consumer) Teams accounts are a separate switch again.', '<code>Set-CsTeamsClientConfiguration -Identity Global -AllowGuestUser $false</code>, then <code>Set-CsTenantFederationConfiguration -AllowFederatedUsers $true -AllowedDomainsAsAList "fabrikam.com" -AllowTeamsConsumer $false</code>'] },
+      { text: 'Mail: inbound mail from outside the organization must carry a visible external-sender warning at the top.',
+        check: st => {
+          if (st.external.Enabled) return true;
+          const r = st.rules.find(x => x.FromScope === 'NotInOrganization' && (x.PrependSubject || x.ApplyHtmlDisclaimerText));
+          if (!r) return 'No enabled rule matches external senders with a warning action.';
+          if (r.State !== 'Enabled') return `Rule "${r.Name}" is disabled.`;
+          if (r.Mode !== 'Enforce') return `Rule "${r.Name}" is in ${r.Mode} mode, so it only logs and doesn't change messages.`;
+          if (!r.PrependSubject && r.ApplyHtmlDisclaimerLocation !== 'Prepend') return `Rule "${r.Name}" adds its disclaimer at the bottom of the message (Append), where nobody reads it.`;
+          return true;
+        },
+        hints: ['Mail flow (transport) rules can match on where the sender is.', 'The sender condition is <code>-FromScope</code>. The action can prepend a subject tag or an HTML disclaimer (mind its location).', '<code>New-TransportRule -Name "External sender warning" -FromScope NotInOrganization -SentToScope InOrganization -PrependSubject "[EXTERNAL] "</code>'] },
+      { text: 'Shared mailbox: create <code>support@contoso.com</code> and give the Support Team group Full Access and Send As.',
+        check: st => {
+          const m = st.mailboxes.find(x => lc(x.PrimarySmtpAddress) === 'support@contoso.com');
+          if (!m) return 'support@contoso.com doesn\'t exist yet.';
+          if (m.Type !== 'SharedMailbox') return 'support@contoso.com exists but isn\'t a shared mailbox.';
+          const fa = m.perms.some(p => p.User === 'Support Team' && p.AccessRights.includes('FullAccess'));
+          const sa = m.sendAs.some(p => p.Trustee === 'Support Team');
+          if (!fa && !sa) return 'The Support Team group has no permissions on the mailbox yet.';
+          if (!fa) return 'Send As is granted, but Full Access is missing.';
+          if (!sa) return 'Full Access is granted, but Send As is missing.';
+          return true;
+        },
+        hints: ['Shared mailboxes are created with <code>New-Mailbox</code> plus a switch.', 'Full Access is a <em>mailbox</em> permission and Send As is a <em>recipient</em> permission, so they\'re set with two different cmdlets.', '<code>New-Mailbox -Shared -Name Support -PrimarySmtpAddress support@contoso.com</code>; <code>Add-MailboxPermission -Identity support -User "Support Team" -AccessRights FullAccess</code>; <code>Add-RecipientPermission -Identity support -Trustee "Support Team" -AccessRights SendAs</code>'] },
+      { text: 'Storage: one mailbox is over its 98 GB warning quota. Find it and enable its archive.',
+        check: st => overMbx(st).ArchiveStatus === 'Active' || 'The mailbox that\'s over its warning quota still has no archive.',
+        hints: ['<code>Get-Mailbox</code> doesn\'t show sizes; mailbox <em>statistics</em> do.', 'Pipe the mailboxes into <code>Get-MailboxStatistics</code> and sort by <code>TotalItemSize</code>.', '<code>Get-Mailbox | Get-MailboxStatistics | Sort-Object TotalItemSize -Descending</code>, then <code>Enable-Mailbox -Identity &lt;alias&gt; -Archive</code>'] },
+      { text: 'The previous admin turned off mailbox auditing for the whole organization. Turn it back on.', optional: true,
+        check: st => !st.org.AuditDisabled || 'Organization-wide mailbox auditing is still disabled.',
+        hints: ['It\'s an organization-level Exchange setting.', '<code>Get-OrganizationConfig | Format-List Audit*</code>', '<code>Set-OrganizationConfig -AuditDisabled $false</code>'] }
+    ],
+    solution(st) {
+      const over = OVER[st.v];
+      return [
+        { cmd: 'Get-CsTeamsMeetingPolicy -Identity Global | Format-List AllowAnonymous*,AutoAdmittedUsers,AllowPSTN*', note: 'Check the Global meeting policy first: anonymous join is on and everyone skips the lobby.' },
+        { cmd: 'Set-CsTeamsMeetingPolicy -Identity Global -AllowAnonymousUsersToJoinMeeting $false -AutoAdmittedUsers EveryoneInCompanyExcludingGuests -AllowPSTNUsersToBypassLobby $false', note: 'Block anonymous join and lobby everyone external. Dial-in callers count as external too.' },
+        { cmd: 'Set-CsTeamsClientConfiguration -Identity Global -AllowGuestUser $false', note: 'Guest access (people added to teams) is a client setting…' },
+        { cmd: 'Set-CsTenantFederationConfiguration -AllowFederatedUsers $true -AllowedDomainsAsAList "fabrikam.com" -AllowTeamsConsumer $false', note: '…while external access (federation) is a tenant setting. Restrict it to the partner and close personal Teams accounts.' },
+        { cmd: 'New-TransportRule -Name "External sender warning" -FromScope NotInOrganization -SentToScope InOrganization -PrependSubject "[EXTERNAL] "', note: 'Mail flow rule: anything from outside the org gets a visible subject tag.' },
+        { cmd: 'New-Mailbox -Shared -Name Support -PrimarySmtpAddress support@contoso.com', note: 'Shared mailboxes need no license, which is the right fit for support@.' },
+        { cmd: 'Add-MailboxPermission -Identity support -User "Support Team" -AccessRights FullAccess -InheritanceType All', note: 'Full Access is a mailbox permission…' },
+        { cmd: 'Add-RecipientPermission -Identity support -Trustee "Support Team" -AccessRights SendAs -Confirm:$false', note: '…Send As is a recipient permission, set with a different cmdlet.' },
+        { cmd: 'Get-Mailbox | Get-MailboxStatistics | Sort-Object TotalItemSize -Descending | Select-Object -First 3', note: 'Sizes live in mailbox statistics. Sort to find who is close to the 100 GB limit.' },
+        { cmd: `Enable-Mailbox -Identity ${over} -Archive`, note: 'Enable the archive. The Default MRM Policy moves older items there, so mail keeps flowing.' },
+        { cmd: 'Set-OrganizationConfig -AuditDisabled $false', note: 'Bonus: turn org-wide mailbox auditing back on.' }
+      ];
+    },
+    debrief: [
+      { title: 'Dial-in callers are external too', text: 'Locking the lobby with <code>AutoAdmittedUsers</code> but leaving <code>AllowPSTNUsersToBypassLobby</code> on still lets anyone with the dial-in number straight into the meeting.' },
+      { title: 'Guest access ≠ external access', text: 'Guests are invited into your teams (client config). External access lets other tenants chat and call your users (federation). Personal Teams accounts are a third switch. Clients often only mean one of these when they say "turn off external".' },
+      { title: 'Warnings belong at the top', text: 'A disclaimer appended at the bottom, or a rule left in Audit mode, looks done in the admin center but protects nobody. Microsoft\'s native <code>Set-ExternalInOutlook</code> tag is a good complement.' },
+      { title: 'Two permission models', text: 'Full Access is a mailbox permission (<code>Add-MailboxPermission</code>); Send As is an Active Directory recipient permission (<code>Add-RecipientPermission</code>). Granting one and assuming the other is a classic post-migration ticket.' },
+      { title: 'Find the problem with data', text: '<code>Get-Mailbox | Get-MailboxStatistics | Sort-Object TotalItemSize -Descending</code> answers "who is about to stop receiving mail" in one line, across any number of users.' },
+      { title: 'Repeatable over clicked', text: 'Every change here is a script line. That means the same hardening can be applied to the next tenant, reviewed in a change request, and audited later.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

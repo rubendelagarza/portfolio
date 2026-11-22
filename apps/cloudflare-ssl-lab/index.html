@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: HTTPS with a Cloudflare origin certificate — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 14</div>
+    <h1>Lab: HTTPS with a Cloudflare origin certificate</h1>
+    <p>Put the site behind Cloudflare and encrypt the whole path: edge certificate for visitors, a Cloudflare Origin CA certificate on nginx, and SSL mode Full (strict). Avoid the redirect loops and 52x errors along the way.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">Cloudflare · nginx · openssl</span><span class="pill">3 randomized starting points</span><span class="pill">Part 2 of 3</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> end-to-end TLS behind a CDN: proxied DNS, Cloudflare SSL modes, origin certificates and private-key handling on Linux, and locking an origin down to the CDN's IP ranges. Continues from Lab 13, where the app is already running behind nginx.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Cloudflare dashboard</strong> <span class="muted">· simulation</span></span><span class="muted">example-shop.com</span></div>
+          <div style="padding:12px 16px">
+            <div class="tabs"><button type="button" class="active" id="cf-tab-dns" data-cft="dns">DNS</button><button type="button" id="cf-tab-ssl" data-cft="ssl">SSL/TLS</button></div>
+            <div data-cfp="dns">
+              <table class="data" id="cf-records" style="font-size:12px"><thead><tr><th>Type</th><th>Name</th><th>Content</th><th>Proxy status</th><th></th></tr></thead><tbody></tbody></table>
+              <div class="row mt-16" style="gap:8px;align-items:flex-end">
+                <div style="width:90px"><label for="cf-type">Type</label><select id="cf-type"><option>A</option><option>CNAME</option></select></div>
+                <div style="width:110px"><label for="cf-name">Name</label><input type="text" id="cf-name" placeholder="app" /></div>
+                <div style="flex:1"><label for="cf-content">IPv4 address / target</label><input type="text" id="cf-content" /></div>
+                <label class="row" style="gap:6px;color:var(--text);font-size:13px;margin:0 0 8px"><input type="checkbox" id="cf-proxied" checked /> Proxied</label>
+                <button type="button" class="sm" id="cf-add">Save</button>
+              </div>
+              <div id="cf-dns-msg" class="inline-msg"></div>
+            </div>
+            <div data-cfp="ssl" hidden>
+              <div class="mock-section"><h4>Encryption mode</h4>
+                <div class="check-list">
+                  <label><input type="radio" name="cf-mode" id="cf-mode-off" value="off" /> Off (not secure)</label>
+                  <label><input type="radio" name="cf-mode" id="cf-mode-flexible" value="flexible" /> Flexible: HTTPS to visitors, HTTP to your origin</label>
+                  <label><input type="radio" name="cf-mode" id="cf-mode-full" value="full" /> Full: HTTPS to your origin, any certificate accepted</label>
+                  <label><input type="radio" name="cf-mode" id="cf-mode-strict" value="strict" /> Full (strict): HTTPS to your origin, certificate must be valid (publicly trusted or Cloudflare Origin CA)</label>
+                </div></div>
+              <div class="mock-section"><h4>Edge certificates</h4><label class="row" style="gap:8px;color:var(--text);font-size:13px;margin:0"><input type="checkbox" id="cf-always" /> Always Use HTTPS (redirect all http:// requests at the edge)</label></div>
+              <div class="mock-section"><h4>Origin Server: create certificate</h4>
+                <label for="cf-hosts">Hostnames (one per line)</label><textarea id="cf-hosts" rows="2" style="font-family:var(--mono);font-size:12px;width:100%;padding:6px;border:1px solid var(--border-strong);border-radius:4px">*.example-shop.com
+example-shop.com</textarea>
+                <p class="muted" style="font-size:12px;margin:6px 0">Private key type RSA (2048) · validity 15 years · signed by Cloudflare Origin CA (trusted by Cloudflare only).</p>
+                <button type="button" class="sm" id="cf-create-cert">Create</button>
+                <div id="cf-cert-out" hidden class="mt-16">
+                  <label>Origin certificate (PEM)</label><textarea id="cf-cert-pem" readonly rows="4" class="editor" style="min-height:90px"></textarea>
+                  <label class="mt-16">Private key (PEM) <span style="color:var(--danger)">shown only once: copy it now</span></label><textarea id="cf-key-pem" readonly rows="4" class="editor" style="min-height:90px"></textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="browser-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Work order</h3>
+          <p style="font-size:14px">Contoso Shop is live on <code>web01</code> (203.0.113.50) over plain HTTP. Move <code>app.example-shop.com</code> behind Cloudflare with HTTPS end to end: visitors → Cloudflare <em>and</em> Cloudflare → origin. You're in an SSH session as <code>ruben</code>.</p>
+          <p class="muted" style="font-size:12px;margin:0" id="vnote"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Cloudflare IPv4 ranges</h3>
+          <pre class="ref" style="max-height:170px">173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22</pre>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 14 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim; const esc = Lab.util.esc;
+  const IP = '203.0.113.50', OLD = '198.51.100.77', LAPTOP = '198.51.100.23', HOST = 'app.example-shop.com', CF_EDGE = '172.68.10.20';
+  const CF_RANGES = ['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'];
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+  document.getElementById('browser-slot').innerHTML = L.browserHtml('Your laptop · browser');
+  const b64 = n => Array.from({ length: n }, () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[Math.floor(Math.random() * 64)]).join('');
+  const pem = (label, lines) => `-----BEGIN ${label}-----\n${Array.from({ length: lines }, () => b64(64)).join('\n')}\n${b64(24)}==\n-----END ${label}-----\n`;
+  const SITE80 = `server {\n    listen 80;\n    server_name ${HOST};\n\n    location / {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n`;
+  const SITE_REDIRECT = `# Started HTTPS setup (unfinished) - previous admin\nserver {\n    listen 80;\n    server_name ${HOST};\n    return 301 https://$host$request_uri;\n}\n`;
+  const SITE_FINAL = `server {\n    listen 80;\n    server_name ${HOST};\n    return 301 https://$host$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    server_name ${HOST};\n\n    ssl_certificate     /etc/ssl/cloudflare/${HOST}.pem;\n    ssl_certificate_key /etc/ssl/cloudflare/${HOST}.key;\n\n    location / {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n`;
+  const UNIT = '[Unit]\nDescription=Contoso Shop web app\nAfter=network.target\n\n[Service]\nUser=shopapp\nGroup=shopapp\nEnvironment=PORT=3000\nWorkingDirectory=/opt/shopapp\nExecStart=/opt/shopapp/bin/shopapp\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n';
+
+  function createState(v) {
+    const fs = L.baseFs('ruben');
+    fs['/opt/shopapp'] = L.d(); fs['/opt/shopapp/bin'] = L.d(); fs['/opt/shopapp/bin/shopapp'] = L.f('#!/usr/bin/env python3\n', 'root', 'root', 0o755);
+    fs['/etc/systemd/system/shopapp.service'] = L.f(UNIT);
+    const snake = { cert: pem('CERTIFICATE', 14), key: pem('PRIVATE KEY', 20), kind: 'snakeoil', hosts: ['web01'] };
+    fs['/etc/ssl/certs/ssl-cert-snakeoil.pem'] = L.f(snake.cert, 'root', 'root', 0o644);
+    fs['/etc/ssl/private/ssl-cert-snakeoil.key'] = L.f(snake.key, 'root', 'ssl-cert', 0o640);
+    const users = L.baseUsers('ruben'); users.shopapp = { uid: 998, groups: ['shopapp'], shell: '/usr/sbin/nologin', system: true };
+    const st = { v, fs, cwd: '/home/ruben', users, units: { shopapp: UNIT }, packages: ['ufw', 'curl', 'python3', 'openssh-server', 'nginx', 'openssl'], certPairs: [snake],
+      services: { ssh: { installed: true, active: true, enabled: true }, ufw: { installed: true, active: true, enabled: true }, cron: { installed: true, active: true, enabled: true } },
+      ufw: { enabled: true, defaultIn: 'deny', rules: [{ action: 'ALLOW', from: 'Anywhere', app: 'OpenSSH' }, { action: 'ALLOW', from: 'Anywhere', app: 'Nginx Full' }] },
+      cf: { records: [{ id: 'c1', type: 'A', name: '@', content: '203.0.113.80', proxied: true }, { id: 'c2', type: 'CNAME', name: 'www', content: 'example-shop.com', proxied: true }], mode: v === 1 ? 'full' : 'flexible', always: false, origin: [], nextId: 5 },
+      flags: {} };
+    L.installNginx(st);
+    st.fs['/etc/nginx/sites-available/shopapp'] = L.f(v === 2 ? SITE_REDIRECT : SITE80);
+    st.fs['/etc/nginx/sites-enabled/shopapp'] = L.l('/etc/nginx/sites-available/shopapp');
+    st.nginxLive = L.nginxTest(st);
+    st.services.shopapp = { installed: true, custom: true, active: true, enabled: true, listen: { addr: '127.0.0.1', port: 3000 }, unit: L.parseUnit(UNIT), env: { PORT: '3000' } };
+    if (v === 0) st.cf.records.push({ id: 'c3', type: 'A', name: 'app', content: IP, proxied: false });
+    if (v === 1) st.cf.records.push({ id: 'c3', type: 'A', name: 'app', content: OLD, proxied: true });
+    return st;
+  }
+
+  // ---------- model
+  function upstream(st, host, port) { const a = st.services.shopapp; return ['127.0.0.1', 'localhost'].includes(host) && a && a.active && a.listen.port === port ? { status: 200, title: 'Contoso Shop', body: '<!doctype html><title>Contoso Shop</title><h1>Contoso Shop</h1>', shop: true } : null; }
+  const coversHost = hosts => hosts.some(h => h === HOST || (h.startsWith('*.') && HOST.endsWith(h.slice(1)) && HOST.split('.').length === h.split('.').length));
+  function originCertOf(st, srv) {
+    if (!srv || !srv.cert) return null; const n = L.get(st, srv.cert); if (!n) return null;
+    return st.certPairs.find(p => L.pemEq(p.cert, n.c)) || { kind: 'unknown', hosts: [] };
+  }
+  const appRec = st => st.cf.records.find(r => r.name === 'app' && (r.type === 'A' || r.type === 'CNAME'));
+  function fetchOnce(st, scheme, path) {
+    const rec = appRec(st); const mode = st.cf.mode;
+    if (!rec) return { page: { secure: false, html: L.errorPage('This site can\'t be reached', `Check if there is a typo in ${HOST}.`, 'DNS_PROBE_FINISHED_NXDOMAIN') } };
+    if (rec.proxied) {
+      if (scheme === 'http' && st.cf.always && mode !== 'off') return { redirect: `https://${HOST}${path}`, by: 'edge' };
+      if (scheme === 'https' && mode === 'off') return { page: { secure: false, html: L.errorPage('This site can\'t provide a secure connection', `${HOST} uses an unsupported protocol.`, 'ERR_SSL_VERSION_OR_CIPHER_MISMATCH') } };
+      const secure = scheme === 'https';
+      if (rec.type !== 'A' || rec.content !== IP) return { page: { secure, html: L.cfErrorPage(522, 'Connection timed out', 'Cloudflare couldn\'t reach the origin server. The DNS record points to an address that isn\'t answering.') }, code: 522 };
+      const oScheme = scheme === 'https' && (mode === 'full' || mode === 'strict') ? 'https' : 'http';
+      const r = L.http(st, { scheme: oScheme, host: HOST, port: oScheme === 'https' ? 443 : 80, path, from: CF_EDGE, local: false }, upstream);
+      if (r.err === 'timeout') return { page: { secure, html: L.cfErrorPage(522, 'Connection timed out', `Cloudflare's connection to the origin on port ${r.port} timed out (firewall?).`) }, code: 522 };
+      if (r.err === 'refused') return { page: { secure, html: L.cfErrorPage(521, 'Web server is down', `The origin refused the connection on port ${r.port}.`) }, code: 521 };
+      if (r.err === 'tlsproto') return { page: { secure, html: L.cfErrorPage(525, 'SSL handshake failed', 'Cloudflare couldn\'t negotiate TLS with the origin on port 443.') }, code: 525 };
+      if (oScheme === 'https' && mode === 'strict') { const c = originCertOf(st, r.srv); if (!c || c.kind !== 'cf' || !coversHost(c.hosts)) return { page: { secure, html: L.cfErrorPage(526, 'Invalid SSL certificate', c && c.kind === 'snakeoil' ? 'The origin presented a self-signed certificate, which Full (strict) rejects.' : 'The origin certificate isn\'t valid for this hostname or isn\'t trusted.') }, code: 526 }; }
+      if ((r.status === 301 || r.status === 302) && r.headers && r.headers.Location) return { redirect: r.headers.Location, by: 'origin' };
+      return { page: { secure, html: r.shop ? L.shopPage() : `<div class="br-page"><h4>${esc(r.title || r.status)}</h4></div>` }, ok: !!r.shop, secure };
+    }
+    if (rec.content !== IP) return { page: { secure: false, html: L.errorPage('This site can\'t be reached', `${HOST} took too long to respond.`, 'ERR_CONNECTION_TIMED_OUT') } };
+    const r = L.http(st, { scheme, host: HOST, port: scheme === 'https' ? 443 : 80, path, from: LAPTOP, local: false }, upstream);
+    if (r.err === 'timeout') return { page: { secure: false, html: L.errorPage('This site can\'t be reached', `${HOST} took too long to respond.`, 'ERR_CONNECTION_TIMED_OUT') } };
+    if (r.err) return { page: { secure: false, html: L.errorPage('This site can\'t be reached', `${HOST} refused to connect.`, scheme === 'https' ? 'ERR_SSL_PROTOCOL_ERROR' : 'ERR_CONNECTION_REFUSED') } };
+    if (scheme === 'https') return { page: { secure: 'bad', html: L.errorPage('Your connection is not private', 'Attackers might be trying to steal your information. The certificate is not trusted by your browser (Cloudflare Origin CA and self-signed certificates are only meant to sit behind Cloudflare).', 'NET::ERR_CERT_AUTHORITY_INVALID') } };
+    if ((r.status === 301 || r.status === 302) && r.headers && r.headers.Location) return { redirect: r.headers.Location, by: 'origin' };
+    return { page: { secure: false, html: r.shop ? L.shopPage() : `<div class="br-page"><h4>${esc(r.title || r.status)}</h4></div>` }, ok: !!r.shop };
+  }
+  function visit(st, url) {
+    let hops = 0; let cur = url;
+    while (hops < 10) {
+      const m = cur.match(/^(https?):\/\/([^/:]+)(?::\d+)?(\/.*)?$/i);
+      if (!m) return { final: cur, page: { secure: false, html: L.errorPage('Invalid address', '', '') } };
+      if (m[2].toLowerCase() !== HOST) return { final: cur, page: { secure: false, html: L.errorPage('This site can\'t be reached', `Check if there is a typo in ${esc(m[2])}.`, 'DNS_PROBE_FINISHED_NXDOMAIN') } };
+      const r = fetchOnce(st, m[1].toLowerCase(), m[3] || '/');
+      if (r.redirect) { cur = r.redirect; hops++; continue; }
+      return Object.assign({ final: cur, hops }, r);
+    }
+    return { final: cur, loop: true, page: { secure: true, html: L.errorPage('This page isn\'t working', `${HOST} redirected you too many times.`, 'ERR_TOO_MANY_REDIRECTS') } };
+  }
+  function browse(st, url) { if (!/^https?:\/\//.test(url)) url = 'http://' + url; const r = visit(st, url); const page = Object.assign({ url: r.final }, r.page); if (r.ok && r.final.startsWith('https://') && r.page.secure === true) st.flags.httpsSeen = true; return page; }
+  const keyNode = st => { const live = st.nginxLive && L.nginxRoute(st.nginxLive, 443, HOST); return live && live.key ? L.get(st, live.key) : null; };
+
+  // ---------- commands
+  const cfg = {
+    user: 'ruben', home: '/home/ruben', host: 'web01', ip: IP, adminIp: LAPTOP,
+    packages: {},
+    start: (st, name, unit, env) => (name === 'nginx' ? L.nginxStart(st) : name === 'shopapp' ? { ok: true, listen: { addr: '127.0.0.1', port: +(env.PORT || 3000) } } : { ok: true }),
+    reload: (st, name) => (name === 'nginx' ? L.nginxReload(st) : { ok: true }),
+    listeners: st => L.nginxListeners(st).concat(st.services.shopapp.active ? [{ addr: '127.0.0.1', port: 3000, proc: 'shopapp' }] : []),
+    curl: (st, toks) => L.curl(st, toks, { hosts: { [HOST]: (appRec(st) && appRec(st).proxied) ? '104.21.48.7' : (appRec(st) || {}).content }, ip: IP, upstream,
+      remote: (st2, q) => { const r = visit(st2, `${q.scheme}://${q.host}${q.path}`); const ok = r.ok; return { text: ok ? (q.headOnly || q.incl ? `HTTP/2 200\nserver: cloudflare\ncf-ray: 8e4f1a2b3c4d5e6f-QRO\ncontent-type: text/html; charset=utf-8\n` : '<!doctype html><title>Contoso Shop</title><h1>Contoso Shop</h1>') : `(request through Cloudflare failed: ${r.loop ? 'too many redirects' : r.code ? 'Cloudflare error ' + r.code : 'see the browser panel for details'})`, cls: ok ? '' : 'warn' }; },
+      tls: (st2, r, req, insecure) => { if (insecure) return null; const c = originCertOf(st2, r.srv); return `curl: (60) SSL certificate problem: ${c && c.kind === 'cf' ? 'unable to get local issuer certificate' : 'self-signed certificate'}\nMore details here: https://curl.se/docs/sslcerts.html\n(The origin certificate is only trusted by Cloudflare: use -k to test the origin directly.)`; } }),
+    extra: (lab, who) => ({
+      openssl: {
+        raw: true, desc: 'Inspect a certificate: openssl x509 -in FILE -noout -subject -issuer -dates -ext subjectAltName',
+        run: a => {
+          const st = lab.state; const t = a._pos;
+          if (t[0] !== 'x509') throw Lab.CmdError('Only "openssl x509 -in FILE -noout ..." is supported in this simulation.');
+          const fi = t.indexOf('-in'); const p = L.norm(t[fi + 1] || '', st.cwd, '/home/ruben'); const r = L.resolve(st, p);
+          if (!r.node) throw Lab.CmdError(`Could not open file or uri for loading certificate from ${t[fi + 1]}: No such file or directory`);
+          if (!L.can(st, who(), r.node, 'r')) throw Lab.CmdError(`Could not open file or uri for loading certificate from ${t[fi + 1]}: Permission denied`);
+          const pair = st.certPairs.find(x => L.pemEq(x.cert, r.node.c));
+          if (!pair) throw Lab.CmdError('Could not read certificate from ' + t[fi + 1] + '\nUnable to load certificate (is it a PEM certificate?)');
+          const cf = pair.kind === 'cf'; const out = [];
+          if (t.includes('-subject')) out.push(cf ? 'subject=O = "CloudFlare, Inc.", OU = CloudFlare Origin CA, CN = CloudFlare Origin Certificate' : 'subject=CN = web01');
+          if (t.includes('-issuer')) out.push(cf ? 'issuer=C = US, O = "CloudFlare, Inc.", OU = CloudFlare Origin SSL Certificate Authority, L = San Francisco, ST = California' : 'issuer=CN = web01');
+          if (t.includes('-dates')) out.push(cf ? 'notBefore=Nov 20 19:30:00 2026 GMT\nnotAfter=Nov 16 19:30:00 2041 GMT' : 'notBefore=Apr 25 10:12:03 2024 GMT\nnotAfter=Apr 23 10:12:03 2034 GMT');
+          if (t.includes('subjectAltName')) out.push('X509v3 Subject Alternative Name: \n    ' + pair.hosts.map(h => 'DNS:' + h).join(', '));
+          return out.join('\n') || '(add -subject, -issuer, -dates or -ext subjectAltName)';
+        }
+      }
+    })
+  };
+
+  // ---------- Cloudflare panel
+  let lab; const $ = s => document.querySelector(s); const S = () => lab.state;
+  document.querySelectorAll('[data-cft]').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('[data-cft]').forEach(x => x.classList.toggle('active', x === b)); document.querySelectorAll('[data-cfp]').forEach(p => { p.hidden = p.dataset.cfp !== b.dataset.cft; }); }));
+  $('#cf-add').addEventListener('click', () => {
+    const st = S(); const name = ($('#cf-name').value.trim().toLowerCase().replace(/\.example-shop\.com\.?$/, '') || '@'); const content = $('#cf-content').value.trim(); const type = $('#cf-type').value;
+    const m = (t, c) => { $('#cf-dns-msg').textContent = t; $('#cf-dns-msg').className = 'inline-msg ' + c; };
+    if (type === 'A' && !Lab.net.isIp(content)) return m('Content for A record must be a valid IPv4 address. (Code: 9005)', 'err');
+    if (st.cf.records.some(r => r.name === name)) return m('An A, AAAA, or CNAME record with that host already exists. Edit or delete it. (Code: 81053)', 'err');
+    st.cf.records.push({ id: 'c' + st.cf.nextId++, type, name, content, proxied: $('#cf-proxied').checked });
+    m(`Added ${type} ${name}${$('#cf-proxied').checked ? ' (proxied)' : ' (DNS only)'}.`, 'ok'); $('#cf-name').value = ''; $('#cf-content').value = '';
+    lab.touch(); lab.refresh();
+  });
+  $('#cf-records').addEventListener('click', e => {
+    const st = S(); const d = e.target.closest('[data-del]'), p = e.target.closest('[data-px]');
+    if (d) st.cf.records = st.cf.records.filter(r => r.id !== d.dataset.del);
+    if (p) { const r = st.cf.records.find(x => x.id === p.dataset.px); r.proxied = !r.proxied; }
+    if (d || p) { lab.touch(); lab.refresh(); }
+  });
+  document.querySelectorAll('[name="cf-mode"]').forEach(r => r.addEventListener('change', () => { S().cf.mode = r.value; lab.touch(); lab.refresh(); }));
+  $('#cf-always').addEventListener('change', e => { S().cf.always = e.target.checked; lab.touch(); lab.refresh(); });
+  $('#cf-create-cert').addEventListener('click', () => {
+    const st = S(); const hosts = $('#cf-hosts').value.split(/[\n,]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+    const pair = { cert: pem('CERTIFICATE', 18), key: pem('PRIVATE KEY', 26), kind: 'cf', hosts };
+    st.certPairs.push(pair); st.cf.origin.push(pair);
+    $('#cf-cert-pem').value = pair.cert; $('#cf-key-pem').value = pair.key; $('#cf-cert-out').hidden = false;
+    lab.touch(); lab.refresh();
+  });
+
+  function render(st) {
+    $('#cf-records tbody').innerHTML = st.cf.records.map(r => `<tr><td><b>${r.type}</b></td><td class="mono">${esc(r.name)}</td><td class="mono">${esc(r.content)}</td><td><button type="button" class="ghost sm" data-px="${r.id}" id="cf-px-${r.id}">${r.proxied ? '🟠 Proxied' : '⚪ DNS only'}</button></td><td><button type="button" class="ghost sm" data-del="${r.id}" id="cf-del-${r.id}">Delete</button></td></tr>`).join('');
+    document.querySelectorAll('[name="cf-mode"]').forEach(r => { r.checked = r.value === st.cf.mode; });
+    $('#cf-always').checked = st.cf.always;
+  }
+  function onReset(st) {
+    document.getElementById('ed-panel').hidden = true; $('#cf-cert-out').hidden = true; $('#cf-cert-pem').value = ''; $('#cf-key-pem').value = '';
+    $('#cf-hosts').value = '*.example-shop.com\nexample-shop.com'; $('#cf-name').value = ''; $('#cf-content').value = ''; $('#cf-dns-msg').textContent = '';
+    $('#br-url').value = 'https://' + HOST; $('#br-view').innerHTML = '<div class="muted" style="padding:20px">Press Go to load the site.</div>';
+    $('#vnote').textContent = st.v === 1 ? 'Heads-up: the site was hosted elsewhere before this server.' : st.v === 2 ? 'Heads-up: the previous admin started an HTTPS setup on the server and didn\'t finish it.' : '';
+  }
+
+  lab = Lab({
+    id: 'cloudflare-ssl-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@203.0.113.50 — web01',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@web01:${st.cwd === '/home/ruben' ? '~' : st.cwd.replace(/^\/home\/ruben/, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nLast login: Fri Nov 20 19:31:40 2026 from 198.51.100.23\nType "help" for the commands available in this simulation.\n',
+    createState, commands: lab => L.commands(lab, cfg), render, onReset,
+    objectives: [
+      { text: 'DNS: <code>app.example-shop.com</code> points to 203.0.113.50 and is proxied through Cloudflare.',
+        check: st => { const r = appRec(st); if (!r) return 'There\'s no DNS record for app yet.'; if (r.type !== 'A' || r.content !== IP) return `The app record points to ${r.content}, not this server.`; return r.proxied || 'The record is DNS only, so visitors bypass Cloudflare (no edge certificate, no protection).'; },
+        hints: ['Look at the DNS tab: is there an app record, where does it point, and is it proxied?', 'Proxied (orange cloud) means visitors connect to Cloudflare, which gets the edge certificate and forwards to your origin.', 'Make the record A <code>app</code> → <code>203.0.113.50</code> with Proxied on (delete and re-add a wrong record).'] },
+      { text: 'Install a Cloudflare Origin CA certificate on nginx for the site on port 443, with the private key readable only by root.',
+        check: st => {
+          const live = st.nginxLive && L.nginxRoute(st.nginxLive, 443, HOST);
+          const disk = L.nginxRoute(L.nginxTest(st), 443, HOST);
+          if (!live || !live.listen.some(l => l.port === 443 && l.ssl)) return disk ? 'The 443 server block exists on disk, but nginx hasn\'t loaded it (test, then reload).' : 'nginx has no HTTPS (listen 443 ssl) server block for app.example-shop.com.';
+          const c = originCertOf(st, live); if (!c || c.kind !== 'cf') return c && c.kind === 'snakeoil' ? 'nginx is using the self-signed snakeoil certificate, not a Cloudflare Origin CA certificate.' : 'The certificate nginx uses isn\'t a Cloudflare Origin CA certificate.';
+          if (!coversHost(c.hosts)) return 'The origin certificate doesn\'t cover app.example-shop.com.';
+          const k = keyNode(st); if (!k) return 'The key file is missing.';
+          if (k.o !== 'root' || (k.m & 0o077) !== 0) return `The private key is ${L.modeStr(k)} ${k.o}:${k.g}. It should be owned by root and not readable by group or others (chmod 600).`;
+          return true;
+        },
+        hints: ['Create the certificate in Cloudflare (SSL/TLS → Origin Server), then put the certificate and the key in files on the server.', 'Use sudo nano to paste each PEM into its own file, e.g. under /etc/ssl/cloudflare. New files are world-readable by default, so fix the key\'s mode. Then add a <code>listen 443 ssl</code> server block that references both files.', '<code>sudo mkdir -p /etc/ssl/cloudflare</code>, <code>sudo nano /etc/ssl/cloudflare/app.example-shop.com.pem</code> (cert) and <code>.key</code> (key), <code>sudo chmod 600 /etc/ssl/cloudflare/app.example-shop.com.key</code>, edit <code>/etc/nginx/sites-available/shopapp</code> to add the 443 server, <code>sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code>'] },
+      { text: 'SSL mode is Full (strict) and <code>https://app.example-shop.com</code> loads the app with a valid padlock.',
+        check: st => {
+          if (st.cf.mode !== 'strict') return `SSL mode is ${st.cf.mode}: ${st.cf.mode === 'flexible' ? 'the Cloudflare → origin leg is unencrypted' : st.cf.mode === 'full' ? 'Cloudflare doesn\'t validate the origin certificate' : 'HTTPS is off'}.`;
+          const r = visit(st, `https://${HOST}/`);
+          if (!(r.ok && r.page.secure === true)) return r.code ? `Through Cloudflare the site shows error ${r.code}.` : r.loop ? 'The site redirects in a loop.' : 'The site doesn\'t load over HTTPS yet.';
+          return st.flags.httpsSeen || 'It should work now: load https://app.example-shop.com in the browser to confirm.';
+        },
+        hints: ['Flexible encrypts only browser → Cloudflare. Full encrypts to the origin but accepts any certificate. Full (strict) validates it.', 'Strict needs the origin to present a certificate that\'s valid for the hostname and trusted by Cloudflare, which is exactly what an Origin CA certificate is.', 'SSL/TLS → Full (strict), then load <code>https://app.example-shop.com</code> in the browser panel.'] },
+      { text: '<code>http://app.example-shop.com</code> ends up on HTTPS, with no redirect loop.',
+        check: st => { const r = visit(st, `http://${HOST}/`); if (r.loop) return 'http:// requests loop (ERR_TOO_MANY_REDIRECTS).'; return (r.ok && r.final.startsWith('https://')) || (r.ok ? 'http:// still serves the site unencrypted.' : 'http:// doesn\'t reach the site.'); },
+        hints: ['Redirect at the edge, at the origin, or both, but think about what each SSL mode sends to the origin.', 'With Flexible, Cloudflare talks HTTP to the origin, so an origin "redirect to HTTPS" bounces forever. With Full (strict) an origin redirect is fine; "Always Use HTTPS" redirects at the edge.', 'Turn on SSL/TLS → Always Use HTTPS (and/or keep <code>return 301 https://$host$request_uri;</code> on port 80 with Full (strict)).'] },
+      { text: 'Lock the origin down so web traffic is only accepted from Cloudflare\'s IP ranges (SSH stays reachable).', optional: true,
+        check: st => {
+          if (st.flags.lockout) return 'You locked yourself out at some point.';
+          const r = visit(st, `https://${HOST}/`); if (!r.ok) return 'The site must keep working through Cloudflare.';
+          if (L.ufwAllows(st, '192.0.2.77', 443) || L.ufwAllows(st, '192.0.2.77', 80)) return 'Port 80/443 is still open to the whole internet.';
+          const miss = CF_RANGES.filter(c => !L.ufwAllows(st, Lab.net.intToIp(Lab.net.parseCidr(c).base + 1), 443));
+          return !miss.length || `${miss.length} Cloudflare range(s) can't reach port 443.`;
+        },
+        hints: ['Replace the "allow from anywhere" web rule with rules for the Cloudflare ranges listed in the side panel.', 'With Always Use HTTPS on, only 443 is needed from Cloudflare. <code>;</code> lets you chain commands on one line.', '<code>sudo ufw delete allow \'Nginx Full\'</code>, then <code>sudo ufw allow from 173.245.48.0/20 to any port 443 proto tcp</code> for each range.'] }
+    ],
+    solution(st) {
+      const s = [];
+      s.push({ note: 'DNS first: the app record must point at this server and be proxied.', run: api => api.click('#cf-tab-dns') });
+      if (st.v === 0) s.push({ run: api => api.click('#cf-px-c3'), note: 'It\'s DNS only, so switch it to Proxied.' });
+      if (st.v === 1) s.push({ run: api => api.click('#cf-del-c3'), note: 'It still points to the old server (Cloudflare would show 522). Replace it.' });
+      if (st.v !== 0) s.push({ run: api => api.fill('#cf-type', 'A') }, { run: api => api.fill('#cf-name', 'app') }, { run: api => api.fill('#cf-content', IP) }, { run: api => api.check('#cf-proxied', true) }, { run: api => api.click('#cf-add') });
+      s.push({ note: 'Create a Cloudflare Origin CA certificate: trusted by Cloudflare, valid for 15 years, covering *.example-shop.com.', run: api => api.click('#cf-tab-ssl') }, { run: api => api.click('#cf-create-cert') });
+      s.push({ cmd: 'sudo mkdir -p /etc/ssl/cloudflare', note: 'On the server: store the certificate and key.' }, { cmd: `sudo nano /etc/ssl/cloudflare/${HOST}.pem` }, { run: api => api.fill('#ed-text', api.state.cf.origin[0].cert, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: `sudo nano /etc/ssl/cloudflare/${HOST}.key`, note: 'The private key is shown only once in Cloudflare. Paste it straight into a root-owned file.' }, { run: api => api.fill('#ed-text', api.state.cf.origin[0].key, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: `ls -l /etc/ssl/cloudflare`, note: 'New files are world-readable (644). A private key must not be.' }, { cmd: `sudo chmod 600 /etc/ssl/cloudflare/${HOST}.key` });
+      s.push({ cmd: 'sudo nano /etc/nginx/sites-available/shopapp', note: 'nginx: redirect port 80 to HTTPS, and serve the app on 443 with the origin certificate.' }, { run: api => api.fill('#ed-text', SITE_FINAL, { instant: true }) }, { run: api => api.click('#ed-save') });
+      s.push({ cmd: 'sudo nginx -t' }, { cmd: 'sudo systemctl reload nginx' }, { cmd: `openssl x509 -in /etc/ssl/cloudflare/${HOST}.pem -noout -issuer -dates -ext subjectAltName`, note: 'Confirm what nginx now presents: issued by Cloudflare Origin CA, covering *.example-shop.com.' });
+      s.push({ note: 'Cloudflare: Full (strict) validates the origin certificate, so the whole path is encrypted and verified.', run: api => api.check('#cf-mode-strict', true) }, { run: api => api.check('#cf-always', true), note: 'Always Use HTTPS redirects http:// at the edge.' });
+      s.push({ note: 'Check in the browser: https with a valid padlock.', run: async api => { await api.fill('#br-url', `https://${HOST}`); await api.click('#br-go'); }, wait: 900 });
+      s.push({ cmd: "sudo ufw delete allow 'Nginx Full'", note: 'Bonus: close 80/443 to the world and allow only Cloudflare to reach 443 (SSH stays open).' });
+      s.push({ cmd: CF_RANGES.map(c => `sudo ufw allow from ${c} to any port 443 proto tcp`).join('; ') });
+      s.push({ cmd: 'sudo ufw status' });
+      return s;
+    },
+    debrief: [
+      { title: 'Proxied is what gives you HTTPS at the edge', text: 'A DNS-only record sends visitors straight to the origin. Proxied records get Cloudflare\'s edge certificate, caching and protection, and hide the origin IP.' },
+      { title: 'Flexible isn\'t end-to-end', text: 'Flexible shows a padlock while the Cloudflare → origin leg is plain HTTP. It also loops forever if the origin redirects to HTTPS. Full (strict) is the only mode that encrypts and verifies the whole path.' },
+      { title: 'Origin CA certificates are for behind Cloudflare', text: 'Free and valid for 15 years, but trusted only by Cloudflare. Hit the origin directly and browsers reject them. That\'s why the record must stay proxied.' },
+      { title: 'Protect the private key', text: 'A new file is 644 (world-readable). Any local user or compromised service could copy the key. <code>chmod 600</code>, owned by root: nginx\'s master process reads it as root before dropping privileges.' },
+      { title: '52x errors tell you which leg broke', text: '521 = origin refused, 522 = timed out (firewall or wrong IP), 525 = TLS handshake failed, 526 = invalid origin certificate under strict. Each one points at a different layer.' },
+      { title: 'Only the CDN should reach the origin', text: 'Allowing 443 only from Cloudflare\'s ranges stops people bypassing the CDN (and its WAF) by connecting straight to the server\'s IP.' }
+    ]
+  });
+  L.attachEditor(lab);
+  L.attachBrowser(lab, browse, () => null);
+})();
+</script>
+</body>
+</html>

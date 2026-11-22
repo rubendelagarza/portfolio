@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Repair a broken VPC peering — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 06</div>
+    <h1>Lab: Repair a broken VPC peering</h1>
+    <p>An app in one VPC can't reach an API in a peered VPC. Diagnose it from Cloud Shell, fix it without weakening security, and prove the fix.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~8 min</span><span class="pill">gcloud</span><span class="pill">3 randomized faults</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the Google Cloud networking cases I resolved at Infosys: peering state, firewall evaluation order, and using Connectivity Tests to prove where a packet dies.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Customer case 51820419</h3>
+          <p style="font-size:14px">"Our app on <code>app-1</code> (prod-vpc) can't call the orders API on <code>api-1</code> (shared-vpc) over HTTPS. We set up peering last week. Everything is in project <code>contoso-prod</code>."</p>
+          <p class="muted" style="font-size:13px;margin:0">Note: <code>deny-legacy-10-8</code> is owned by the security team. Don't modify or delete it.</p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Environment</h3>
+          <table class="brief">
+            <tr><th>VM</th><th>Network</th><th>IP</th><th>Tags</th></tr>
+            <tr><td>app-1</td><td>prod-vpc</td><td>10.10.1.5</td><td>app</td></tr>
+            <tr><td>api-1</td><td>shared-vpc</td><td>10.20.1.8</td><td>api</td></tr>
+          </table>
+          <dl class="facts" style="margin-top:10px">
+            <dt>prod-vpc</dt><dd>10.10.0.0/16</dd>
+            <dt>shared-vpc</dt><dd>10.20.0.0/16</dd>
+            <dt>Zone</dt><dd>us-central1-a</dd>
+            <dt>API</dt><dd>HTTPS on TCP 443</dd>
+          </dl>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 06 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/gcp-common.js"></script>
+<script>
+(function () {
+  const { CmdError, net } = Lab;
+  const G = GcpSim;
+  const PROJECT = 'contoso-prod';
+  const ZONE = 'us-central1-a';
+
+  const fw = (o) => Object.assign({ direction: 'INGRESS', action: 'ALLOW', sourceTags: [], targetTags: [], destinationRanges: [], priority: 1000, disabled: false, description: '', created: '2026-11-12T10:21:43.000-08:00' }, o);
+
+  function createState(v) {
+    const firewalls = [
+      fw({ name: 'prod-allow-iap-ssh', network: 'prod-vpc', rules: [{ proto: 'tcp', ports: [[22, 22]] }], sourceRanges: ['35.235.240.0/20'] }),
+      fw({ name: 'shared-allow-iap-ssh', network: 'shared-vpc', rules: [{ proto: 'tcp', ports: [[22, 22]] }], sourceRanges: ['35.235.240.0/20'] }),
+      fw({ name: 'deny-legacy-10-8', network: 'shared-vpc', action: 'DENY', rules: [{ proto: 'all', ports: null }], sourceRanges: ['10.0.0.0/8'], priority: 900, targetTags: v === 2 ? [] : ['legacy'], description: 'Owned by SecOps. Blocks legacy 10/8 ranges. Do not modify.', owner: 'security' })
+    ];
+    if (v === 1) firewalls.push(fw({ name: 'shared-allow-prod-api', network: 'shared-vpc', rules: [{ proto: 'tcp', ports: [[8443, 8443]] }], sourceRanges: ['10.10.0.0/16'], description: 'Orders API from prod' }));
+    if (v === 2) firewalls.push(fw({ name: 'shared-allow-prod-api', network: 'shared-vpc', rules: [{ proto: 'tcp', ports: [[443, 443]] }], sourceRanges: ['10.10.0.0/16'], description: 'Orders API from prod' }));
+    const peerings = [{ network: 'prod-vpc', name: 'prod-to-shared', peer: 'shared-vpc', importCustom: false, exportCustom: false }];
+    if (v !== 0) peerings.push({ network: 'shared-vpc', name: 'shared-to-prod', peer: 'prod-vpc', importCustom: false, exportCustom: false });
+    const legacy = firewalls.find(f => f.name === 'deny-legacy-10-8');
+    return {
+      v,
+      networks: [{ name: 'prod-vpc' }, { name: 'shared-vpc' }],
+      subnets: [
+        { name: 'prod-app', network: 'prod-vpc', region: 'us-central1', range: '10.10.1.0/24' },
+        { name: 'shared-api', network: 'shared-vpc', region: 'us-central1', range: '10.20.1.0/24' }
+      ],
+      instances: [
+        { name: 'app-1', zone: ZONE, network: 'prod-vpc', ip: '10.10.1.5', tags: ['app'], listens: [] },
+        { name: 'api-1', zone: ZONE, network: 'shared-vpc', ip: '10.20.1.8', tags: ['api'], listens: [443] }
+      ],
+      peerings, firewalls, tests: {},
+      legacySnapshot: JSON.stringify(legacy),
+      flags: {}
+    };
+  }
+
+  // ---------- network model
+  const peeringActive = (st, a, b) => st.peerings.some(p => p.network === a && p.peer === b) && st.peerings.some(p => p.network === b && p.peer === a);
+  const instByIp = (st, ip) => st.instances.find(i => i.ip === ip);
+  function trace(st, src, dstIp, proto, port) {
+    const steps = [{ step: 'START_FROM_INSTANCE', detail: `${src.name} (${src.ip}) in ${src.network}` }];
+    steps.push({ step: 'APPLY_EGRESS_FIREWALL_RULE', detail: 'Implied rule: allow all egress' });
+    const dst = instByIp(st, dstIp);
+    const dstSubnet = st.subnets.find(s => net.contains(s.range, dstIp));
+    if (!dst || !dstSubnet) { steps.push({ step: 'DROP', detail: 'NO_ROUTE — destination is not in any known subnet', drop: true }); return { ok: false, steps, reason: 'no_route' }; }
+    if (dstSubnet.network !== src.network) {
+      if (!peeringActive(st, src.network, dstSubnet.network)) {
+        steps.push({ step: 'DROP', detail: `NO_ROUTE — no route to ${dstSubnet.range}. Peering between ${src.network} and ${dstSubnet.network} is not ACTIVE, so subnet routes are not exchanged.`, drop: true });
+        return { ok: false, steps, reason: 'no_route' };
+      }
+      steps.push({ step: 'APPLY_ROUTE', detail: `Peering subnet route ${dstSubnet.range} via network peering to ${dstSubnet.network}` });
+    } else steps.push({ step: 'APPLY_ROUTE', detail: `Subnet route ${dstSubnet.range}` });
+    const ev = G.evalIngress(st.firewalls, { network: dst.network, srcIp: src.ip, srcNetwork: src.network, srcTags: src.tags, tags: dst.tags, proto, port });
+    if (!ev.allowed) {
+      steps.push({ step: 'APPLY_INGRESS_FIREWALL_RULE', detail: ev.rule ? `${ev.rule.name} (priority ${ev.rule.priority}, ${ev.rule.action})` : 'Implied rule: deny all ingress' });
+      steps.push({ step: 'DROP', detail: ev.rule ? `FIREWALL_RULE — denied by ${ev.rule.name}` : 'FIREWALL_RULE — no ALLOW rule matched, implied deny-all ingress applied', drop: true });
+      return { ok: false, steps, reason: 'firewall', rule: ev.rule };
+    }
+    steps.push({ step: 'APPLY_INGRESS_FIREWALL_RULE', detail: `${ev.rule.name} (priority ${ev.rule.priority}, ALLOW)` });
+    steps.push({ step: 'ARRIVE_AT_INSTANCE', detail: `${dst.name} (${dst.ip})` });
+    if (proto === 'tcp' && !dst.listens.includes(port)) { steps.push({ step: 'DELIVER', detail: `Packet delivered, but nothing is listening on TCP ${port} (connection refused)` }); return { ok: false, steps, reason: 'refused', rule: ev.rule }; }
+    steps.push({ step: 'DELIVER', detail: 'Packet delivered to the instance' });
+    return { ok: true, steps, rule: ev.rule };
+  }
+  const goodPath = st => trace(st, st.instances[0], '10.20.1.8', 'tcp', 443);
+
+  function runOnVm(lab, inst, command) {
+    const st = lab.state; const toks = Lab.util.tokenize(command); const tool = (toks[0] || '').toLowerCase();
+    const hostPort = (u) => {
+      const m = String(u).match(/^(?:(https?):\/\/)?([^/:]+)(?::(\d+))?/i);
+      if (!m) return null; const port = m[3] ? +m[3] : (m[1] && m[1].toLowerCase() === 'http' ? 80 : 443);
+      return { host: m[2], port };
+    };
+    if (tool === 'curl') {
+      const url = toks.slice(1).find(t => !t.startsWith('-'));
+      if (!url) return { text: 'curl: try \'curl --help\' for more information', cls: 'err' };
+      const hp = hostPort(url); if (!hp || !net.isIp(hp.host)) return { text: `curl: (6) Could not resolve host: ${hp ? hp.host : url}`, cls: 'err' };
+      const t = trace(st, inst, hp.host, 'tcp', hp.port);
+      if (t.ok) {
+        if (hp.host === '10.20.1.8' && hp.port === 443) lab.flag('proved');
+        const verbose = toks.includes('-v') || toks.includes('-I') || toks.includes('-i');
+        return { text: (verbose ? 'HTTP/1.1 200 OK\ncontent-type: application/json\nserver: orders-api/2.3\n\n' : '') + '{"service":"orders-api","status":"ok","region":"us-central1"}', cls: 'ok' };
+      }
+      if (t.reason === 'refused') return { text: `curl: (7) Failed to connect to ${hp.host} port ${hp.port} after 2 ms: Connection refused`, cls: 'err' };
+      return { text: `curl: (28) Failed to connect to ${hp.host} port ${hp.port} after 130002 ms: Connection timed out`, cls: 'err' };
+    }
+    if (tool === 'nc') {
+      const args = toks.slice(1).filter(t => !t.startsWith('-'));
+      if (args.length < 2) return { text: 'usage: nc -zv <host> <port>', cls: 'err' };
+      const t = trace(st, inst, args[0], 'tcp', +args[1]);
+      if (t.ok) { if (args[0] === '10.20.1.8' && +args[1] === 443) lab.flag('proved'); return { text: `Connection to ${args[0]} ${args[1]} port [tcp/https] succeeded!`, cls: 'ok' }; }
+      if (t.reason === 'refused') return { text: `nc: connect to ${args[0]} port ${args[1]} (tcp) failed: Connection refused`, cls: 'err' };
+      return { text: `nc: connect to ${args[0]} port ${args[1]} (tcp) failed: Connection timed out`, cls: 'err' };
+    }
+    if (tool === 'ping') {
+      const host = toks.slice(1).filter(t => !t.startsWith('-') && !/^\d+$/.test(t))[0];
+      if (!host) return { text: 'ping: usage error: Destination address required', cls: 'err' };
+      const t = trace(st, inst, host, 'icmp');
+      return t.ok ? { text: `PING ${host} 56(84) bytes of data.\n64 bytes from ${host}: icmp_seq=1 ttl=64 time=1.21 ms\n64 bytes from ${host}: icmp_seq=2 ttl=64 time=0.98 ms\n64 bytes from ${host}: icmp_seq=3 ttl=64 time=1.02 ms\n\n--- ${host} ping statistics ---\n3 packets transmitted, 3 received, 0% packet loss` }
+        : { text: `PING ${host} 56(84) bytes of data.\n\n--- ${host} ping statistics ---\n3 packets transmitted, 0 received, 100% packet loss, time 2049ms`, cls: 'warn' };
+    }
+    return { text: `bash: ${tool}: command not found on ${inst.name} (supported here: curl, nc, ping)`, cls: 'err' };
+  }
+
+  const peeringRow = (st, p) => {
+    const active = peeringActive(st, p.network, p.peer);
+    return { NAME: p.name, NETWORK: p.network, PEER_PROJECT: PROJECT, PEER_NETWORK: p.peer, IMPORT_CUSTOM_ROUTES: p.importCustom ? 'True' : 'False', EXPORT_CUSTOM_ROUTES: p.exportCustom ? 'True' : 'False', STATE: active ? 'ACTIVE' : 'INACTIVE', STATE_DETAILS: active ? '[2026-11-20T08:01:12.000-08:00]: Connected.' : '[2026-11-13T15:44:02.000-08:00]: Waiting for peer network to connect.' };
+  };
+
+  const commands = lab => Object.assign({
+    'gcloud compute networks list': { desc: 'List VPC networks', run: () => G.table(lab.state.networks.map(n => ({ NAME: n.name, SUBNET_MODE: 'CUSTOM', BGP_ROUTING_MODE: 'REGIONAL', IPV4_RANGE: '', GATEWAY_IPV4: '' }))) },
+    'gcloud compute networks subnets list': {
+      desc: 'List subnets', params: { network: {}, regions: {} },
+      run: a => G.table(lab.state.subnets.filter(s => !a.network || s.network === a.network).map(s => ({ NAME: s.name, REGION: s.region, NETWORK: s.network, RANGE: s.range, STACK_TYPE: 'IPV4_ONLY' })))
+    },
+    'gcloud compute networks peerings list': {
+      desc: 'List VPC Network Peering connections', params: { network: { desc: 'Only show peerings of this network' } },
+      run: a => {
+        const rows = lab.state.peerings.filter(p => !a.network || p.network === a.network);
+        if (!rows.length) return { text: 'Listed 0 items.' };
+        return G.table(rows.map(p => peeringRow(lab.state, p)));
+      }
+    },
+    'gcloud compute networks peerings create': {
+      desc: 'Create one side of a VPC Network Peering', positional: ['NAME'],
+      params: { NAME: { posOnly: true, required: true }, network: { required: true, desc: 'The local network' }, 'peer-network': { required: true, desc: 'The network to peer with' }, 'peer-project': { desc: 'Defaults to the current project' }, 'export-custom-routes': { type: 'switch' }, 'import-custom-routes': { type: 'switch' }, 'export-subnet-routes-with-public-ip': { type: 'switch' }, 'import-subnet-routes-with-public-ip': { type: 'switch' }, 'auto-create-routes': { type: 'switch', desc: 'Deprecated; ignored' } },
+      run: a => {
+        const st = lab.state; const cmd = 'gcloud compute networks peerings create';
+        if (a['peer-project'] && a['peer-project'] !== PROJECT) throw G.invalid(cmd, `Could not fetch resource:\n - The resource 'projects/${a['peer-project']}/global/networks/${a['peer-network']}' was not found`);
+        [a.network, a['peer-network']].forEach(n => { if (!st.networks.some(x => x.name === n)) throw G.notFound(cmd, PROJECT, 'global/networks/' + n); });
+        if (a.network === a['peer-network']) throw G.invalid(cmd, 'Could not fetch resource:\n - A network can\'t be peered with itself.');
+        if (st.peerings.some(p => p.network === a.network && p.name === a.NAME)) throw G.invalid(cmd, `Could not fetch resource:\n - There is already a peering named '${a.NAME}' on network '${a.network}'.`);
+        if (st.peerings.some(p => p.network === a.network && p.peer === a['peer-network'])) throw G.invalid(cmd, `Could not fetch resource:\n - There is already a peering between '${a.network}' and '${a['peer-network']}'.`);
+        const p = { network: a.network, name: a.NAME, peer: a['peer-network'], importCustom: !!a['import-custom-routes'], exportCustom: !!a['export-custom-routes'] };
+        st.peerings.push(p);
+        return { pre: `Updated [${G.url(PROJECT, 'global/networks/' + a.network)}].`, objects: [peeringRow(st, p)], style: 'gcloud' };
+      }
+    },
+    'gcloud compute networks peerings delete': {
+      desc: 'Delete one side of a peering', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, network: { required: true } },
+      run: a => {
+        const st = lab.state; const i = st.peerings.findIndex(p => p.network === a.network && p.name === a.NAME);
+        if (i < 0) throw G.invalid('gcloud compute networks peerings delete', `Could not fetch resource:\n - There is no peering named '${a.NAME}' on network '${a.network}'.`);
+        st.peerings.splice(i, 1);
+        return { text: `Updated [${G.url(PROJECT, 'global/networks/' + a.network)}].` };
+      }
+    },
+    'gcloud compute instances list': {
+      desc: 'List VM instances',
+      run: () => G.table(lab.state.instances.map(i => ({ NAME: i.name, ZONE: i.zone, MACHINE_TYPE: 'e2-standard-2', PREEMPTIBLE: '', INTERNAL_IP: i.ip, EXTERNAL_IP: '', STATUS: 'RUNNING' })))
+    },
+    'gcloud compute instances describe': {
+      desc: 'Show a VM (network, IP, tags)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true }, zone: {} },
+      run: a => {
+        const i = lab.state.instances.find(x => x.name === a.NAME); if (!i) throw G.notFound('gcloud compute instances describe', PROJECT, `zones/${ZONE}/instances/${a.NAME}`);
+        return G.yaml({ name: i.name, zone: G.url(PROJECT, 'zones/' + ZONE), machineType: 'e2-standard-2', status: 'RUNNING', networkInterfaces: [{ network: G.url(PROJECT, 'global/networks/' + i.network), networkIP: i.ip, subnetwork: G.url(PROJECT, 'regions/us-central1/subnetworks/' + (i.network === 'prod-vpc' ? 'prod-app' : 'shared-api')) }], tags: { items: i.tags } });
+      }
+    },
+    'gcloud compute ssh': {
+      desc: 'Run a command on a VM over SSH (use --command)', positional: ['INSTANCE'],
+      params: { INSTANCE: { posOnly: true, required: true }, zone: {}, command: { desc: 'Command to run on the VM, e.g. "curl -sk https://10.20.1.8"' }, 'tunnel-through-iap': { type: 'switch' } },
+      run: a => {
+        const name = a.INSTANCE.replace(/^.*@/, '');
+        const inst = lab.state.instances.find(i => i.name === name);
+        if (!inst) throw G.notFound('gcloud compute ssh', PROJECT, `zones/${a.zone || ZONE}/instances/${name}`);
+        if (a.zone && a.zone !== ZONE) throw G.notFound('gcloud compute ssh', PROJECT, `zones/${a.zone}/instances/${name}`);
+        if (!a.command) throw CmdError('Interactive SSH sessions aren\'t available in this simulation. Pass a command, e.g.\n  gcloud compute ssh app-1 --zone=us-central1-a --command="curl -sk https://10.20.1.8"');
+        const res = runOnVm(lab, inst, a.command);
+        if (!a.zone) res.pre = `No zone specified. Using zone [${ZONE}] for instance: [${name}].`;
+        return res;
+      }
+    },
+    'gcloud network-management connectivity-tests create': {
+      desc: 'Run a Connectivity Test (configuration analysis)', positional: ['NAME'],
+      params: { NAME: { posOnly: true, required: true }, 'source-instance': { desc: 'Instance name or projects/P/zones/Z/instances/NAME' }, 'source-ip-address': {}, 'destination-instance': {}, 'destination-ip-address': {}, 'destination-port': { type: 'int' }, protocol: { type: 'enum', values: ['TCP', 'UDP', 'ICMP', 'ESP', 'AH', 'SCTP', 'IPIP'] } },
+      run: a => {
+        const st = lab.state; const cmd = 'gcloud network-management connectivity-tests create';
+        if (st.tests[a.NAME]) throw G.invalid(cmd, `Resource 'projects/${PROJECT}/locations/global/connectivityTests/${a.NAME}' already exists`);
+        const srcName = a['source-instance'] ? a['source-instance'].split('/').pop() : null;
+        const src = srcName ? st.instances.find(i => i.name === srcName) : st.instances.find(i => i.ip === a['source-ip-address']);
+        if (!src) throw G.invalid(cmd, 'INVALID_ARGUMENT: provide --source-instance (or --source-ip-address of a VM in this project).');
+        const dstName = a['destination-instance'] ? a['destination-instance'].split('/').pop() : null;
+        const dst = dstName ? st.instances.find(i => i.name === dstName) : null;
+        const dstIp = dst ? dst.ip : a['destination-ip-address'];
+        if (!dstIp) throw G.invalid(cmd, 'INVALID_ARGUMENT: provide --destination-ip-address or --destination-instance.');
+        const proto = (a.protocol || 'TCP').toLowerCase(); const port = a['destination-port'] || (proto === 'tcp' ? 80 : undefined);
+        st.tests[a.NAME] = { src: src.name, dstIp, proto, port };
+        const t = trace(st, src, dstIp, proto, port);
+        if (t.ok && dstIp === '10.20.1.8' && proto === 'tcp' && port === 443) lab.flag('proved');
+        const last = t.steps[t.steps.length - 1];
+        return { text: `Create request issued for: [${a.NAME}]\nWaiting for operation [projects/${PROJECT}/locations/global/operations/operation-1732118${Math.floor(Math.random() * 900000 + 100000)}] to complete...done.\nCreated connectivity test [${a.NAME}].\n\nResult: ${t.ok ? 'REACHABLE' : 'UNREACHABLE'}${t.ok ? '' : ' — ' + last.detail}\nRun  gcloud network-management connectivity-tests describe ${a.NAME}  for the full trace.`, cls: t.ok ? 'ok' : 'warn' };
+      }
+    },
+    'gcloud network-management connectivity-tests describe': {
+      desc: 'Show a Connectivity Test result and trace (re-analyzed against current config)', positional: ['NAME'], params: { NAME: { posOnly: true, required: true } },
+      run: a => {
+        const st = lab.state; const t0 = st.tests[a.NAME];
+        if (!t0) throw G.invalid('gcloud network-management connectivity-tests describe', `NOT_FOUND: Resource 'projects/${PROJECT}/locations/global/connectivityTests/${a.NAME}' was not found`);
+        const src = st.instances.find(i => i.name === t0.src);
+        const t = trace(st, src, t0.dstIp, t0.proto, t0.port);
+        if (t.ok && t0.dstIp === '10.20.1.8' && t0.proto === 'tcp' && t0.port === 443) lab.flag('proved');
+        return G.yaml({
+          name: `projects/${PROJECT}/locations/global/connectivityTests/${a.NAME}`,
+          protocol: t0.proto.toUpperCase(),
+          source: { instance: `projects/${PROJECT}/zones/${ZONE}/instances/${src.name}`, ipAddress: src.ip },
+          destination: { ipAddress: t0.dstIp, port: t0.port },
+          reachabilityDetails: { result: t.ok ? 'REACHABLE' : 'UNREACHABLE', verifyTime: new Date().toISOString(), traces: [{ steps: t.steps.map(s => ({ state: s.step, description: s.detail })) }] }
+        });
+      }
+    },
+    'gcloud network-management connectivity-tests rerun': {
+      desc: 'Re-run a Connectivity Test', positional: ['NAME'], params: { NAME: { posOnly: true, required: true } },
+      run: (a, c) => {
+        const t0 = lab.state.tests[a.NAME]; if (!t0) throw G.invalid('gcloud network-management connectivity-tests rerun', `NOT_FOUND: connectivity test '${a.NAME}' was not found`);
+        const src = lab.state.instances.find(i => i.name === t0.src); const t = trace(lab.state, src, t0.dstIp, t0.proto, t0.port);
+        if (t.ok && t0.dstIp === '10.20.1.8' && t0.proto === 'tcp' && t0.port === 443) lab.flag('proved');
+        return { text: `Rerun request issued for: [${a.NAME}]\nWaiting for operation to complete...done.\n\nResult: ${t.ok ? 'REACHABLE' : 'UNREACHABLE — ' + t.steps[t.steps.length - 1].detail}`, cls: t.ok ? 'ok' : 'warn' };
+      }
+    },
+    'gcloud config list': { desc: 'Show the active gcloud configuration', run: () => `[core]\naccount = ruben@contoso-partner.com\nproject = ${PROJECT}\n\nYour active configuration is: [default]` }
+  }, G.firewallCommands({ project: () => PROJECT, state: () => lab.state }));
+
+  Lab({
+    id: 'gcp-diagnostics', dialect: 'bash', variants: 3, termTitle: 'Cloud Shell — contoso-prod',
+    prompt: `ruben@cloudshell:~ (${PROJECT})$ `,
+    banner: `Welcome to Cloud Shell! Type "help" to get started.\nYour Cloud Platform project in this session is set to ${PROJECT}.\nUse "gcloud config set project [PROJECT_ID]" to change to a different project.\n`,
+    createState, commands,
+    objectives: [
+      { text: 'Peering between <code>prod-vpc</code> and <code>shared-vpc</code> is ACTIVE on both sides.',
+        check: st => peeringActive(st, 'prod-vpc', 'shared-vpc') || 'The peering isn\'t ACTIVE in both directions.',
+        hints: ['List the peerings and look at the STATE column.', 'Peering is a two-sided handshake: each network needs its own peering that points at the other one.', '<code>gcloud compute networks peerings create shared-to-prod --network=shared-vpc --peer-network=prod-vpc</code>'] },
+      { text: 'shared-vpc\'s firewall lets TCP 443 from app-1 into api-1 (rule priorities included).',
+        check: st => {
+          const ev = G.evalIngress(st.firewalls, { network: 'shared-vpc', srcIp: '10.10.1.5', srcNetwork: 'prod-vpc', srcTags: ['app'], tags: ['api'], proto: 'tcp', port: 443 });
+          return ev.allowed || (ev.rule ? `TCP 443 from 10.10.1.5 is being denied by ${ev.rule.name}.` : 'No ALLOW rule matches TCP 443 from 10.10.1.5, so the implied deny applies.');
+        },
+        hints: ['Firewall rules are not exchanged over peering. The destination network has to allow the source range itself.', '<code>firewall-rules list</code> hides source ranges and tags, so use <code>describe</code>. Lower priority numbers win, and a DENY can sit above your ALLOW.', 'You need an ALLOW for <code>tcp:443</code> from <code>10.10.0.0/16</code> on shared-vpc, with a priority number lower than any matching DENY (e.g. <code>--priority=800</code>).'] },
+      { text: 'Prove it: a test from app-1 to api-1 on TCP 443 succeeds (curl over SSH, nc, or a Connectivity Test).',
+        check: st => (st.flags.proved && goodPath(st).ok) || (st.flags.proved ? 'Your earlier test passed, but the path is broken again.' : 'No successful test from app-1 to 10.20.1.8:443 yet.'),
+        hints: ['You can run a command on app-1 without an interactive session.', '<code>gcloud compute ssh</code> takes <code>--command</code>. Network Intelligence Center\'s Connectivity Tests also show exactly where a packet is dropped.', '<code>gcloud compute ssh app-1 --zone=us-central1-a --command="curl -sk https://10.20.1.8"</code>'] },
+      { text: 'Least privilege: the matching rule allows only TCP 443 from prod-vpc\'s range (or narrower), and <code>deny-legacy-10-8</code> is untouched.',
+        check: st => {
+          const legacy = st.firewalls.find(f => f.name === 'deny-legacy-10-8');
+          if (!legacy || JSON.stringify(legacy) !== st.legacySnapshot) return 'The security team\'s deny-legacy-10-8 rule was changed or deleted. Reset the lab, then outrank it with priority instead.';
+          const ev = G.evalIngress(st.firewalls, { network: 'shared-vpc', srcIp: '10.10.1.5', srcNetwork: 'prod-vpc', srcTags: ['app'], tags: ['api'], proto: 'tcp', port: 443 });
+          if (!ev.allowed) return 'Nothing allows the traffic yet.';
+          if (!G.onlyPort(ev.rule.rules, 'tcp', 443)) return `${ev.rule.name} allows more than TCP 443 (${G.rulesStr(ev.rule.rules)}).`;
+          if (!ev.rule.sourceRanges.every(r => Lab.net.within(r, '10.10.0.0/16'))) return `${ev.rule.name} allows sources outside prod-vpc (${ev.rule.sourceRanges.join(', ')}).`;
+          return true;
+        },
+        hints: ['Look at the source ranges and ports on the rule that actually matches.', 'If you leave out <code>--source-ranges</code>, gcloud defaults an ingress rule to <code>0.0.0.0/0</code>.', 'Use <code>--rules=tcp:443 --source-ranges=10.10.0.0/16</code>. Never edit deny-legacy-10-8; give your ALLOW a lower priority number instead.'] }
+    ],
+    solution(st) {
+      const s = [{ cmd: 'gcloud compute networks peerings list', note: 'Start with the peering: it has to be ACTIVE on both sides before any routes are exchanged.' }];
+      if (st.v === 0) {
+        s.push({ cmd: 'gcloud compute networks peerings create shared-to-prod --network=shared-vpc --peer-network=prod-vpc', note: 'Only prod-vpc had a peering, so it was stuck INACTIVE. Create the other half.' });
+        s.push({ cmd: 'gcloud compute firewall-rules list', note: 'Peering doesn\'t carry firewall rules. shared-vpc has nothing allowing 443 from prod.' });
+        s.push({ cmd: 'gcloud compute firewall-rules create shared-allow-prod-https --network=shared-vpc --direction=INGRESS --action=ALLOW --rules=tcp:443 --source-ranges=10.10.0.0/16 --target-tags=api', note: 'Allow only HTTPS, only from prod-vpc\'s range, and only to the API VMs.' });
+      }
+      if (st.v === 1) {
+        s.push({ cmd: 'gcloud compute firewall-rules describe shared-allow-prod-api', note: 'Peering is fine. The allow rule exists, but describe shows it opens tcp:8443, not 443.' });
+        s.push({ cmd: 'gcloud compute firewall-rules update shared-allow-prod-api --rules=tcp:443', note: 'Fix the port on the existing rule.' });
+      }
+      if (st.v === 2) {
+        s.push({ cmd: 'gcloud network-management connectivity-tests create app-to-api --source-instance=app-1 --destination-ip-address=10.20.1.8 --destination-port=443 --protocol=TCP', note: 'Peering and allow rule both look right, so let a Connectivity Test show where the packet dies.' });
+        s.push({ cmd: 'gcloud compute firewall-rules describe deny-legacy-10-8', note: 'The security team\'s DENY at priority 900 matches before our ALLOW at 1000. We may not touch it.' });
+        s.push({ cmd: 'gcloud compute firewall-rules update shared-allow-prod-api --priority=800', note: 'Outrank it instead: a lower number is evaluated first. The scope stays narrow (tcp:443 from 10.10.0.0/16).' });
+      }
+      s.push({ cmd: 'gcloud compute ssh app-1 --zone=us-central1-a --command="curl -sk https://10.20.1.8"', note: 'Prove it from the actual client VM.' });
+      return s;
+    },
+    debrief: [
+      { title: 'Peering is two-sided', text: 'Each VPC must create its own peering pointing at the other. Until both exist, the state is INACTIVE and no subnet routes are exchanged.' },
+      { title: 'Firewalls don\'t travel', text: 'Peering exchanges routes, not firewall rules. The destination VPC must allow the source CIDR. Source tags don\'t work across peering either.' },
+      { title: 'Evaluation order', text: 'Lowest priority number wins. At equal priority, DENY beats ALLOW. If nothing matches, the implied deny-all ingress applies. That\'s why a priority-900 DENY silently beats a correct priority-1000 ALLOW.' },
+      { title: '<code>list</code> hides the important fields', text: 'Source ranges and target tags only show in <code>describe</code> or <code>--format=json</code>, which is where most firewall mistakes hide.' },
+      { title: 'Prove, don\'t assume', text: 'Connectivity Tests analyze configuration and name the exact rule or missing route. A curl from the real client confirms the data path. Note that ping would still fail here, because ICMP isn\'t allowed. Test the protocol you care about.' },
+      { title: 'Least privilege, even under pressure', text: 'Opening 0.0.0.0/0 or deleting the security team\'s rule would also "fix" the ticket. Scoping to <code>tcp:443</code> from <code>10.10.0.0/16</code> fixes it without creating the next incident.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

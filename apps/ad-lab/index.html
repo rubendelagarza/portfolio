@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: Active Directory onboarding, offboarding and cleanup — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 03</div>
+    <h1>Lab: Active Directory onboarding, offboarding and cleanup</h1>
+    <p>Work a morning's queue of identity tickets with the ActiveDirectory PowerShell module: a new hire, a locked-out user, a leaver, stale accounts and a privilege problem hiding in nested groups.</p>
+    <div class="lab-meta"><span class="pill">Intermediate</span><span class="pill">~12 min</span><span class="pill">PowerShell (ActiveDirectory)</span><span class="pill">3 randomized ticket queues</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> the Active Directory administration I did as an IT Support Analyst and escalation point at TCS: naming standards, least-privilege group access, safe offboarding and directory hygiene.</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div class="panel">
+          <h3>contoso.local (live view)</h3>
+          <div class="dir-tree" id="tree"></div>
+        </div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Ticket queue</h3>
+          <div id="tickets" style="font-size:13px"></div>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Contoso account standard</h3>
+          <dl class="facts">
+            <dt>sAMAccountName</dt><dd>first initial + last name, lowercase (e.g. jperez). If taken, append 2, 3…</dd>
+            <dt>UPN</dt><dd>first.last@contoso.com</dd>
+            <dt>Name / DisplayName</dt><dd>First Last</dd>
+            <dt>Location</dt><dd>OU=&lt;Department&gt;,OU=Users,OU=Contoso,DC=contoso,DC=local</dd>
+            <dt>New accounts</dt><dd>Enabled, temporary password, must change at next logon; Department and Title set</dd>
+            <dt>Leavers</dt><dd>Disable, move to OU=Disabled Users,OU=Contoso; remove groups; never delete (mailbox and audit retention)</dd>
+          </dl>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 03 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script>
+(function () {
+  const { CmdError } = Lab;
+  const BASE = 'DC=contoso,DC=local';
+  const OU = { Contoso: `OU=Contoso,${BASE}`, Users: `OU=Users,OU=Contoso,${BASE}`, Groups: `OU=Groups,OU=Contoso,${BASE}`, Service: `OU=Service Accounts,OU=Contoso,${BASE}`, Disabled: `OU=Disabled Users,OU=Contoso,${BASE}`, Builtin: `CN=Users,${BASE}` };
+  const dept = d => `OU=${d},OU=Users,OU=Contoso,${BASE}`;
+  const TODAY = '2026-11-20';
+  const VARIANTS = [
+    { hire: { given: 'Luis', sur: 'Perez', dept: 'Finance', title: 'Accounts Payable Clerk', sam: 'lperez2', upn: 'luis.perez@contoso.com', template: 'mtorres', templateName: 'Maria Torres', exclude: ['GG-Finance-Payroll'], excludeWhy: 'Payroll access needs separate approval from the CFO.', ticket: 'RITM0040812' },
+      locked: { sam: 'tvega', story: '"I changed my password on Monday and since then I keep getting locked out, even though I\'m sure I\'m typing the new one."', reset: false, source: 'CTSO-PH-TVEGA (iPhone mail app)' },
+      leaver: { sam: 'jperez', ticket: 'RITM0041177' } },
+    { hire: { given: 'Sara', sur: 'Gomez', dept: 'Sales', title: 'Account Executive', sam: 'sgomez', upn: 'sara.gomez@contoso.com', template: 'agomez', templateName: 'Ana Gomez', exclude: ['GG-CRM-Admins', 'GG-Sales-Commissions'], excludeWhy: 'Admin and commission-report access need separate approval.', ticket: 'RITM0041021' },
+      locked: { sam: 'ehernandez', story: '"I was off for two weeks and completely forgot my password. I tried a few times and now it says my account is locked."', reset: true, source: 'CTSO-LT-0233' },
+      leaver: { sam: 'rlopez', ticket: 'RITM0041402' } },
+    { hire: { given: 'Diego', sur: 'Castro', dept: 'IT', title: 'Service Desk Analyst', sam: 'dcastro2', upn: 'diego.castro@contoso.com', template: 'dcastro', templateName: 'Diana Castro', exclude: ['GG-Server-Local-Admins'], excludeWhy: 'Privileged (admin) groups are never copied from a template.', ticket: 'RITM0041108' },
+      locked: { sam: 'lperez', story: '"I fat-fingered my password a few times this morning. I know what it is, I just typed it wrong."', reset: false, source: 'CTSO-LT-0418' },
+      leaver: { sam: 'agomez', ticket: 'RITM0041530' } }
+  ];
+  const PEOPLE = [
+    ['Administrator', null, null, 'Builtin', '', '', '2026-11-19'],
+    ['rdelagarza', 'Ruben', 'de la Garza', 'IT', 'Senior Consultant', 'IT', '2026-11-20'],
+    ['dcastro', 'Diana', 'Castro', 'IT', 'Service Desk Analyst', 'IT', '2026-11-19'],
+    ['lperez', 'Laura', 'Perez', 'Finance', 'AP Clerk', 'Finance', '2026-11-20'],
+    ['mtorres', 'Maria', 'Torres', 'Finance', 'Controller', 'Finance', '2026-11-20'],
+    ['tvega', 'Tomas', 'Vega', 'Finance', 'Financial Analyst', 'Finance', '2026-11-17'],
+    ['smendez', 'Sofia', 'Mendez', 'Finance', 'Financial Analyst', 'Finance', '2026-05-15'],
+    ['jperez', 'Jorge', 'Perez', 'Sales', 'Account Executive', 'Sales', '2026-11-18'],
+    ['agomez', 'Ana', 'Gomez', 'Sales', 'Sales Director', 'Sales', '2026-11-20'],
+    ['ehernandez', 'Elena', 'Hernandez', 'Sales', 'Account Executive', 'Sales', '2026-11-03'],
+    ['cruiz', 'Carlos', 'Ruiz', 'Sales', 'Account Executive', 'Sales', '2026-06-02'],
+    ['rlopez', 'Rocio', 'Lopez', 'HR', 'HR Generalist', 'HR', '2026-11-19'],
+    ['jgarcia', 'Javier', 'Garcia', 'HR', 'Recruiter', 'HR', '2026-07-30'],
+    ['svc-backup', null, null, 'Service', 'Backup service account', '', '2026-03-01'],
+    ['svc-sql', null, null, 'Service', 'SQL Server service account', '', '2025-12-10']
+  ];
+  const GROUPS = {
+    'Domain Admins': { path: OU.Builtin, m: ['Administrator', 'g:GG-IT-Admins'] },
+    'GG-IT-Admins': { path: OU.Groups, m: ['rdelagarza', 'g:GG-Helpdesk'] },
+    'GG-Helpdesk': { path: OU.Groups, m: ['dcastro'] },
+    'GG-Server-Local-Admins': { path: OU.Groups, m: ['dcastro', 'rdelagarza'] },
+    'GG-VPN-Users': { path: OU.Groups, m: ['lperez', 'mtorres', 'jperez', 'agomez', 'dcastro', 'tvega', 'ehernandez', 'cruiz', 'smendez'] },
+    'GG-Finance-Users': { path: OU.Groups, m: ['lperez', 'mtorres', 'tvega', 'smendez'] },
+    'GG-Finance-AP': { path: OU.Groups, m: ['lperez', 'mtorres', 'tvega'] },
+    'GG-SAP-Users': { path: OU.Groups, m: ['lperez', 'mtorres', 'tvega', 'smendez'] },
+    'GG-Finance-Payroll': { path: OU.Groups, m: ['mtorres'] },
+    'GG-Sales-Users': { path: OU.Groups, m: ['jperez', 'agomez', 'ehernandez', 'cruiz'] },
+    'GG-CRM-Users': { path: OU.Groups, m: ['jperez', 'agomez', 'ehernandez', 'cruiz'] },
+    'GG-CRM-Admins': { path: OU.Groups, m: ['agomez'] },
+    'GG-Sales-Commissions': { path: OU.Groups, m: ['agomez'] },
+    'GG-HR-Users': { path: OU.Groups, m: ['rlopez', 'jgarcia'] },
+    'GG-HRIS-Users': { path: OU.Groups, m: ['rlopez', 'jgarcia'] },
+    'GG-HR-Salaries': { path: OU.Groups, m: ['rlopez'] },
+    'GG-Backup-Operators': { path: OU.Groups, m: ['svc-backup'] }
+  };
+
+  function createState(v) {
+    const V = VARIANTS[v];
+    const users = PEOPLE.map(([sam, given, sur, ou, title, department, last]) => {
+      const name = given ? `${given} ${sur}` : sam;
+      return { sam, name, given, sur, display: name, upn: given ? `${given.toLowerCase()}.${sur.toLowerCase().replace(/ /g, '')}@contoso.com` : `${sam}@contoso.local`, path: ou === 'Builtin' ? OU.Builtin : ou === 'Service' ? OU.Service : dept(ou), enabled: true, locked: false, badCount: 0, lastBad: null, lockTime: null, lastLogon: last, pwdLastSet: '2026-10-02 09:14:22', mustChange: false, dept: department, title, desc: ou === 'Service' ? title : '', created: '2025-03-11' };
+    });
+    const lk = users.find(u => u.sam === V.locked.sam);
+    Object.assign(lk, { locked: true, badCount: 5, lastBad: '2026-11-20 08:14:37', lockTime: '2026-11-20 08:14:37' });
+    const groups = {};
+    Object.entries(GROUPS).forEach(([n, g]) => { groups[n] = { name: n, path: g.path, members: g.m.slice() }; });
+    return { v, V, users, groups, deleted: [], lockedPwd: lk.pwdLastSet, flags: {} };
+  }
+
+  // ---------- helpers
+  const lc = s => String(s).toLowerCase();
+  const dnOf = u => `CN=${u.name},${u.path}`;
+  const gdn = g => `CN=${g.name},${g.path}`;
+  const fmtDate = d => (d ? (d.length === 10 ? `${d.slice(5, 7)}/${d.slice(8, 10)}/${d.slice(0, 4)} 9:12:44 AM` : `${d.slice(5, 7)}/${d.slice(8, 10)}/${d.slice(0, 4)} ${d.slice(11)}`) : '');
+  const userBy = (st, id) => st.users.find(u => lc(u.sam) === lc(id) || lc(dnOf(u)) === lc(id));
+  const groupBy = (st, id) => Object.values(st.groups).find(g => lc(g.name) === lc(id) || lc(gdn(g)) === lc(id));
+  const nf = (cmd, id) => CmdError(`${cmd} : Cannot find an object with identity: '${id}' under: '${BASE}'.`);
+  const idOf = x => (x && typeof x === 'object' ? (x._sam || x.SamAccountName || x.DistinguishedName || x.name || x.Name) : x);
+  const mustUser = (st, cmd, id) => { const u = userBy(st, idOf(id)); if (!u) throw nf(cmd, idOf(id)); return u; };
+  const mustGroup = (st, cmd, id) => { const g = groupBy(st, idOf(id)); if (!g) throw nf(cmd, idOf(id)); return g; };
+  const memberOf = (st, sam) => Object.values(st.groups).filter(g => g.members.includes(sam)).map(g => g.name).sort();
+  function recursiveUsers(st, gname, seen) {
+    seen = seen || new Set(); if (seen.has(gname)) return []; seen.add(gname);
+    const g = st.groups[gname]; if (!g) return [];
+    return g.members.flatMap(m => (m.startsWith('g:') ? recursiveUsers(st, m.slice(2), seen) : [m]));
+  }
+  function nestedIn(st, inner, outer, seen) {
+    seen = seen || new Set(); const g = st.groups[outer]; if (!g || seen.has(outer)) return false; seen.add(outer);
+    return g.members.some(m => m === 'g:' + inner || (m.startsWith('g:') && nestedIn(st, inner, m.slice(2), seen)));
+  }
+  const ALL_PROPS = ['AccountLockoutTime', 'BadLogonCount', 'Created', 'Department', 'Description', 'DisplayName', 'EmailAddress', 'LastBadPasswordAttempt', 'LastLogonDate', 'LockedOut', 'MemberOf', 'PasswordLastSet', 'Title'];
+  function userView(st, u, props) {
+    const o = { DistinguishedName: dnOf(u), Enabled: u.enabled, GivenName: u.given, Name: u.name, ObjectClass: 'user', SamAccountName: u.sam, Surname: u.sur, UserPrincipalName: u.upn, _sam: u.sam };
+    let want = [];
+    (props || []).forEach(p => { if (p === '*') want = want.concat(ALL_PROPS); else want.push(p); });
+    const extra = { AccountLockoutTime: fmtDate(u.lockTime), BadLogonCount: u.badCount, Created: fmtDate(u.created), Department: u.dept, Description: u.desc, DisplayName: u.display, EmailAddress: u.given ? u.upn : '', LastBadPasswordAttempt: fmtDate(u.lastBad), LastLogonDate: fmtDate(u.lastLogon), LockedOut: u.locked, MemberOf: memberOf(st, u.sam).map(n => gdn(st.groups[n])), PasswordLastSet: fmtDate(u.pwdLastSet), Title: u.title };
+    want.forEach(p => { const k = ALL_PROPS.find(x => lc(x) === lc(p)); if (k) o[k] = extra[k]; else if (!(Object.keys(o).some(x => lc(x) === lc(p)))) o[p] = null; });
+    return o;
+  }
+  const groupView = g => ({ DistinguishedName: gdn(g), GroupCategory: 'Security', GroupScope: 'Global', Name: g.name, ObjectClass: 'group', SamAccountName: g.name, _group: g.name });
+  const pgmView = g => ({ name: g.name, GroupCategory: 'Security', GroupScope: 'Global', distinguishedName: gdn(g), _group: g.name });
+  const FIELD = { name: 'name', samaccountname: 'sam', userprincipalname: 'upn', givenname: 'given', surname: 'sur', department: 'dept', title: 'title', enabled: 'enabled', displayname: 'display', description: 'desc', lockedout: 'locked' };
+  function filterFn(expr) {
+    let e = String(expr).trim().replace(/^\{\s*|\s*\}$/g, '').replace(/^["']|["']$/g, '');
+    if (e === '*') return () => true;
+    const clauses = e.split(/\s+-and\s+/i).map(c => {
+      const m = c.trim().match(/^(\w+)\s+-(eq|ne|like|notlike)\s+(.+)$/i);
+      if (!m) throw CmdError(`Get-ADUser : Error parsing query: '${e}' Error Message: 'syntax error' at position: '1'.`);
+      const f = FIELD[lc(m[1])]; if (!f) throw CmdError(`Get-ADUser : The property '${m[1]}' is not filterable in this simulation. Try Name, SamAccountName, Department, Title, Enabled.`);
+      let val = m[3].trim().replace(/^["']|["']$/g, ''); const op = lc(m[2]);
+      const bool = /^\$true$/i.test(val) ? true : /^\$false$/i.test(val) ? false : null;
+      return u => {
+        const x = u[f];
+        if (bool !== null) return op === 'eq' ? x === bool : x !== bool;
+        const sx = lc(x || ''), sv = lc(val);
+        if (op === 'eq') return sx === sv; if (op === 'ne') return sx !== sv;
+        const re = new RegExp('^' + sv.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+        return op === 'like' ? re.test(sx) : !re.test(sx);
+      };
+    });
+    return u => clauses.every(f => f(u));
+  }
+  function pwOk(pw) { const s = String(pw); const cats = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter(r => r.test(s)).length; return s.length >= 8 && cats >= 3; }
+  const confirmText = (what) => `\nConfirm\nAre you sure you want to perform this action?\n${what}\n[Y] Yes  [A] Yes to All  [N] No  [L] No to All  [S] Suspend  [?] Help (default is "Y"): Y   (auto-answered; add -Confirm:$false to skip)`;
+  const wantsConfirm = a => !(a._c.confirm === false || /^\$?false$/i.test(String(a._c.confirm)));
+  const targets = (st, cmd, a, c) => {
+    if (a.Identity !== undefined) return [mustUser(st, cmd, a.Identity)];
+    if (c.input && c.input.length) return c.input.map(o => mustUser(st, cmd, o));
+    throw CmdError(`${cmd} : Cannot process command because of one or more missing mandatory parameters: Identity.`);
+  };
+  function timespanDays(v) {
+    if (v && typeof v === 'object') return v.days;
+    const s = String(v).trim(); let m;
+    if ((m = s.match(/^(\d+)(?:\.(\d{1,2}):\d{2}:\d{2})?$/))) return +m[1];
+    if ((m = s.match(/^(\d{1,2}):\d{2}:\d{2}$/))) return 0;
+    throw CmdError(`Search-ADAccount : Cannot bind parameter 'TimeSpan'. Cannot convert value "${s}" to type "System.TimeSpan". Use the form 90.00:00:00 or (New-TimeSpan -Days 90).`);
+  }
+  const daysAgo = d => (d ? Math.round((Date.parse(TODAY) - Date.parse(d.slice(0, 10))) / 86400000) : null);
+
+  const commands = lab => {
+    const S = () => lab.state;
+    const BOOL = { type: 'bool' };
+    return {
+      'Get-ADUser': {
+        desc: 'Get users by -Identity or -Filter', positional: ['Identity'],
+        params: { Identity: { type: 'any' }, Filter: { desc: '* or "Name -eq \'Laura Perez\'"' }, Properties: { type: 'list', desc: 'Extra properties, or *' }, SearchBase: { desc: 'Only look under this OU (DN)' } },
+        run: a => {
+          const st = S();
+          let list;
+          if (a.Identity !== undefined) list = [mustUser(st, 'Get-ADUser', a.Identity)];
+          else if (a.Filter !== undefined) list = st.users.filter(filterFn(a.Filter));
+          else throw CmdError('Get-ADUser : Cannot process command because of one or more missing mandatory parameters: Filter.');
+          if (a.SearchBase) list = list.filter(u => lc(dnOf(u)).endsWith(lc(a.SearchBase)));
+          return { objects: list.map(u => userView(st, u, a.Properties)), view: 'list' };
+        }
+      },
+      'New-ADUser': {
+        desc: 'Create a user account', positional: ['Name'],
+        params: { Name: { required: true }, SamAccountName: {}, UserPrincipalName: {}, GivenName: {}, Surname: {}, DisplayName: {}, Path: { desc: `Default: ${OU.Builtin}` }, AccountPassword: { type: 'secure', desc: '(ConvertTo-SecureString "…" -AsPlainText -Force) or (Read-Host -AsSecureString)' }, Enabled: BOOL, ChangePasswordAtLogon: BOOL, Department: {}, Title: {}, Description: {}, EmailAddress: {}, Office: {}, Company: {}, Manager: {} },
+        run: a => {
+          const st = S(); const cmd = 'New-ADUser';
+          const sam = a.SamAccountName || a.Name;
+          const path = a.Path || OU.Builtin;
+          if (!/^(OU|CN)=.+,DC=contoso,DC=local$/i.test(path) || !(path === OU.Builtin || ['Finance', 'Sales', 'IT', 'HR'].some(d => lc(dept(d)) === lc(path)) || [OU.Service, OU.Disabled].some(x => lc(x) === lc(path)))) throw CmdError(`${cmd} : Directory object not found`);
+          if (st.users.some(u => lc(u.sam) === lc(sam))) throw CmdError(`${cmd} : The specified account already exists`);
+          if (a.UserPrincipalName && st.users.some(u => lc(u.upn) === lc(a.UserPrincipalName))) throw CmdError(`${cmd} : The operation failed because UPN value provided for addition/modification is not unique forest-wide`);
+          if (st.users.some(u => lc(u.name) === lc(a.Name) && lc(u.path) === lc(path))) throw CmdError(`${cmd} : An attempt was made to add an object to the directory with a name that is already in use`);
+          if (a.AccountPassword && !pwOk(a.AccountPassword.value)) throw CmdError(`${cmd} : The password does not meet the length, complexity, or history requirement of the domain.`);
+          if (a.Enabled && !a.AccountPassword) throw CmdError(`${cmd} : The password does not meet the length, complexity, or history requirement of the domain.\n(An account can't be enabled without a password: add -AccountPassword.)`);
+          const realPath = (['Finance', 'Sales', 'IT', 'HR'].map(dept).concat([OU.Builtin, OU.Service, OU.Disabled])).find(x => lc(x) === lc(path));
+          st.users.push({ sam, name: a.Name, given: a.GivenName || null, sur: a.Surname || null, display: a.DisplayName || null, upn: a.UserPrincipalName || null, path: realPath, enabled: !!a.Enabled && !!a.AccountPassword, locked: false, badCount: 0, lastBad: null, lockTime: null, lastLogon: null, pwdLastSet: a.AccountPassword ? '2026-11-20 10:02:11' : null, mustChange: !!a.ChangePasswordAtLogon, dept: a.Department || null, title: a.Title || null, desc: a.Description || '', created: '2026-11-20', isNew: true });
+          return null;
+        }
+      },
+      'Set-ADUser': {
+        desc: 'Change user attributes (accepts pipeline input)', positional: ['Identity'],
+        params: { Identity: { type: 'any' }, Description: {}, Department: {}, Title: {}, DisplayName: {}, GivenName: {}, Surname: {}, UserPrincipalName: {}, EmailAddress: {}, Office: {}, Manager: {}, ChangePasswordAtLogon: BOOL, Enabled: BOOL },
+        run: (a, c) => {
+          const st = S();
+          targets(st, 'Set-ADUser', a, c).forEach(u => {
+            const map = { Description: 'desc', Department: 'dept', Title: 'title', DisplayName: 'display', GivenName: 'given', Surname: 'sur', UserPrincipalName: 'upn', ChangePasswordAtLogon: 'mustChange', Enabled: 'enabled' };
+            Object.entries(map).forEach(([k, f]) => { if (a[k] !== undefined) u[f] = a[k]; });
+          });
+          return null;
+        }
+      },
+      'Remove-ADUser': {
+        desc: 'Delete a user account (permanent)', positional: ['Identity'], params: { Identity: { type: 'any' } },
+        run: (a, c) => { const st = S(); const ts = targets(st, 'Remove-ADUser', a, c); ts.forEach(u => { st.users = st.users.filter(x => x !== u); Object.values(st.groups).forEach(g => { g.members = g.members.filter(m => m !== u.sam); }); st.deleted.push(u.sam); }); return wantsConfirm(a) ? { text: confirmText(`Performing the operation "Remove" on target "${dnOf(ts[0])}".`), cls: 'muted' } : null; }
+      },
+      'Enable-ADAccount': { desc: 'Enable accounts (accepts pipeline input)', positional: ['Identity'], params: { Identity: { type: 'any' } }, run: (a, c) => { targets(S(), 'Enable-ADAccount', a, c).forEach(u => { u.enabled = true; }); return null; } },
+      'Disable-ADAccount': { desc: 'Disable accounts (accepts pipeline input)', positional: ['Identity'], params: { Identity: { type: 'any' } }, run: (a, c) => { targets(S(), 'Disable-ADAccount', a, c).forEach(u => { u.enabled = false; }); return null; } },
+      'Unlock-ADAccount': { desc: 'Unlock a locked-out account', positional: ['Identity'], params: { Identity: { type: 'any' } }, run: (a, c) => { targets(S(), 'Unlock-ADAccount', a, c).forEach(u => { u.locked = false; u.lockTime = null; u.badCount = 0; }); return null; } },
+      'Set-ADAccountPassword': {
+        desc: 'Reset a password (-Reset -NewPassword (…))', positional: ['Identity'],
+        params: { Identity: { type: 'any' }, Reset: { type: 'switch' }, NewPassword: { type: 'secure' }, OldPassword: { type: 'secure' } },
+        run: (a, c) => {
+          const st = S(); const u = targets(st, 'Set-ADAccountPassword', a, c)[0];
+          if (!a.Reset && !a.OldPassword) throw CmdError('Set-ADAccountPassword : Specify -Reset to set a new password as an administrator (or supply -OldPassword).');
+          if (!a.NewPassword) throw CmdError('Set-ADAccountPassword : Cannot process command because of one or more missing mandatory parameters: NewPassword.');
+          if (!pwOk(a.NewPassword.value)) throw CmdError('Set-ADAccountPassword : The password does not meet the length, complexity, or history requirement of the domain.');
+          u.pwdLastSet = '2026-11-20 10:18:40';
+          return null;
+        }
+      },
+      'Search-ADAccount': {
+        desc: 'Find locked, inactive or disabled accounts',
+        params: { LockedOut: { type: 'switch' }, AccountInactive: { type: 'switch' }, AccountDisabled: { type: 'switch' }, TimeSpan: { type: 'any', desc: 'e.g. 90.00:00:00' }, DateTime: {}, UsersOnly: { type: 'switch' }, SearchBase: {} },
+        run: a => {
+          const st = S();
+          if (a.DateTime) throw CmdError('Search-ADAccount : In this simulation use -TimeSpan 90.00:00:00 instead of -DateTime.');
+          let list;
+          if (a.LockedOut) list = st.users.filter(u => u.locked);
+          else if (a.AccountDisabled) list = st.users.filter(u => !u.enabled);
+          else if (a.AccountInactive) { const days = a.TimeSpan !== undefined ? timespanDays(a.TimeSpan) : 15; list = st.users.filter(u => u.lastLogon && daysAgo(u.lastLogon) >= days); }
+          else throw CmdError('Search-ADAccount : Parameter set cannot be resolved using the specified named parameters. Use -LockedOut, -AccountInactive or -AccountDisabled.');
+          if (a.SearchBase) list = list.filter(u => lc(dnOf(u)).endsWith(lc(a.SearchBase)));
+          return { objects: list.map(u => ({ Name: u.name, SamAccountName: u.sam, Enabled: u.enabled, LockedOut: u.locked, LastLogonDate: fmtDate(u.lastLogon), DistinguishedName: dnOf(u), ObjectClass: 'user', _sam: u.sam })), cols: ['Name', 'SamAccountName', 'Enabled', 'LockedOut', 'LastLogonDate', 'DistinguishedName'] };
+        }
+      },
+      'Move-ADObject': {
+        desc: 'Move an object to another OU (Identity must be a DN, or pipe the object in)', positional: ['Identity'],
+        params: { Identity: { type: 'any' }, TargetPath: { required: true } },
+        run: (a, c) => {
+          const st = S(); const cmd = 'Move-ADObject';
+          let list;
+          if (a.Identity !== undefined) {
+            const id = idOf(a.Identity);
+            const u = typeof a.Identity === 'object' ? userBy(st, id) : st.users.find(x => lc(dnOf(x)) === lc(id));
+            if (!u) throw nf(cmd, id);
+            list = [u];
+          } else if (c.input) list = c.input.map(o => mustUser(st, cmd, o));
+          else throw CmdError(`${cmd} : Cannot process command because of one or more missing mandatory parameters: Identity.`);
+          const tp = ['Finance', 'Sales', 'IT', 'HR'].map(dept).concat([OU.Service, OU.Disabled, OU.Builtin]).find(x => lc(x) === lc(a.TargetPath));
+          if (!tp) throw CmdError(`${cmd} : Directory object not found`);
+          list.forEach(u => { u.path = tp; });
+          return null;
+        }
+      },
+      'Get-ADGroup': {
+        desc: 'Get groups', positional: ['Identity'], params: { Identity: { type: 'any' }, Filter: {}, Properties: { type: 'list' } },
+        run: a => {
+          const st = S();
+          if (a.Identity !== undefined) { const g = mustGroup(st, 'Get-ADGroup', a.Identity); const o = groupView(g); if ((a.Properties || []).some(p => /^(members|\*)$/i.test(p))) o.Members = g.members.map(m => (m.startsWith('g:') ? gdn(st.groups[m.slice(2)]) : dnOf(userBy(st, m) || { name: m, path: OU.Builtin }))); return { objects: [o], view: 'list' }; }
+          return { objects: Object.values(st.groups).map(groupView), cols: ['Name', 'GroupScope', 'GroupCategory', 'DistinguishedName'] };
+        }
+      },
+      'Get-ADGroupMember': {
+        desc: 'List group members (-Recursive flattens nested groups)', positional: ['Identity'], params: { Identity: { type: 'any' }, Recursive: { type: 'switch' } },
+        run: a => {
+          const st = S(); const g = mustGroup(st, 'Get-ADGroupMember', a.Identity);
+          const rows = a.Recursive ? [...new Set(recursiveUsers(st, g.name))].map(s => ({ name: (userBy(st, s) || { name: s }).name, objectClass: 'user', SamAccountName: s, distinguishedName: dnOf(userBy(st, s) || { name: s, path: OU.Builtin }), _sam: s }))
+            : g.members.map(m => (m.startsWith('g:') ? { name: m.slice(2), objectClass: 'group', SamAccountName: m.slice(2), distinguishedName: gdn(st.groups[m.slice(2)]), _group: m.slice(2) } : { name: (userBy(st, m) || { name: m }).name, objectClass: 'user', SamAccountName: m, distinguishedName: dnOf(userBy(st, m) || { name: m, path: OU.Builtin }), _sam: m }));
+          return { objects: rows, cols: ['name', 'objectClass', 'SamAccountName', 'distinguishedName'] };
+        }
+      },
+      'Add-ADGroupMember': {
+        desc: 'Add members to a group', positional: ['Identity'], params: { Identity: { type: 'any', required: true }, Members: { type: 'list', required: true } },
+        run: a => {
+          const st = S(); const g = mustGroup(st, 'Add-ADGroupMember', a.Identity);
+          a.Members.forEach(m => { const u = userBy(st, m); const sg = !u && groupBy(st, m); if (!u && !sg) throw nf('Add-ADGroupMember', m); const key = u ? u.sam : 'g:' + sg.name; if (!g.members.includes(key)) g.members.push(key); });
+          return null;
+        }
+      },
+      'Remove-ADGroupMember': {
+        desc: 'Remove members from a group', positional: ['Identity'], params: { Identity: { type: 'any', required: true }, Members: { type: 'list', required: true } },
+        run: a => {
+          const st = S(); const g = mustGroup(st, 'Remove-ADGroupMember', a.Identity);
+          a.Members.forEach(m => { const u = userBy(st, m); const sg = !u && groupBy(st, m); if (!u && !sg) throw nf('Remove-ADGroupMember', m); const key = u ? u.sam : 'g:' + sg.name; g.members = g.members.filter(x => x !== key); });
+          return wantsConfirm(a) ? { text: confirmText(`Performing the operation "Set" on target "${gdn(g)}".`), cls: 'muted' } : null;
+        }
+      },
+      'Get-ADPrincipalGroupMembership': {
+        desc: 'Groups a user belongs to (direct)', positional: ['Identity'], params: { Identity: { type: 'any', required: true } },
+        run: a => {
+          const st = S(); const u = mustUser(st, 'Get-ADPrincipalGroupMembership', a.Identity);
+          return { objects: [{ name: 'Domain Users', GroupCategory: 'Security', GroupScope: 'Global', distinguishedName: `CN=Domain Users,CN=Users,${BASE}`, _group: 'Domain Users' }].concat(memberOf(st, u.sam).map(n => pgmView(st.groups[n]))), cols: ['name', 'GroupCategory', 'GroupScope', 'distinguishedName'] };
+        }
+      },
+      'Add-ADPrincipalGroupMembership': {
+        desc: 'Add a user to several groups (-MemberOf g1,g2)', positional: ['Identity'], params: { Identity: { type: 'any', required: true }, MemberOf: { type: 'list', required: true } },
+        run: a => {
+          const st = S(); const u = mustUser(st, 'Add-ADPrincipalGroupMembership', a.Identity);
+          a.MemberOf.filter(n => lc(n) !== 'domain users').forEach(n => { const g = mustGroup(st, 'Add-ADPrincipalGroupMembership', n); if (!g.members.includes(u.sam)) g.members.push(u.sam); });
+          return null;
+        }
+      },
+      'Remove-ADPrincipalGroupMembership': {
+        desc: 'Remove a user from several groups (-MemberOf g1,g2)', positional: ['Identity'], params: { Identity: { type: 'any', required: true }, MemberOf: { type: 'list', required: true } },
+        run: a => {
+          const st = S(); const u = mustUser(st, 'Remove-ADPrincipalGroupMembership', a.Identity);
+          if (a.MemberOf.some(n => lc(n) === 'domain users')) throw CmdError('Remove-ADPrincipalGroupMembership : The user cannot be removed from a group because the group is currently the user\'s primary group');
+          a.MemberOf.forEach(n => { const g = mustGroup(st, 'Remove-ADPrincipalGroupMembership', n); g.members = g.members.filter(m => m !== u.sam); });
+          return wantsConfirm(a) ? { text: confirmText(`Performing the operation "Set" on target "${dnOf(u)}".`), cls: 'muted' } : null;
+        }
+      },
+      'Get-ADOrganizationalUnit': { desc: 'List OUs', params: { Filter: {} }, run: () => ({ objects: [OU.Contoso, OU.Users, dept('Finance'), dept('Sales'), dept('IT'), dept('HR'), OU.Groups, OU.Service, OU.Disabled].map(d => ({ Name: d.split(',')[0].slice(3), DistinguishedName: d })), cols: ['Name', 'DistinguishedName'] }) },
+      'Get-EventLog': {
+        desc: 'Read a DC event log (e.g. -LogName Security -InstanceId 4740 for lockouts)', params: { LogName: { required: true }, InstanceId: { type: 'int' }, Newest: { type: 'int' } },
+        run: a => {
+          const st = S();
+          if (lc(a.LogName) !== 'security') return { text: '(No entries of interest in this log.)', cls: 'muted' };
+          if (a.InstanceId !== undefined && a.InstanceId !== 4740) return { text: `(No events with ID ${a.InstanceId} in the last 24 hours.)`, cls: 'muted' };
+          const L = st.V.locked; const u = userBy(st, L.sam);
+          const ev = (t) => ({ Index: 88412 + t, TimeGenerated: `11/20/2026 8:${String(14 - t * 3).padStart(2, '0')}:37 AM`, EntryType: 'SuccessAudit', InstanceID: 4740, Message: `A user account was locked out.\n\n    Account That Was Locked Out:\n        Account Name:   ${u ? u.sam : L.sam}\n    Additional Information:\n        Caller Computer Name:   ${L.source}` });
+          return { objects: [ev(0), ev(1)].slice(0, a.Newest || 2), view: 'list' };
+        }
+      },
+      'ConvertTo-SecureString': {
+        desc: 'Make a SecureString: ConvertTo-SecureString "…" -AsPlainText -Force', positional: ['String'], params: { String: { required: true }, AsPlainText: { type: 'switch' }, Force: { type: 'switch' } },
+        run: a => {
+          if (!a.AsPlainText) throw CmdError('ConvertTo-SecureString : The input string was not in a correct format. (To convert plain text, add -AsPlainText -Force.)');
+          if (!a.Force && !a._c.force) throw CmdError('ConvertTo-SecureString : The system cannot protect plain text input. To suppress this warning and convert the plain text to a SecureString, reissue the command specifying the Force parameter.');
+          return { value: { secure: true, value: a.String }, text: 'System.Security.SecureString' };
+        }
+      },
+      'Read-Host': { desc: 'Prompt for input (-AsSecureString)', positional: ['Prompt'], params: { Prompt: {}, AsSecureString: { type: 'switch' } }, run: a => (a.AsSecureString ? { value: { secure: true, value: 'Welcome#2026!' }, text: `${a.Prompt || ''}: *************  (simulated input)` } : { value: '', text: '' }) },
+      'New-TimeSpan': { desc: 'Create a TimeSpan (-Days N)', params: { Days: { type: 'int', required: true } }, run: a => ({ value: { days: a.Days }, text: `Days : ${a.Days}\nTotalDays : ${a.Days}` }) },
+      'Get-Date': { desc: 'Current date', run: () => ({ value: TODAY, text: 'Friday, November 20, 2026 10:21:07 AM' }) }
+    };
+  };
+
+  // ---------- checks
+  function hireStatus(st) {
+    const H = st.V.hire; const u = st.users.find(x => x.isNew && (lc(x.given || '') === lc(H.given) || lc(x.name) === lc(`${H.given} ${H.sur}`)));
+    if (!u) return 'No account for the new hire yet.';
+    const issues = [];
+    if (u.sam !== H.sam) issues.push(`sAMAccountName is "${u.sam}"${H.sam.endsWith('2') ? ' (check whether the standard name is already taken)' : ''}`);
+    if (lc(u.upn || '') !== H.upn) issues.push(`UPN is "${u.upn || '(empty)'}"`);
+    if (u.name !== `${H.given} ${H.sur}` || u.display !== `${H.given} ${H.sur}`) issues.push('Name/DisplayName don\'t follow "First Last"');
+    if (u.given !== H.given || u.sur !== H.sur) issues.push('GivenName/Surname missing or wrong');
+    if (lc(u.path) !== lc(dept(H.dept))) issues.push(`it's in ${u.path.split(',')[0]} instead of the ${H.dept} OU`);
+    if (!u.enabled) issues.push('the account is disabled');
+    if (!u.mustChange) issues.push('"must change password at next logon" isn\'t set');
+    if (lc(u.dept || '') !== lc(H.dept) || lc(u.title || '') !== lc(H.title)) issues.push('Department/Title not set as in the ticket');
+    return issues.length ? issues.join('; ') + '.' : true;
+  }
+  const hireUser = st => st.users.find(x => x.sam === st.V.hire.sam && x.isNew);
+  function expectedGroups(st) { return GROUPS_TEMPLATE(st).filter(g => !st.V.hire.exclude.includes(g)).sort(); }
+  function GROUPS_TEMPLATE(st) { const tmpl = st.V.hire.template; return Object.entries(GROUPS).filter(([, g]) => g.m.includes(tmpl)).map(([n]) => n); }
+
+  // ---------- tree
+  function render(st) {
+    const byOu = {};
+    st.users.forEach(u => { (byOu[u.path] = byOu[u.path] || []).push(u); });
+    const uLine = (u, pad) => `<div class="u${!u.enabled ? ' disabled' : ''}${u.locked ? ' locked' : ''}${u.isNew ? ' new' : ''}" style="padding-left:${pad}px">👤 ${Lab.util.esc(u.name)} <span class="muted">(${Lab.util.esc(u.sam)})</span></div>`;
+    const ou = (label, dn, pad) => `<div class="ou" style="padding-left:${pad}px">📁 ${label}</div>` + (byOu[dn] || []).map(u => uLine(u, pad + 16)).join('');
+    let h = `<div class="ou">🏢 contoso.local</div>` + ou('Users (default container)', OU.Builtin, 16) + `<div class="ou" style="padding-left:16px">📁 Contoso</div><div class="ou" style="padding-left:32px">📁 Users</div>`;
+    ['Finance', 'Sales', 'IT', 'HR'].forEach(d => { h += ou(d, dept(d), 48); });
+    h += `<div class="ou" style="padding-left:32px">📁 Groups</div>` + Object.values(st.groups).map(g => `<div class="g" style="padding-left:48px">👥 ${g.name} <span class="muted">(${g.members.length})</span></div>`).join('');
+    h += ou('Service Accounts', OU.Service, 32) + ou('Disabled Users', OU.Disabled, 32);
+    document.getElementById('tree').innerHTML = h;
+  }
+  function onReset(st) {
+    const V = st.V; const L = V.locked; const lu = st.users.find(u => u.sam === L.sam);
+    document.getElementById('tickets').innerHTML = `
+      <p><strong>${V.hire.ticket} · New hire</strong><br>${V.hire.given} ${V.hire.sur} starts Monday as <em>${V.hire.title}</em> in ${V.hire.dept}. Same access as ${V.hire.templateName} (<code>${V.hire.template}</code>). ${V.hire.excludeWhy}</p>
+      <p><strong>INC0052317 · Locked out</strong><br>${lu.name} (<code>${L.sam}</code>): ${L.story}</p>
+      <p><strong>${V.leaver.ticket} · Leaver</strong><br>${st.users.find(u => u.sam === V.leaver.sam).name} (<code>${V.leaver.sam}</code>) left the company yesterday. Process the account per the standard.</p>
+      <p style="margin:0"><strong>CHG0031420 · Hygiene</strong><br>Quarterly review: disable user accounts with no logon in 90+ days. Service accounts are reviewed separately; don't touch them.</p>`;
+  }
+
+  Lab({
+    id: 'ad-lab', dialect: 'ps', variants: 3, termTitle: 'Windows PowerShell — CTSO-DC01 (ActiveDirectory module)',
+    prompt: 'PS C:\\Users\\adm-rdelagarza> ',
+    banner: 'Windows PowerShell\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nPS> Import-Module ActiveDirectory   (loaded)\nConnected to CTSO-DC01.contoso.local as CONTOSO\\adm-rdelagarza.\nType "help" for the cmdlets available in this simulation. Variables work:  $pw = ConvertTo-SecureString "…" -AsPlainText -Force\n',
+    createState, commands, render, onReset,
+    objectives: [
+      { text: 'New hire: create the account exactly to the standard, in the right OU, ready for first logon.',
+        check: st => hireStatus(st),
+        hints: ['Check whether the standard sAMAccountName is free first: <code>Get-ADUser -Filter "SamAccountName -like \'x*\'"</code>.', '<code>New-ADUser</code> puts accounts in the default Users container unless you pass <code>-Path</code>, and can\'t enable an account without <code>-AccountPassword</code>.', 'Example: <code>New-ADUser -Name "First Last" -GivenName First -Surname Last -DisplayName "First Last" -SamAccountName xxx -UserPrincipalName first.last@contoso.com -Path "OU=Dept,OU=Users,OU=Contoso,DC=contoso,DC=local" -AccountPassword (ConvertTo-SecureString "Welcome#2026!" -AsPlainText -Force) -Enabled $true -ChangePasswordAtLogon $true -Department Dept -Title "Title"</code>'] },
+      { text: 'Give the new hire the same groups as their template user, minus anything the ticket says needs separate approval.',
+        check: st => {
+          const u = hireUser(st); if (!u) return 'Create the new hire\'s account first.';
+          const have = memberOf(st, u.sam); const want = expectedGroups(st);
+          const missing = want.filter(g => !have.includes(g)); const extra = have.filter(g => !want.includes(g));
+          if (!missing.length && !extra.length) return true;
+          return [missing.length ? `missing ${missing.length} group(s) the template has` : '', extra.length ? `has ${extra.join(', ')}, which ${extra.some(e => st.V.hire.exclude.includes(e)) ? 'needs separate approval' : 'the template doesn\'t have'}` : ''].filter(Boolean).join('; ') + '.';
+        },
+        hints: ['List the template\'s groups with <code>Get-ADPrincipalGroupMembership &lt;template&gt;</code>.', 'Domain Users is automatic. Read the ticket again for the group(s) that must not be copied.', '<code>Add-ADPrincipalGroupMembership -Identity &lt;newuser&gt; -MemberOf GG-A,GG-B,GG-C</code>, or build a list: <code>$g = Get-ADPrincipalGroupMembership tmpl | Where-Object Name -ne "Domain Users"</code>.'] },
+      { text: 'Locked-out user: get them working again, and reset the password only if the situation calls for it.',
+        check: st => {
+          const L = st.V.locked; const u = userBy(st, L.sam);
+          if (!u) return 'That account no longer exists.';
+          const reset = u.pwdLastSet !== st.lockedPwd;
+          if (u.locked) return reset ? 'You reset the password, but resetting doesn\'t unlock an account.' : 'The account is still locked out.';
+          if (L.reset && !reset) return 'The account is unlocked, but the user doesn\'t know their password.';
+          if (L.reset && !u.mustChange) return 'Password reset, but the user isn\'t forced to choose their own at next logon.';
+          if (!L.reset && reset) return 'The user knows their password, so resetting it wasn\'t needed (and it breaks every device they\'ve signed in on).';
+          return true;
+        },
+        hints: ['Read what the user said, then look at the evidence: <code>Get-ADUser &lt;sam&gt; -Properties LockedOut,BadLogonCount,LastBadPasswordAttempt</code>.', 'Lockout source events (4740) are on the DC: <code>Get-EventLog -LogName Security -InstanceId 4740 -Newest 2</code>. Resetting a password does not unlock an account.', '<code>Unlock-ADAccount &lt;sam&gt;</code>. Only if they forgot it: <code>Set-ADAccountPassword &lt;sam&gt; -Reset -NewPassword (ConvertTo-SecureString "…" -AsPlainText -Force)</code> plus <code>Set-ADUser &lt;sam&gt; -ChangePasswordAtLogon $true</code>.'] },
+      { text: 'Leaver: disabled, moved to Disabled Users, all groups removed, ticket number in the description. Never delete.',
+        check: st => {
+          const L = st.V.leaver; if (st.deleted.includes(L.sam)) return 'The account was deleted. The standard says disable and retain. Reset the lab to try again.';
+          const u = userBy(st, L.sam); const issues = [];
+          if (u.enabled) issues.push('still enabled');
+          if (lc(u.path) !== lc(OU.Disabled)) issues.push('not in Disabled Users');
+          const g = memberOf(st, u.sam); if (g.length) issues.push(`still in ${g.length} group(s)`);
+          if (!(u.desc || '').includes(L.ticket)) issues.push('description doesn\'t reference the ticket');
+          return issues.length ? issues.join('; ') + '.' : true;
+        },
+        hints: ['Four separate changes: account state, location, group memberships, description.', '<code>Move-ADObject</code> needs a DN, not a sAMAccountName, so pipe the user in: <code>Get-ADUser x | Move-ADObject -TargetPath "…"</code>. Domain Users is the primary group and stays.', '<code>Disable-ADAccount x</code>; <code>Set-ADUser x -Description "Disabled 2026-11-20 per RITM…"</code>; <code>$g = Get-ADPrincipalGroupMembership x | Where-Object Name -ne "Domain Users"</code>; <code>Remove-ADPrincipalGroupMembership x -MemberOf $g -Confirm:$false</code>; <code>Get-ADUser x | Move-ADObject -TargetPath "OU=Disabled Users,OU=Contoso,DC=contoso,DC=local"</code>'] },
+      { text: 'Disable every user account inactive for 90+ days, without touching service accounts.',
+        check: st => {
+          const stale = st.users.filter(u => u.lastLogon && daysAgo(u.lastLogon) >= 90 && lc(u.path).includes('ou=users,ou=contoso'));
+          const svc = st.users.filter(u => lc(u.path) === lc(OU.Service));
+          if (svc.some(u => !u.enabled)) return 'A service account was disabled. Those are reviewed separately.';
+          const left = stale.filter(u => u.enabled);
+          if (left.length) return `${left.length} stale user account(s) are still enabled.`;
+          const active = st.users.filter(u => u.enabled === false && u.lastLogon && daysAgo(u.lastLogon) < 90 && u.sam !== st.V.leaver.sam);
+          if (active.length) return `An active user was disabled: ${active.map(u => u.sam).join(', ')}.`;
+          return true;
+        },
+        hints: ['<code>Search-ADAccount</code> can find inactive accounts for you.', 'Use <code>-AccountInactive -TimeSpan 90.00:00:00 -UsersOnly</code>, and scope it with <code>-SearchBase</code> so the Service Accounts OU isn\'t included. Check the list before acting.', '<code>Search-ADAccount -AccountInactive -TimeSpan 90.00:00:00 -UsersOnly -SearchBase "OU=Users,OU=Contoso,DC=contoso,DC=local" | Disable-ADAccount</code>'] },
+      { text: 'Audit Domain Admins: helpdesk staff shouldn\'t be domain admins through nested groups (IT admins must keep access).', optional: true,
+        check: st => {
+          if (nestedIn(st, 'GG-Helpdesk', 'Domain Admins')) return 'GG-Helpdesk is still nested (directly or indirectly) inside Domain Admins.';
+          if (!recursiveUsers(st, 'Domain Admins').includes('rdelagarza')) return 'You removed the IT admins\' access too.';
+          return true;
+        },
+        hints: ['Compare direct members with recursive members of Domain Admins.', '<code>Get-ADGroupMember "Domain Admins" -Recursive</code>, then look at what each nested group contains.', '<code>Remove-ADGroupMember -Identity GG-IT-Admins -Members GG-Helpdesk -Confirm:$false</code>'] }
+    ],
+    solution(st) {
+      const H = st.V.hire, Lk = st.V.locked, Lv = st.V.leaver;
+      const s = [
+        { cmd: `Get-ADUser -Filter "SamAccountName -like '${H.given[0].toLowerCase()}${H.sur.toLowerCase()}*'"`, note: `Check the standard name first: ${H.given[0].toLowerCase()}${H.sur.toLowerCase()}${H.sam.endsWith('2') ? ' is already taken, so the standard says ' + H.sam : ' is free'}.` },
+        { cmd: '$pw = ConvertTo-SecureString "Welcome#2026!" -AsPlainText -Force', note: 'A temporary password as a SecureString (in real life, generated and sent through a secure channel).' },
+        { cmd: `New-ADUser -Name "${H.given} ${H.sur}" -GivenName ${H.given} -Surname ${H.sur} -DisplayName "${H.given} ${H.sur}" -SamAccountName ${H.sam} -UserPrincipalName ${H.upn} -Path "${dept(H.dept)}" -AccountPassword $pw -Enabled $true -ChangePasswordAtLogon $true -Department ${H.dept} -Title "${H.title}"`, note: 'Create it in the department OU (not the default container), enabled, forced to change the password at first logon.' },
+        { cmd: `Get-ADPrincipalGroupMembership ${H.template}`, note: `Look at ${H.templateName}'s groups. ${H.excludeWhy}` },
+        { cmd: `$g = Get-ADPrincipalGroupMembership ${H.template} | Where-Object Name -ne "Domain Users"${H.exclude.map(x => ` | Where-Object Name -ne "${x}"`).join('')}`, note: 'Build the list without Domain Users (automatic) and without the group(s) needing separate approval.' },
+        { cmd: `Add-ADPrincipalGroupMembership -Identity ${H.sam} -MemberOf $g` },
+        { cmd: `Get-ADUser ${Lk.sam} -Properties LockedOut,BadLogonCount,LastBadPasswordAttempt`, note: 'Locked-out user: evidence first.' },
+        { cmd: 'Get-EventLog -LogName Security -InstanceId 4740 -Newest 2', note: `Lockout events name the source: ${Lk.source}.${Lk.reset ? ' She forgot the password, so a reset is needed.' : Lk.source.includes('iPhone') ? ' An old password saved on his phone keeps retrying, so a reset wouldn\'t help: the phone needs the new password.' : ' Simple typos, and she knows the password, so no reset.'}` }
+      ];
+      if (Lk.reset) {
+        s.push({ cmd: `Set-ADAccountPassword ${Lk.sam} -Reset -NewPassword (ConvertTo-SecureString "Temp#Reset2026" -AsPlainText -Force)`, note: 'Reset, and force her to pick her own at next logon.' });
+        s.push({ cmd: `Set-ADUser ${Lk.sam} -ChangePasswordAtLogon $true` });
+      }
+      s.push({ cmd: `Unlock-ADAccount ${Lk.sam}`, note: 'Unlock. A password reset alone doesn\'t unlock an account.' });
+      s.push(
+        { cmd: `Disable-ADAccount ${Lv.sam}`, note: 'Leaver: disable first, so access stops immediately.' },
+        { cmd: `Set-ADUser ${Lv.sam} -Description "Disabled 2026-11-20 per ${Lv.ticket}"`, note: 'Leave an audit trail on the object itself.' },
+        { cmd: `$lg = Get-ADPrincipalGroupMembership ${Lv.sam} | Where-Object Name -ne "Domain Users"` },
+        { cmd: `Remove-ADPrincipalGroupMembership ${Lv.sam} -MemberOf $lg -Confirm:$false`, note: 'Remove every group except the primary group.' },
+        { cmd: `Get-ADUser ${Lv.sam} | Move-ADObject -TargetPath "${OU.Disabled}"`, note: 'Move-ADObject needs a DN, so pipe the user object in.' },
+        { cmd: `Search-ADAccount -AccountInactive -TimeSpan 90.00:00:00 -UsersOnly -SearchBase "${OU.Users}"`, note: 'Hygiene: preview the stale accounts, scoped to the Users OU so service accounts are excluded.' },
+        { cmd: `Search-ADAccount -AccountInactive -TimeSpan 90.00:00:00 -UsersOnly -SearchBase "${OU.Users}" | Disable-ADAccount`, note: 'Disable them in one pipeline.' },
+        { cmd: 'Get-ADGroupMember "Domain Admins" -Recursive', note: 'Bonus: the recursive view shows a helpdesk analyst is effectively a Domain Admin.' },
+        { cmd: 'Get-ADGroupMember GG-IT-Admins', note: 'The cause: GG-Helpdesk is nested inside GG-IT-Admins.' },
+        { cmd: 'Remove-ADGroupMember -Identity GG-IT-Admins -Members GG-Helpdesk -Confirm:$false', note: 'Break the nesting; IT admins keep their access.' }
+      );
+      return s;
+    },
+    debrief: [
+      { title: 'Standards prevent collisions', text: 'Checking whether the standard name is taken before creating the account avoids duplicate-name failures and the "two Luis Perez" confusion that follows.' },
+      { title: 'Placement matters', text: 'New-ADUser defaults to the CN=Users container, where no department GPOs or delegations apply. <code>-Path</code> decides which policies the user gets.' },
+      { title: 'Copy access, not privilege', text: 'Template-based onboarding is fast, but it copies everything. Excluding approval-gated and admin groups is how least privilege survives day-to-day operations.' },
+      { title: 'Lockouts have causes', text: 'Event 4740 names the device generating bad attempts. A phone with an old password needs updating; resetting the password would just lock the user out again. And a reset never unlocks.' },
+      { title: 'Offboard without deleting', text: 'Disable, strip groups, document, quarantine. Deleting loses the SID, the mailbox link and the audit trail you may need for legal holds.' },
+      { title: 'Nested groups hide privilege', text: 'Domain Admins looked clean at the top level. Only <code>-Recursive</code> revealed that the whole helpdesk had domain-admin rights through nesting.' }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

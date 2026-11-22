@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lab: SQLite database and Sign in with Google — Ruben de la Garza</title>
+<link rel="stylesheet" href="../../assets/style.css" />
+<link rel="stylesheet" href="../../assets/lab.css" />
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container inner">
+    <div class="brand">Ruben de la Garza <span>· Portfolio</span></div>
+    <nav><a href="../../index.html">&larr; All labs</a></nav>
+  </div>
+</header>
+
+<div class="app-header">
+  <div class="container">
+    <div class="crumbs">Portfolio / Labs / 15</div>
+    <h1>Lab: SQLite database and Sign in with Google</h1>
+    <p>The app's new release stores users in SQLite and signs them in with their Google accounts. Create the database with the right ownership, register an OAuth client, configure the app's secrets safely, then fix the ops team's Python report script.</p>
+    <div class="lab-meta"><span class="pill">Intermediate–Advanced</span><span class="pill">~15 min</span><span class="pill">sqlite3 · Google OAuth · Python · systemd</span><span class="pill">3 randomized configs</span><span class="pill">Part 3 of 3</span></div>
+  </div>
+</div>
+
+<section style="padding-top:24px">
+  <div class="container">
+    <div class="callout"><strong>What this demonstrates:</strong> wiring an app to its data and identity provider in production: file ownership for SQLite, OAuth 2.0 client and consent-screen setup, secrets in a root-only environment file loaded by systemd, and a bit of Python scripting for operations. Continues from Lab 14 (HTTPS is already working through Cloudflare).</div>
+
+    <div id="lab-status"></div>
+    <div id="lab-narration" class="lab-narration"></div>
+
+    <div class="lab-layout">
+      <div class="lab-main">
+        <div id="lab-terminal"></div>
+        <div id="editor-slot"></div>
+        <div class="mock-console lab-gui">
+          <div class="mock-head"><span><strong>Google Cloud console</strong> <span class="muted">· simulation · Google Auth Platform</span></span><span class="muted">Project: contoso-shop-web</span></div>
+          <div style="padding:12px 16px">
+            <div class="tabs"><button type="button" class="active" id="gc-tab-consent" data-gt="consent">Branding &amp; audience (consent screen)</button><button type="button" id="gc-tab-creds" data-gt="creds">Clients (credentials)</button></div>
+            <div data-gp="consent">
+              <div class="grid-2">
+                <div class="field check-list"><label style="color:var(--muted)">User type</label>
+                  <label><input type="radio" name="gc-type" id="gc-type-internal" disabled /> Internal <span class="muted">(Workspace org only)</span></label>
+                  <label><input type="radio" name="gc-type" id="gc-type-external" checked /> External (any Google account)</label></div>
+                <div>
+                  <div class="field"><label for="gc-appname">App name</label><input type="text" id="gc-appname" /></div>
+                  <div class="field"><label for="gc-support">User support email</label><select id="gc-support"><option value="">— Select —</option><option>ruben@contoso-partner.com</option><option>support@example-shop.com</option></select></div>
+                </div>
+              </div>
+              <div class="field check-list"><label style="color:var(--muted)">Scopes (data access)</label>
+                <label><input type="checkbox" id="gc-scope-openid" /> openid</label>
+                <label><input type="checkbox" id="gc-scope-email" /> …/auth/userinfo.email</label>
+                <label><input type="checkbox" id="gc-scope-profile" /> …/auth/userinfo.profile</label>
+                <label><input type="checkbox" id="gc-scope-drive" /> …/auth/drive <span class="badge warn">Sensitive: needs verification</span></label></div>
+              <button type="button" class="sm" id="gc-consent-save">Save consent screen</button>
+              <div class="mock-section mt-16"><h4>Publishing status: <span id="gc-pubstatus">Testing</span></h4>
+                <div class="row" style="gap:6px"><input type="text" id="gc-testuser" placeholder="test user email" style="flex:1" /><button type="button" class="ghost sm" id="gc-addtest">Add test user</button><button type="button" class="ghost sm" id="gc-publish">Publish app</button></div>
+                <div id="gc-testlist" class="muted" style="font-size:12px;margin-top:6px"></div></div>
+              <div id="gc-consent-msg" class="inline-msg"></div>
+            </div>
+            <div data-gp="creds" hidden>
+              <div class="grid-2">
+                <div class="field"><label for="gc-apptype">Application type</label><select id="gc-apptype"><option value="">— Select —</option><option>Web application</option><option>Desktop app</option><option>Android</option><option>iOS</option></select></div>
+                <div class="field"><label for="gc-cname">Name</label><input type="text" id="gc-cname" /></div>
+              </div>
+              <div class="field"><label for="gc-origins">Authorized JavaScript origins (one per line)</label><textarea id="gc-origins" rows="2" style="width:100%;font-family:var(--mono);font-size:12px;padding:6px;border:1px solid var(--border-strong);border-radius:4px"></textarea></div>
+              <div class="field"><label for="gc-redirects">Authorized redirect URIs (one per line)</label><textarea id="gc-redirects" rows="2" style="width:100%;font-family:var(--mono);font-size:12px;padding:6px;border:1px solid var(--border-strong);border-radius:4px"></textarea></div>
+              <button type="button" class="sm" id="gc-create">Create client</button>
+              <div id="gc-out" hidden class="mt-16">
+                <div class="field"><label>Client ID</label><input type="text" id="gc-clientid" readonly style="font-family:var(--mono);font-size:12px" /></div>
+                <div class="field"><label>Client secret</label><input type="text" id="gc-secret" readonly style="font-family:var(--mono);font-size:12px" /></div>
+              </div>
+              <div id="gc-msg" class="inline-msg"></div>
+            </div>
+          </div>
+        </div>
+        <div id="browser-slot"></div>
+      </div>
+      <aside class="lab-side">
+        <div class="panel">
+          <h3>Release notes: Contoso Shop 2.0</h3>
+          <p style="font-size:14px">Code is deployed to <code>/opt/shopapp</code> and the service runs, but sign-in is disabled until it's configured. Read <code>/opt/shopapp/README.md</code> for the settings it needs. Then the ops team wants their daily sign-up report working (<code>/opt/shopapp/scripts/daily_signups.py</code>).</p>
+          <p class="muted" style="font-size:12px;margin:0" id="vnote"></p>
+        </div>
+        <div class="panel">
+          <h3>Objectives</h3>
+          <ol id="lab-objectives" class="obj-list"></ol>
+        </div>
+        <div class="panel">
+          <h3>Server facts</h3>
+          <dl class="facts"><dt>Site</dt><dd>https://app.example-shop.com (via Cloudflare)</dd><dt>Service</dt><dd>shopapp.service · runs as user shopapp</dd><dt>Your session</dt><dd>ruben (sudo)</dd><dt>Today</dt><dd>2026-11-20</dd></dl>
+        </div>
+      </aside>
+    </div>
+
+    <div id="lab-debrief" class="lab-debrief" hidden></div>
+  </div>
+</section>
+
+<footer class="site"><div class="container inner"><div>Lab 15 · <a href="../../index.html">back to portfolio</a></div><div>© Ruben de la Garza</div></div></footer>
+
+<script src="../../assets/lab.js"></script>
+<script src="../../assets/linux-sim.js"></script>
+<script>
+(function () {
+  const L = LinuxSim; const esc = Lab.util.esc; const CmdError = Lab.CmdError;
+  const IP = '203.0.113.50', HOST = 'app.example-shop.com', BASE = 'https://' + HOST, DB = '/var/lib/shopapp/shop.db', ENVF = '/etc/shopapp/shopapp.env';
+  document.getElementById('editor-slot').innerHTML = L.editorHtml();
+  document.getElementById('browser-slot').innerHTML = L.browserHtml('Tester\'s laptop · browser');
+  const VARIANTS = [
+    { path: '/auth/google/callback', tester: 'maria.torres@gmail.com', testerName: 'Maria Torres', bug: { table: 'user', col: 'created_at' } },
+    { path: '/oauth2/callback', tester: 'luis.mendez@gmail.com', testerName: 'Luis Mendez', bug: { table: 'users', col: 'created' } },
+    { path: '/login/google/authorized', tester: 'ana.gomez@gmail.com', testerName: 'Ana Gomez', bug: { table: 'signups', col: 'created_at' } }
+  ];
+  const SCHEMA = `-- Contoso Shop 2.0 schema\nCREATE TABLE IF NOT EXISTS users (\n  id          INTEGER PRIMARY KEY AUTOINCREMENT,\n  google_sub  TEXT    NOT NULL UNIQUE,\n  email       TEXT    NOT NULL UNIQUE,\n  name        TEXT,\n  created_at  TEXT    NOT NULL DEFAULT (datetime('now'))\n);\nCREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at);\n`;
+  const UNIT = '[Unit]\nDescription=Contoso Shop web app\nAfter=network.target\n\n[Service]\nUser=shopapp\nGroup=shopapp\nEnvironment=PORT=3000\n# Settings and secrets (optional file: the app starts in setup mode without it)\nEnvironmentFile=-/etc/shopapp/shopapp.env\nWorkingDirectory=/opt/shopapp\nExecStart=/opt/shopapp/bin/shopapp\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n';
+  const readme = V => `# Contoso Shop 2.0\n\n## Configuration (environment variables, read at startup)\n\n| Variable              | Value                                       |\n|-----------------------|---------------------------------------------|\n| DATABASE_PATH         | /var/lib/shopapp/shop.db (SQLite)           |\n| GOOGLE_CLIENT_ID      | OAuth 2.0 Web client ID                     |\n| GOOGLE_CLIENT_SECRET  | OAuth 2.0 client secret                     |\n| BASE_URL              | https://app.example-shop.com                |\n\nThe OAuth callback is served at  BASE_URL + ${V.path}\nWithout BASE_URL the app assumes http://127.0.0.1:3000.\n\n## Database\n\nCreate it from schema.sql. The service runs as user "shopapp" and needs\nto write the database file AND its directory (SQLite journal files).\n\n## Secrets\n\nNever commit secrets to this directory. systemd loads\n/etc/shopapp/shopapp.env (see the unit file).\n`;
+  const script = V => `#!/usr/bin/env python3\n"""Print today's sign-ups for the daily ops email."""\nimport sqlite3\nfrom datetime import date\n\nDB_PATH = "shop.db"\n\nconn = sqlite3.connect(DB_PATH)\nrows = conn.execute(\n    "SELECT email, ${V.bug.col} FROM ${V.bug.table} WHERE date(${V.bug.col}) = ?",\n    (date.today().isoformat(),),\n).fetchall()\n\nprint(f"{len(rows)} sign-up(s) on {date.today()}")\nfor email, created_at in rows:\n    print(f"  {email}  {created_at}")\n`;
+
+  function createState(v) {
+    const V = VARIANTS[v]; const fs = L.baseFs('ruben');
+    fs['/opt/shopapp'] = L.d(); fs['/opt/shopapp/bin'] = L.d(); fs['/opt/shopapp/scripts'] = L.d(); fs['/var/backups'] = L.d();
+    fs['/opt/shopapp/bin/shopapp'] = L.f('#!/usr/bin/env python3\n', 'root', 'root', 0o755);
+    fs['/opt/shopapp/README.md'] = L.f(readme(V)); fs['/opt/shopapp/schema.sql'] = L.f(SCHEMA);
+    fs['/opt/shopapp/scripts/daily_signups.py'] = L.f(script(V), 'root', 'root', 0o755);
+    fs['/etc/systemd/system/shopapp.service'] = L.f(UNIT);
+    const users = L.baseUsers('ruben'); users.shopapp = { uid: 998, groups: ['shopapp'], shell: '/usr/sbin/nologin', system: true };
+    const st = { v, V, fs, cwd: '/home/ruben', users, units: { shopapp: UNIT }, packages: ['ufw', 'curl', 'python3', 'openssh-server', 'nginx'],
+      services: { ssh: { installed: true, active: true, enabled: true }, nginx: { installed: true, active: true, enabled: true }, shopapp: { installed: true, custom: true, active: true, enabled: true, listen: { addr: '127.0.0.1', port: 3000 }, unit: L.parseUnit(UNIT), env: { PORT: '3000' } } },
+      ufw: { enabled: true, defaultIn: 'deny', rules: [{ action: 'ALLOW', from: 'Anywhere', app: 'OpenSSH' }, { action: 'ALLOW', from: 'Anywhere', port: 443, proto: 'tcp' }] },
+      gc: { consent: null, testers: [], published: false, client: null }, signedIn: null, flags: {} };
+    return st;
+  }
+
+  // ---------- app model
+  const running = st => st.services.shopapp.active;
+  const env = st => (running(st) ? st.services.shopapp.env || {} : {});
+  function dbFor(st, user, path, write) {
+    const r = L.resolve(st, path); const dir = L.get(st, L.parent(r.path));
+    if (!r.node) return { err: 'unable to open database file' };
+    if (!L.canEnter(st, user, r.path) || !L.can(st, user, r.node, 'r')) return { err: 'unable to open database file' };
+    if (!r.node.db) return { err: (r.node.c || '').length ? 'file is not a database' : 'no such table: users' };
+    if (write && (!L.can(st, user, r.node, 'w') || !L.can(st, user, dir, 'w'))) return { err: 'attempt to write a readonly database' };
+    return { db: r.node.db };
+  }
+  const redirectUri = st => (env(st).BASE_URL ? env(st).BASE_URL.replace(/\/$/, '') : 'http://127.0.0.1:3000') + st.V.path;
+  const appPage = st => {
+    if (!running(st)) return { url: BASE + '/', secure: true, html: '<div class="br-page" style="text-align:center"><h4>502 Bad Gateway</h4><hr><p class="muted">nginx/1.24.0 (Ubuntu)</p></div>' };
+    const e = env(st);
+    const signin = st.signedIn ? `<p>Signed in as <b>${esc(st.signedIn)}</b> · <a href="#" data-br="signout">Sign out</a></p>` : e.GOOGLE_CLIENT_ID ? '<p><button class="br-btn" data-br="signin" id="br-signin"><b style="color:#4285f4">G</b> Sign in with Google</button></p>' : '<p class="muted">Sign-in is unavailable: the app is in setup mode (GOOGLE_CLIENT_ID is not set).</p>';
+    return { url: BASE + '/', secure: true, html: L.shopPage(`<h4>Spring sale is live</h4>${signin}`) };
+  };
+  const googleErr = (code, title, detail) => ({ url: 'https://accounts.google.com/signin/oauth/error', secure: true, html: `<div class="br-consent"><div style="font-size:22px;color:#4285f4;font-weight:700">Google</div><h4>${esc(title)}</h4><p style="font-size:13px">${detail}</p><p class="mono muted" style="font-size:12px">${esc(code)}</p></div>` });
+  function browse(st, url) { st.flow = null; return appPage(st); }
+  function action(st, act) {
+    const V = st.V; const e = env(st); const gc = st.gc;
+    if (act === 'signout') { st.signedIn = null; return appPage(st); }
+    if (act === 'signin') {
+      const ru = redirectUri(st);
+      const c = gc.client && gc.client.id === e.GOOGLE_CLIENT_ID ? gc.client : null;
+      if (!c) return googleErr('Error 401: invalid_client', 'Access blocked: Authorization Error', 'The OAuth client was not found. (The client ID the app sent doesn\'t exist in this Google Cloud project.)');
+      if (c.type !== 'Web application') return googleErr('Error 400: invalid_request', 'Access blocked: This app\'s request is invalid', `This client is a "${esc(c.type)}" client. Server-side web apps need a "Web application" client.`);
+      if (!c.redirects.includes(ru)) return googleErr('Error 400: redirect_uri_mismatch', 'Access blocked: This app\'s request is invalid', `You can't sign in because this app sent an invalid request.<br><br>Request details: <span class="mono">redirect_uri=${esc(ru)}</span><br>It must exactly match one of the client's authorized redirect URIs.`);
+      if (!gc.consent) return googleErr('Error 400: invalid_request', 'Access blocked: App not configured', 'The OAuth consent screen hasn\'t been configured for this project.');
+      if (!gc.published && !gc.testers.includes(V.tester)) return googleErr('Error 403: access_denied', `Access blocked: ${esc(gc.consent.name)} has not completed the Google verification process`, `${esc(gc.consent.name)} is currently being tested and can only be accessed by developer-approved testers. ${esc(V.tester)} isn't a test user.`);
+      st.flow = { ru };
+      return { url: `https://accounts.google.com/o/oauth2/v2/auth?client_id=${c.id.slice(0, 12)}…&redirect_uri=${encodeURIComponent(ru)}&scope=openid%20email%20profile`, secure: true, html: `<div class="br-consent"><div style="font-size:22px;color:#4285f4;font-weight:700">Google</div><h4>Choose an account</h4><p style="font-size:13px">to continue to <b>${esc(gc.consent.name)}</b></p><button class="br-btn" style="width:100%;justify-content:flex-start" data-br="consent" id="br-consent">👤 ${esc(V.testerName)} · ${esc(V.tester)}</button><p class="muted" style="font-size:11px;margin-top:10px">${esc(gc.consent.name)} will receive your name, email address and profile picture.</p></div>` };
+    }
+    if (act === 'consent') {
+      if (!st.flow) return appPage(st);
+      const fail = (m) => ({ url: st.flow.ru + '?code=4%2F0AQ…&scope=email+profile+openid', secure: true, html: `<div class="br-page"><h4>500 Internal Server Error</h4><pre class="ref" style="white-space:pre-wrap">${esc(m)}</pre><p class="muted" style="font-size:12px">(Also visible with: journalctl -u shopapp)</p></div>` });
+      if (e.GOOGLE_CLIENT_SECRET !== st.gc.client.secret) { st.services.shopapp.log = ['shopapp[3311]: OAuthError: invalid_client (Unauthorized) during token exchange']; return fail('OAuthError: invalid_client (Unauthorized)\nThe token exchange was rejected: GOOGLE_CLIENT_SECRET does not match this client.'); }
+      if (!e.DATABASE_PATH) { st.services.shopapp.log = ["shopapp[3311]: KeyError: 'DATABASE_PATH'"]; return fail("Traceback (most recent call last):\n  File \"/opt/shopapp/app/auth.py\", line 42, in callback\n    db = sqlite3.connect(os.environ['DATABASE_PATH'])\nKeyError: 'DATABASE_PATH'"); }
+      const h = dbFor(st, 'shopapp', e.DATABASE_PATH, true);
+      if (h.err) { st.services.shopapp.log = [`shopapp[3311]: sqlite3.OperationalError: ${h.err}`]; return fail(`Traceback (most recent call last):\n  File "/opt/shopapp/app/auth.py", line 47, in callback\n    db.execute("INSERT OR IGNORE INTO users ...")\nsqlite3.OperationalError: ${h.err}`); }
+      const t = h.db.tables.users;
+      if (!t || !['google_sub', 'email', 'name', 'created_at'].every(c => t.cols.some(x => x.name === c))) return fail('sqlite3.OperationalError: no such table: users (or wrong schema: create it from /opt/shopapp/schema.sql)');
+      if (!t.rows.some(r => r.email === st.V.tester)) L.sql.exec(h.db, `INSERT INTO users (google_sub, email, name) VALUES ('1094${Math.floor(Math.random() * 1e12)}', '${st.V.tester}', '${st.V.testerName}')`);
+      st.signedIn = st.V.testerName; st.flags.signedIn = true; st.flow = null;
+      return appPage(st);
+    }
+    return null;
+  }
+
+  // ---------- python3 simulation (just enough to run the ops script)
+  function python(lab, who, toks) {
+    const st = lab.state; const f = toks.filter(t => !t.startsWith('-'))[0];
+    if (!f) return { text: 'Python 3.12.3 (main, Nov  6 2024, 18:32:19) [GCC 13.2.0] on linux\n(Interactive mode isn\'t available in this simulation; run a script: python3 FILE)', cls: 'muted' };
+    const p = L.norm(f, st.cwd, '/home/ruben'); const r = L.resolve(st, p);
+    if (!r.node) return { text: `python3: can't open file '${p}': [Errno 2] No such file or directory`, cls: 'err' };
+    if (!L.canEnter(st, who(), r.path) || !L.can(st, who(), r.node, 'r')) return { text: `python3: can't open file '${p}': [Errno 13] Permission denied`, cls: 'err' };
+    const src = r.node.c;
+    const tb = (line, code, err) => ({ text: `Traceback (most recent call last):\n  File "${p}", line ${line}, in <module>\n    ${code}\n${err}`, cls: 'err' });
+    const lineOf = re => { const i = src.split('\n').findIndex(l => re.test(l)); return i + 1; };
+    if (!/import sqlite3/.test(src)) return tb(lineOf(/sqlite3\.connect/), 'conn = sqlite3.connect(DB_PATH)', "NameError: name 'sqlite3' is not defined");
+    let dbPath = null;
+    const m = src.match(/DB_PATH\s*=\s*(.+)/);
+    if (!m) return { text: 'This simulation runs scripts that keep the original structure (DB_PATH = ..., conn.execute("...")).', cls: 'warn' };
+    const rhs = m[1].trim();
+    let mm;
+    if ((mm = rhs.match(/^["']([^"']+)["']/))) dbPath = mm[1];
+    else if ((mm = rhs.match(/^os\.environ\.get\(\s*["'](\w+)["']\s*(?:,\s*["']([^"']+)["'])?\s*\)/))) { if (!/import os/.test(src)) return tb(lineOf(/DB_PATH\s*=/), m[0], "NameError: name 'os' is not defined. Did you forget to import 'os'?"); dbPath = mm[2] || null; if (!dbPath) return tb(lineOf(/sqlite3\.connect/), 'conn = sqlite3.connect(DB_PATH)', 'TypeError: expected str, bytes or os.PathLike object, not NoneType\n(DATABASE_PATH isn\'t set in your shell: only the service has it.)'); }
+    else if ((mm = rhs.match(/^os\.environ\[\s*["'](\w+)["']\s*\]/))) { return tb(lineOf(/DB_PATH\s*=/), m[0], `KeyError: '${mm[1]}'\n(That variable only exists in the service's environment, not in your shell.)`); }
+    else return { text: 'This simulation understands DB_PATH = "/path" or os.environ.get("NAME", "/default/path").', cls: 'warn' };
+    const sqlm = src.match(/execute\(\s*["']([^"']+)["']/);
+    if (!sqlm) return { text: 'Couldn\'t find the conn.execute("...") call (keep the original structure).', cls: 'warn' };
+    const abs = L.norm(dbPath, st.cwd, '/home/ruben');
+    let node = L.get(st, abs);
+    const user = who();
+    if (!node) {
+      const dir = L.get(st, L.parent(abs));
+      if (!dir || !L.canEnter(st, user, abs) || !L.can(st, user, dir, 'w')) return tb(lineOf(/sqlite3\.connect/), 'conn = sqlite3.connect(DB_PATH)', 'sqlite3.OperationalError: unable to open database file');
+      st.fs[abs] = L.f('', user, (st.users[user] || { groups: [user] }).groups[0], 0o644); st.fs[abs].db = L.newDb(); node = st.fs[abs];
+    }
+    if (!L.canEnter(st, user, abs) || !L.can(st, user, node, 'r')) return tb(lineOf(/sqlite3\.connect/), 'conn = sqlite3.connect(DB_PATH)', 'sqlite3.OperationalError: unable to open database file');
+    if (!node.db) node.db = L.newDb();
+    let res;
+    try { res = L.sql.exec(node.db, sqlm[1], ['2026-11-20']); }
+    catch (e) { if (e.sql) return tb(lineOf(/execute\(/), 'rows = conn.execute(', `sqlite3.OperationalError: ${e.message}${!dbPath.startsWith('/') ? `\n(Note: "${dbPath}" is relative, so Python looked for it in ${st.cwd} and created an empty database there.)` : ''}`); throw e; }
+    const rows = res.rows || [];
+    if (rows.length && rows.some(rw => rw[0] === st.V.tester)) st.flags.scriptOk = true;
+    return { text: `${rows.length} sign-up(s) on 2026-11-20` + rows.map(rw => `\n  ${rw[0]}  ${rw[1]}`).join('') };
+  }
+
+  const cfg = {
+    user: 'ruben', home: '/home/ruben', host: 'web01', ip: IP, adminIp: '198.51.100.23',
+    packages: { sqlite3: () => null },
+    start: (st, name, unit, envv) => (name === 'shopapp' ? { ok: true, listen: { addr: '127.0.0.1', port: +(envv.PORT || 3000) } } : { ok: true }),
+    listeners: st => [{ addr: '0.0.0.0', port: 80, proc: 'nginx' }, { addr: '0.0.0.0', port: 443, proc: 'nginx' }].concat(running(st) ? [{ addr: '127.0.0.1', port: 3000, proc: 'shopapp' }] : []),
+    curl: (st, toks) => ({ text: running(st) ? (toks.some(t => /-[a-z]*I/.test(t)) ? 'HTTP/2 200\nserver: cloudflare\ncontent-type: text/html; charset=utf-8' : '<!doctype html><title>Contoso Shop</title>…') : 'HTTP/2 502', cls: '' }),
+    extra: (lab, who) => ({ python3: { raw: true, aliases: ['python'], desc: 'Run a Python script (python3 FILE)', run: a => python(lab, who, a._pos) } })
+  };
+
+  // ---------- Google console wiring
+  let lab; const $ = s => document.querySelector(s); const S = () => lab.state;
+  const gmsg = (id, t, c) => { $(id).textContent = t; $(id).className = 'inline-msg ' + (c || ''); };
+  document.querySelectorAll('[data-gt]').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('[data-gt]').forEach(x => x.classList.toggle('active', x === b)); document.querySelectorAll('[data-gp]').forEach(p => { p.hidden = p.dataset.gp !== b.dataset.gt; }); }));
+  $('#gc-consent-save').addEventListener('click', () => {
+    const st = S(); const name = $('#gc-appname').value.trim(); const sup = $('#gc-support').value;
+    if (!name || !sup) return gmsg('#gc-consent-msg', 'App name and user support email are required.', 'err');
+    const scopes = ['openid', 'email', 'profile', 'drive'].filter(s => $('#gc-scope-' + s).checked);
+    st.gc.consent = { name, support: sup, scopes };
+    gmsg('#gc-consent-msg', 'Consent screen saved.' + (scopes.includes('drive') ? ' ⚠ A sensitive scope was added: the app will need Google verification before publishing.' : ''), scopes.includes('drive') ? 'err' : 'ok');
+    lab.touch(); lab.refresh();
+  });
+  $('#gc-addtest').addEventListener('click', () => { const st = S(); const e = $('#gc-testuser').value.trim().toLowerCase(); if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/.test(e)) return gmsg('#gc-consent-msg', 'Enter a valid email address.', 'err'); if (!st.gc.testers.includes(e)) st.gc.testers.push(e); $('#gc-testuser').value = ''; gmsg('#gc-consent-msg', `Added test user ${e}.`, 'ok'); lab.touch(); lab.refresh(); });
+  $('#gc-publish').addEventListener('click', () => {
+    const st = S(); if (!st.gc.consent) return gmsg('#gc-consent-msg', 'Configure and save the consent screen first.', 'err');
+    if (st.gc.consent.scopes.includes('drive')) return gmsg('#gc-consent-msg', 'Publishing blocked: the app requests a sensitive scope (drive) and needs Google verification (weeks). Remove scopes you don\'t need.', 'err');
+    st.gc.published = true; gmsg('#gc-consent-msg', 'App published: any Google account can sign in.', 'ok'); lab.touch(); lab.refresh();
+  });
+  $('#gc-create').addEventListener('click', () => {
+    const st = S(); const type = $('#gc-apptype').value; const name = $('#gc-cname').value.trim();
+    if (!type || !name) return gmsg('#gc-msg', 'Choose an application type and a name.', 'err');
+    const lines = id => $(id).value.split(/\n+/).map(x => x.trim()).filter(Boolean);
+    const redirects = lines('#gc-redirects'), origins = lines('#gc-origins');
+    const bad = redirects.concat(origins).find(u => !/^https:\/\/[^\s/]+/.test(u) && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(u));
+    if (bad) return gmsg('#gc-msg', `Invalid URI "${bad}": must use https (http is only allowed for localhost).`, 'err');
+    if (origins.some(o => /\/./.test(o.replace(/^https?:\/\//, '')))) return gmsg('#gc-msg', 'Invalid origin: origins can\'t contain a path (no trailing slash either).', 'err');
+    if (st.gc.client) { Object.assign(st.gc.client, { type, name, redirects, origins }); gmsg('#gc-msg', 'Client saved. (Changes can take a few minutes to apply at Google; instant here.)', 'ok'); }
+    else {
+      const rnd = (n, set) => Array.from({ length: n }, () => set[Math.floor(Math.random() * set.length)]).join('');
+      st.gc.client = { id: `4821${rnd(8, '0123456789')}-${rnd(32, 'abcdefghijklmnopqrstuvwxyz0123456789')}.apps.googleusercontent.com`, secret: 'GOCSPX-' + rnd(28, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'), type, name, redirects, origins };
+      $('#gc-clientid').value = st.gc.client.id; $('#gc-secret').value = st.gc.client.secret; $('#gc-out').hidden = false; $('#gc-create').textContent = 'Save client';
+      gmsg('#gc-msg', 'OAuth client created.', 'ok');
+    }
+    lab.touch(); lab.refresh();
+  });
+  function render(st) {
+    $('#gc-pubstatus').textContent = st.gc.published ? 'In production' : 'Testing';
+    $('#gc-testlist').textContent = st.gc.published ? 'Published: all Google accounts can sign in.' : st.gc.testers.length ? 'Test users: ' + st.gc.testers.join(', ') : 'No test users. Only test users can sign in while the app is in Testing.';
+  }
+  function onReset(st) {
+    document.getElementById('ed-panel').hidden = true;
+    ['#gc-appname', '#gc-testuser', '#gc-cname', '#gc-origins', '#gc-redirects', '#gc-clientid', '#gc-secret'].forEach(s => { $(s).value = ''; });
+    $('#gc-support').value = ''; $('#gc-apptype').value = ''; ['openid', 'email', 'profile', 'drive'].forEach(s => { $('#gc-scope-' + s).checked = false; });
+    $('#gc-out').hidden = true; $('#gc-create').textContent = 'Create client'; gmsg('#gc-msg', ''); gmsg('#gc-consent-msg', '');
+    $('#br-url').value = BASE + '/'; $('#br-view').innerHTML = '<div class="muted" style="padding:20px">Press Go to load the site.</div>';
+    $('#vnote').textContent = `The tester for today is ${st.V.tester}.`;
+  }
+
+  // ---------- checks
+  const usersTable = st => { const n = L.get(st, DB); return n && n.db && n.db.tables.users; };
+  const ENVTXT = st => `DATABASE_PATH=${DB}\nGOOGLE_CLIENT_ID=${st.gc.client ? st.gc.client.id : '<client id>'}\nGOOGLE_CLIENT_SECRET=${st.gc.client ? st.gc.client.secret : '<client secret>'}\nBASE_URL=${BASE}\n`;
+  const FIXED = st => script(st.V).replace('DB_PATH = "shop.db"', `DB_PATH = "${DB}"`).replace(new RegExp(`FROM ${st.V.bug.table} `), 'FROM users ').replace(new RegExp(`\\b${st.V.bug.col}\\b`, 'g'), 'created_at');
+
+  lab = Lab({
+    id: 'sqlite-oauth-lab', dialect: 'bash', variants: 3, termTitle: 'ssh ruben@203.0.113.50 — web01',
+    prompt: st => `${st.__asUser || (st.rootShell ? 'root' : 'ruben')}@web01:${st.cwd === '/home/ruben' ? '~' : st.cwd.replace(/^\/home\/ruben/, '~')}${st.rootShell ? '#' : '$'} `,
+    banner: 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-49-generic x86_64)\nLast login: Fri Nov 20 20:02:11 2026 from 198.51.100.23\nType "help" for the commands available in this simulation.\n',
+    createState, commands: lab => L.commands(lab, cfg), render, onReset,
+    objectives: [
+      { text: 'Create the SQLite database at <code>/var/lib/shopapp/shop.db</code> from <code>schema.sql</code>.',
+        check: st => { if (!st.packages.includes('sqlite3')) return 'The sqlite3 command-line tool isn\'t installed.'; const t = usersTable(st); if (!t) return L.get(st, DB) ? 'The database exists but has no users table.' : 'The database doesn\'t exist yet.'; return ['google_sub', 'email', 'name', 'created_at'].every(c => t.cols.some(x => x.name === c)) || 'The users table doesn\'t match schema.sql.'; },
+        hints: ['Install the CLI, create the directory, then feed it the schema.', 'Who creates the file decides who owns it. Creating it as the service user avoids a chown later. sqlite3 can read SQL from a file with &lt; or .read.', '<code>sudo apt install -y sqlite3</code>, <code>sudo mkdir -p /var/lib/shopapp</code>, <code>sudo chown shopapp:shopapp /var/lib/shopapp</code>, <code>sudo -u shopapp sqlite3 /var/lib/shopapp/shop.db &lt; /opt/shopapp/schema.sql</code>'] },
+      { text: 'The service user can write the database (file and directory), and other users can\'t read it.',
+        check: st => {
+          const n = L.get(st, DB), d = L.get(st, '/var/lib/shopapp'); if (!n || !d) return 'Create the database first.';
+          if (!L.can(st, 'shopapp', n, 'w')) return 'shopapp can\'t write the database file.';
+          if (!L.can(st, 'shopapp', d, 'w')) return 'shopapp can\'t write the directory, and SQLite needs that for its journal file ("attempt to write a readonly database").';
+          if ((n.m & 0o004) && (d.m & 0o001)) return 'The database (user personal data) is readable by every account on the server. Tighten the file or directory permissions.';
+          return true;
+        },
+        hints: ['Check with <code>ls -l /var/lib/shopapp</code> and <code>ls -ld /var/lib/shopapp</code>.', 'SQLite writes a journal next to the database, so the directory must be writable too. Personal data shouldn\'t be world-readable.', '<code>sudo chown -R shopapp:shopapp /var/lib/shopapp</code>, <code>sudo chmod 750 /var/lib/shopapp</code>, <code>sudo chmod 640 /var/lib/shopapp/shop.db</code>'] },
+      { text: 'Register the app with Google: consent screen (basic scopes only), the tester allowed in, and a Web client with the exact redirect URI.',
+        check: st => {
+          const g = st.gc; if (!g.consent) return 'The consent screen isn\'t configured.';
+          const sc = g.consent.scopes; if (!['openid', 'email', 'profile'].every(s => sc.includes(s))) return 'Declare openid, email and profile on the consent screen.';
+          if (sc.includes('drive')) return 'The drive scope isn\'t needed and forces a Google verification review. Remove it.';
+          if (!g.published && !g.testers.includes(st.V.tester)) return `The app is in Testing and ${st.V.tester} isn't a test user.`;
+          if (!g.client) return 'No OAuth client yet.';
+          if (g.client.type !== 'Web application') return 'The client must be a "Web application" client.';
+          return g.client.redirects.includes(BASE + st.V.path) || `The authorized redirect URIs don't include the app's callback (${BASE}…, see the README).`;
+        },
+        hints: ['Two parts in the console: the consent screen (who can sign in, what data) and the client (credentials).', 'Ask only for what the app needs (openid, email, profile). In Testing, only test users can sign in. Redirect URIs must match <em>exactly</em>: scheme, host, path, no trailing slash.', `Consent screen: name, support email, the 3 basic scopes, Save, then add the tester as a test user. Client: Web application, redirect URI = BASE_URL + the callback path from the README.`] },
+      { text: 'Configure the app: settings and secrets in <code>/etc/shopapp/shopapp.env</code> (root-only), loaded by the running service.',
+        check: st => {
+          const n = L.get(st, ENVF); if (!n) return 'There\'s no /etc/shopapp/shopapp.env yet.';
+          const fileEnv = L.readEnvFile(n.c); const need = { DATABASE_PATH: DB, BASE_URL: BASE };
+          if (st.gc.client) { need.GOOGLE_CLIENT_ID = st.gc.client.id; need.GOOGLE_CLIENT_SECRET = st.gc.client.secret; } else return 'Create the OAuth client first: you need its ID and secret.';
+          const wrong = Object.keys(need).filter(k => (fileEnv[k] || '').replace(/\/$/, '') !== need[k].replace(/\/$/, ''));
+          if (wrong.length) return `In the env file: ${wrong.join(', ')} ${wrong.length > 1 ? 'are' : 'is'} missing or wrong.`;
+          if (n.o !== 'root' || (n.m & 0o077) !== 0) return `The env file holds the client secret but is ${L.modeStr(n)} ${n.o}:${n.g}. Make it root-only (chmod 600). systemd reads it as root before starting the app.`;
+          const live = env(st); const stale = Object.keys(need).filter(k => (live[k] || '').replace(/\/$/, '') !== need[k].replace(/\/$/, ''));
+          return !stale.length || 'The file is right, but the running service still has the old settings (environment is read at start: restart it).';
+        },
+        hints: ['The README lists the four variables. The unit file already points at /etc/shopapp/shopapp.env.', 'Create the directory and file as root, keep it 600, then restart the service. Editing the file alone doesn\'t change a running process.', '<code>sudo mkdir -p /etc/shopapp</code>, <code>sudo nano /etc/shopapp/shopapp.env</code> (DATABASE_PATH=…, GOOGLE_CLIENT_ID=…, GOOGLE_CLIENT_SECRET=…, BASE_URL=https://app.example-shop.com), <code>sudo chmod 600 /etc/shopapp/shopapp.env</code>, <code>sudo systemctl restart shopapp</code>'] },
+      { text: 'The tester signs in with Google on the live site, and a row appears in the users table.',
+        check: st => { const t = usersTable(st); const row = t && t.rows.find(r => r.email === st.V.tester); return (st.flags.signedIn && !!row) || (st.flags.signedIn ? 'Signed in, but no row in the database you created.' : 'Nobody has signed in yet. Use the browser panel.'); },
+        hints: ['Load the site, click Sign in with Google, pick the tester\'s account.', 'Error pages tell you which side is wrong: Google errors (redirect_uri_mismatch, access_denied) vs app errors (500 with a traceback). <code>journalctl -u shopapp</code> shows app errors.', 'Fix whatever the error page names, restart if you change the env file, and try again. Check with <code>sudo sqlite3 /var/lib/shopapp/shop.db "SELECT email, created_at FROM users;"</code>'] },
+      { text: 'Fix the ops script <code>daily_signups.py</code> so it prints today\'s sign-ups, and run it successfully.',
+        check: st => st.flags.scriptOk || 'No successful run that lists today\'s sign-up yet.',
+        hints: ['Run it and read the traceback. Then compare its SQL with the real schema (<code>.schema users</code>).', 'A relative DB path depends on the current directory, so make it absolute. The script also has a table or column name that doesn\'t exist. You\'ll need permission to read the database, too.', '<code>sudo nano /opt/shopapp/scripts/daily_signups.py</code>: <code>DB_PATH = "/var/lib/shopapp/shop.db"</code> and the right table/column; then <code>sudo -u shopapp python3 /opt/shopapp/scripts/daily_signups.py</code>'] },
+      { text: 'Take a consistent backup of the database into <code>/var/backups</code>.', optional: true,
+        check: st => { const b = st.flags.backup; const n = b && L.get(st, b); return (b && b.startsWith('/var/backups/') && n && n.db && n.db.tables.users && n.db.tables.users.rows.length > 0) || 'No backup with data in /var/backups yet.'; },
+        hints: ['Copying a live SQLite file with cp can catch it mid-write.', 'The sqlite3 CLI has a .backup command that takes a consistent snapshot.', '<code>sudo sqlite3 /var/lib/shopapp/shop.db ".backup /var/backups/shop-2026-11-20.db"</code>'] }
+    ],
+    solution(st) {
+      const p = st.V.path; return [
+        { cmd: 'cat /opt/shopapp/README.md', note: `The README lists four settings and the callback path (${p}). Note: the service user needs to write the DB file and its directory.` },
+        { cmd: 'sudo apt install -y sqlite3' },
+        { cmd: 'sudo mkdir -p /var/lib/shopapp', note: 'Database directory owned by the service user, closed to everyone else.' }, { cmd: 'sudo chown shopapp:shopapp /var/lib/shopapp' }, { cmd: 'sudo chmod 750 /var/lib/shopapp' },
+        { cmd: `sudo -u shopapp sqlite3 ${DB} < /opt/shopapp/schema.sql`, note: 'Create the database as shopapp so it owns the file from the start.' },
+        { cmd: `sudo chmod 640 ${DB}` }, { cmd: `sudo sqlite3 ${DB} ".schema users"` },
+        { note: 'Google: consent screen with only the basic scopes (no verification needed), and the tester added while the app is in Testing.', run: api => api.click('#gc-tab-consent') },
+        { run: api => api.fill('#gc-appname', 'Contoso Shop') }, { run: api => api.fill('#gc-support', 'support@example-shop.com') },
+        { run: api => api.check('#gc-scope-openid') }, { run: api => api.check('#gc-scope-email') }, { run: api => api.check('#gc-scope-profile') }, { run: api => api.click('#gc-consent-save') },
+        { run: api => api.fill('#gc-testuser', st.V.tester) }, { run: api => api.click('#gc-addtest') },
+        { note: `Client: a Web application with the exact redirect URI ${BASE}${p}.`, run: api => api.click('#gc-tab-creds') },
+        { run: api => api.fill('#gc-apptype', 'Web application') }, { run: api => api.fill('#gc-cname', 'Contoso Shop web') },
+        { run: api => api.fill('#gc-origins', BASE) }, { run: api => api.fill('#gc-redirects', BASE + p) }, { run: api => api.click('#gc-create') },
+        { cmd: 'sudo mkdir -p /etc/shopapp', note: 'Secrets go in a root-only env file outside the code directory. systemd loads it (see the unit).' },
+        { cmd: `sudo nano ${ENVF}` }, { run: api => api.fill('#ed-text', ENVTXT(api.state), { instant: true }) }, { run: api => api.click('#ed-save') },
+        { cmd: `sudo chmod 600 ${ENVF}` }, { cmd: 'sudo systemctl restart shopapp', note: 'Environment is read at start, so restart to load it.' },
+        { note: 'Sign in as the tester on the live site.', run: async api => { await api.fill('#br-url', BASE + '/'); await api.click('#br-go'); }, wait: 700 },
+        { run: api => api.click('#br-signin'), wait: 700 }, { run: api => api.click('#br-consent'), wait: 700 },
+        { cmd: `sudo sqlite3 ${DB} "SELECT email, created_at FROM users;"`, note: 'The sign-in created a row.' },
+        { cmd: 'python3 /opt/shopapp/scripts/daily_signups.py', note: 'Now the ops script: run it and read the traceback.' },
+        { cmd: 'sudo nano /opt/shopapp/scripts/daily_signups.py', note: `Fix it: absolute DB path (a relative path depends on the current directory) and the real ${st.V.bug.table !== 'users' ? 'table name (users)' : 'column name (created_at)'}.` },
+        { run: api => api.fill('#ed-text', FIXED(api.state), { instant: true }) }, { run: api => api.click('#ed-save') },
+        { cmd: 'sudo -u shopapp python3 /opt/shopapp/scripts/daily_signups.py', note: 'Run it as the service user, which can read the database (ruben can\'t, by design).' },
+        { cmd: `sudo sqlite3 ${DB} ".backup /var/backups/shop-2026-11-20.db"`, note: 'Bonus: .backup takes a consistent snapshot even while the app is writing.' }
+      ];
+    },
+    debrief: [
+      { title: 'SQLite permissions are about the directory too', text: 'SQLite creates a journal file next to the database. A writable file in a read-only directory still fails with "attempt to write a readonly database".' },
+      { title: 'Create data as the user that owns it', text: '<code>sudo -u shopapp sqlite3 …</code> makes the service user the owner from the start. Tight modes (750/640) keep personal data away from other accounts.' },
+      { title: 'OAuth errors name the culprit', text: 'redirect_uri_mismatch = the URI isn\'t registered exactly; access_denied = consent screen in Testing without the user; invalid_client = wrong client ID or secret. Without BASE_URL the app sent http://127.0.0.1, a classic misconfiguration.' },
+      { title: 'Least data, least friction', text: 'openid, email and profile are non-sensitive, so no Google verification is needed. Adding Drive "just in case" would block publishing for weeks.' },
+      { title: 'Secrets: root-only, outside the code, loaded at start', text: 'systemd reads EnvironmentFile as root before dropping to the service user, so 600 root:root works and keeps the secret away from the app directory and git. Changes need a restart.' },
+      { title: 'Scripts run where you run them', text: 'A relative path resolves against the current directory, so the script silently created an empty shop.db and then failed. Absolute paths (or the service\'s own env) make scripts behave the same from cron, sudo or a shell.' }
+    ]
+  });
+  L.attachEditor(lab);
+  L.attachBrowser(lab, browse, action);
+})();
+</script>
+</body>
+</html>
