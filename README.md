@@ -1,6 +1,6 @@
 # Ruben de la Garza — Interactive Portfolio
 
-An interactive portfolio for a Senior Technical Consultant. Instead of describing skills, it lets visitors **do the work**: sixteen hands-on labs with simulated terminals, admin consoles, a ticketing tool and a browser.
+An interactive portfolio for a Senior Technical Consultant. Instead of describing skills, it lets visitors **do the work**: twenty-one hands-on labs with simulated terminals, admin consoles, a ticketing tool and a browser.
 
 **Live site:** _add your GitHub Pages URL here after the first deploy_
 
@@ -43,6 +43,16 @@ Each lab drops the visitor into a broken or empty environment with 4–8 objecti
 | 14 | HTTPS with a Cloudflare origin certificate (Part 2/3) | bash · Cloudflare dashboard · browser | Proxied DNS, SSL modes, Origin CA cert + key permissions, redirect loops, 52x errors, origin lockdown |
 | 15 | SQLite and Sign in with Google (Part 3/3) | bash · Google Cloud console · browser | sqlite3, file/dir ownership, OAuth consent screen + client, redirect URIs, root-only env file, Python script fix, `.backup` |
 
+### Containers & Orchestration
+
+| Lab | Title | Interface | Skills |
+|---|---|---|---|
+| 17 | Slim down a 1.2 GB Docker image | bash · docker | `docker history`, `.dockerignore`, multi-stage builds, base images (slim, alpine, distroless, scratch), native libs (libpq5), static Go binaries, CA certificates, non-root images |
+| 18 | Container won't start: permissions and volumes | bash · docker | `docker logs`/`inspect`, container UIDs vs host ownership, bind mounts vs named volumes, Dockerfile `USER`/`chown` order, NFS root_squash, avoiding chmod 777 / root / privileged |
+| 19 | Compose stack: networking and startup order | bash · docker compose | Service-name DNS vs localhost, Compose networks, published vs internal ports, healthchecks + `condition: service_healthy`, `.env` interpolation |
+| 20 | Fix a broken Kubernetes rollout | kubectl · manifests in git | `get`/`describe`/events/`logs --previous`, CrashLoopBackOff, CreateContainerConfigError, readiness probes, ConfigMaps and Secrets per namespace, rolling updates, `rollout status/history/undo` |
+| 21 | Kubernetes Service with no traffic | kubectl · manifests in git | Throwaway test pods, Service selectors, Endpoints, `port` vs `targetPort`, refused vs timeout, NetworkPolicy namespace selectors, `kubernetes.io/metadata.name` |
+
 ### AI & Automation
 
 | Lab | Title | Interface | Skills |
@@ -52,7 +62,7 @@ Each lab drops the visitor into a broken or empty environment with 4–8 objecti
 **Lab features**
 
 - **Randomized environments:** each lab has 3 variants (different fault, tenant or config), so a repeat visit isn't a copy-paste.
-- **Realistic errors:** commands validate parameters and fail the way the real tools do (PowerShell, gcloud, az, bash, nginx, sqlite3, OAuth, Cloudflare).
+- **Realistic errors:** commands validate parameters and fail the way the real tools do (PowerShell, gcloud, az, bash, nginx, sqlite3, OAuth, Cloudflare, docker, kubectl).
 - **Hint ladder:** three hints per objective (nudge → concept → near-answer), each costing points.
 - **Check my work:** state-based feedback on every open objective.
 - **Watch solution:** an autoplay walkthrough with narration, for visitors who don't have 10 minutes.
@@ -64,7 +74,7 @@ Each lab drops the visitor into a broken or empty environment with 4–8 objecti
 
 ```
 .
-├── index.html               Landing page (four tracks, progress badges)
+├── index.html               Landing page (six tracks, progress badges)
 ├── about.html               CV, with links from each role to the matching labs
 ├── contact.html             Contact details
 ├── assets/
@@ -72,14 +82,20 @@ Each lab drops the visitor into a broken or empty environment with 4–8 objecti
 │   ├── lab.css              Lab styles (terminal, objectives, consoles, editor, browser)
 │   ├── lab.js               Lab engine: terminal + parser, objectives, hints, scoring, autoplay
 │   ├── gcp-common.js        Google Cloud helpers (firewall rules + evaluation)
-│   └── linux-sim.js         Linux server simulation (filesystem, users, systemd, ufw, nginx, sqlite3, editor, browser)
+│   ├── linux-sim.js         Linux server simulation (filesystem, users, systemd, ufw, nginx, sqlite3, editor, browser)
+│   └── container-sim.js     Docker, Compose and kubectl simulation (YAML + Dockerfile parsers, virtual cluster)
 └── apps/
     ├── m365-hardening-lab/  01      ├── gcp-diagnostics/     06      ├── email-dns-lab/          11
     ├── sso-mfa-lab/         02      ├── cloud-dns-lab/       07      ├── outlook-migration-lab/  12
     ├── ad-lab/              03      ├── hybrid-vpn-lab/      08      ├── linux-web-lab/          13
     ├── itsm-ticket-lab/     04      ├── gcp-lb-cdn-lab/      09      ├── cloudflare-ssl-lab/     14
     └── vpn-troubleshooter/  05      └── azure-vnet-lab/      10      ├── sqlite-oauth-lab/       15
-                                                                     └── local-llm-bot-lab/      16
+                                                                     ├── local-llm-bot-lab/      16
+                                                                     ├── docker-image-lab/       17
+                                                                     ├── docker-permissions-lab/ 18
+                                                                     ├── docker-compose-lab/     19
+                                                                     ├── k8s-rollout-lab/        20
+                                                                     └── k8s-service-lab/        21
 ```
 
 No build step, no backend, no npm, and no external dependencies: every page works offline from the files in this repo.
@@ -95,7 +111,9 @@ No build step, no backend, no npm, and no external dependencies: every page work
 - `debrief`: the "why it matters" notes shown on completion
 - optional `render(state)` / `onReset(state)` to drive a mock console, and `terminal: null` for GUI-only labs
 
-`assets/linux-sim.js` (`LinuxSim`) adds a shared Ubuntu server model for Labs 13–16: a virtual filesystem with owners and modes, `sudo`, `apt`, `systemctl`/`journalctl` (custom units, `daemon-reload`, `EnvironmentFile`), `ufw` (with lockout detection), `ss`, `curl`, an `nginx` config parser with real `nginx -t` errors, a small `sqlite3` SQL engine, a `nano` editor panel and a browser panel.
+`assets/linux-sim.js` (`LinuxSim`) adds a shared Ubuntu server model for Labs 13–21: a virtual filesystem with owners and modes, `sudo`, `apt`, `systemctl`/`journalctl` (custom units, `daemon-reload`, `EnvironmentFile`), `ufw` (with lockout detection), `ss`, `curl`, an `nginx` config parser with real `nginx -t` errors, a small `sqlite3` SQL engine, a `nano` editor panel and a browser panel.
+
+`assets/container-sim.js` (`ContainerSim`) builds on it for Labs 17–21: a YAML subset parser and emitter, a Dockerfile parser, a `docker` CLI (build with BuildKit-style output, images, history, run, ps, logs, inspect with `--format`, exec, volumes, networks) with per-lab hooks for build and runtime behaviour, Compose helpers (service normalization, `.env` interpolation), and a `kubectl` against a virtual cluster that derives pods, ReplicaSets, Endpoints and rollout state from Deployments, evaluates ConfigMap/Secret references and probes, and enforces NetworkPolicies on in-cluster `curl`.
 
 The checker runs in the browser, so a determined visitor could read the answers in the page source. That's fine for a portfolio, since this isn't a certification.
 

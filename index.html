@@ -4,9 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Ruben de la Garza — Technical Consultant Portfolio</title>
-<meta name="description" content="Interactive portfolio of Ruben de la Garza, Senior Technical Consultant: sixteen hands-on labs covering Microsoft 365, identity, Active Directory, ITSM, Google Cloud and Azure networking, email DNS and Linux web servers." />
+<meta name="description" content="Interactive portfolio of Ruben de la Garza, Senior Technical Consultant: twenty-one hands-on labs covering Microsoft 365, identity, Active Directory, ITSM, Google Cloud and Azure networking, email DNS, Linux web servers, Docker and Kubernetes." />
 <meta property="og:title" content="Ruben de la Garza — Technical Consultant Portfolio" />
-<meta property="og:description" content="Sixteen hands-on labs: Microsoft 365, SSO/MFA, Active Directory, ITSM, Google Cloud, Azure, email DNS, mailbox migration, local AI, Linux, Cloudflare and OAuth." />
+<meta property="og:description" content="Twenty-one hands-on labs: Microsoft 365, SSO/MFA, Active Directory, ITSM, Google Cloud, Azure, email DNS, mailbox migration, local AI, Linux, Cloudflare, OAuth, Docker and Kubernetes." />
 <link rel="stylesheet" href="assets/style.css" />
 <link rel="stylesheet" href="assets/lab.css" />
 </head>
@@ -28,8 +28,8 @@
     <div class="eyebrow">Interactive Portfolio</div>
     <h1>Don't take my CV's word for it. Do the work I do.</h1>
     <p class="lede">
-      Sixteen hands-on labs drop you into a broken or empty environment (a Microsoft 365 tenant,
-      a domain controller, a ticket queue, cloud networks, a fresh Linux server) and check whether
+      Twenty-one hands-on labs drop you into a broken or empty environment (a Microsoft 365 tenant,
+      a domain controller, a ticket queue, cloud networks, a fresh Linux server, a Kubernetes cluster) and check whether
       you fixed it properly. Faults are randomized and hints are there when you need them.
       Short on time? Every lab has a <strong>Watch solution</strong> button that replays the fix
       with the reasoning narrated.
@@ -169,6 +169,47 @@
         <h3>SQLite database and Sign in with Google</h3>
         <p>Create the database with the right ownership, register an OAuth client, keep secrets in a root-only env file, then fix the ops team's Python report.</p>
         <div><span class="tag">SQLite · OAuth</span><span class="tag">Python</span><span class="lab-progress"></span></div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="track">
+  <div class="container">
+    <div class="section-head">
+      <div class="section-title">Containers &amp; Orchestration</div>
+      <p>Docker images, volumes and Compose stacks, then Kubernetes rollouts and service networking.</p>
+    </div>
+    <div class="demo-grid">
+      <a class="demo-card" href="apps/docker-image-lab/" data-lab="docker-image-lab">
+        <div class="num">Lab 17 · Intermediate · ~15 min</div>
+        <h3>Slim down a 1.2 GB Docker image</h3>
+        <p>Read <code>docker history</code>, add a <code>.dockerignore</code> and rewrite the Dockerfile as a multi-stage build under 200 MB, without breaking native libraries, static binaries or CA certificates.</p>
+        <div><span class="tag">Dockerfile</span><span class="tag">multi-stage</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/docker-permissions-lab/" data-lab="docker-permissions-lab">
+        <div class="num">Lab 18 · Intermediate · ~10 min</div>
+        <h3>Container won't start: permissions and volumes</h3>
+        <p>A hardened image now runs as UID 10001 and crash-loops. Diagnose with logs and inspect, then fix ownership on the host, in the Dockerfile or with a named volume, with no chmod 777 and no root.</p>
+        <div><span class="tag">docker</span><span class="tag">volumes · UIDs</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/docker-compose-lab/" data-lab="docker-compose-lab">
+        <div class="num">Lab 19 · Intermediate · ~12 min</div>
+        <h3>Compose stack: networking and startup order</h3>
+        <p>"Works on my laptop", 502 on the server. Fix service names, networks and published ports, add a database healthcheck with <code>service_healthy</code>, and move secrets to <code>.env</code>.</p>
+        <div><span class="tag">docker compose</span><span class="tag">healthchecks</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/k8s-rollout-lab/" data-lab="k8s-rollout-lab">
+        <div class="num">Lab 20 · Intermediate · ~12 min</div>
+        <h3>Fix a broken Kubernetes rollout</h3>
+        <p>A config change left a Deployment stuck: CrashLoopBackOff, CreateContainerConfigError or a failing readiness probe. Use describe, events and <code>logs --previous</code>, then fix the manifests.</p>
+        <div><span class="tag">kubectl</span><span class="tag">Deployments · probes</span><span class="lab-progress"></span></div>
+      </a>
+      <a class="demo-card" href="apps/k8s-service-lab/" data-lab="k8s-service-lab">
+        <div class="num">Lab 21 · Intermediate · ~12 min</div>
+        <h3>Kubernetes Service with no traffic</h3>
+        <p>Pods are green but callers time out. Follow Service → Endpoints → Pods, fix the selector or targetPort, and repair the NetworkPolicy so only the frontend namespace gets in.</p>
+        <div><span class="tag">Services</span><span class="tag">NetworkPolicy</span><span class="lab-progress"></span></div>
       </a>
     </div>
   </div>
